@@ -30,7 +30,9 @@ porting Go `compress/flate`, `compress/gzip`, `archive/zip`,
 ## Module layout
 
 ```
-src/archive.nim            # public re-export only
+src/archive.nim            # gated stub: importing it is a compile error;
+                             # import the specific module you need instead
+                             # (full re-export only under -d:build_docs)
 src/archive/
   types.nim                # FileInfo, FileMeta, MatchResult, ArchiveError, SkipDir/SkipAll
   simd.nim                 # AVX2/SSE4.2 kernels + silicon self-test (feature "nimsimd")

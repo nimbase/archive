@@ -1,7 +1,15 @@
 import std/[unittest, strutils]
-import archive
+import archive/types
+import archive/io
+import archive/registry
+import archive/zlibf
+import archive/formats/gz
+import archive/formats/zlib
+import archive/formats/brotli
 
-registerDefaults()
+registerGz()
+registerZlib()
+registerBrotli()
 
 proc handlerFor(ext: string): FormatHandler =
   for h in registeredFormats():

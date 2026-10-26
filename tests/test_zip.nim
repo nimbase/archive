@@ -1,7 +1,11 @@
 import std/[unittest, tables]
-import archive
+import archive/types
+import archive/io
+import archive/registry
+import archive/files
+import archive/formats/zip
 
-registerDefaults()
+registerZip()
 
 proc zipHandler(): FormatHandler =
   for h in registeredFormats():

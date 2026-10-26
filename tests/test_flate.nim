@@ -1,5 +1,6 @@
 import std/[unittest, strutils]
-import archive
+import archive/io
+import archive/flate
 
 suite "flate":
   test "empty":

@@ -1,7 +1,11 @@
 import std/[unittest, tables, strutils]
-import archive
+import archive/types
+import archive/io
+import archive/registry
+import archive/files
+import archive/formats/tar
 
-registerDefaults()
+registerTar()
 
 proc tarHandler(): FormatHandler =
   for h in registeredFormats():

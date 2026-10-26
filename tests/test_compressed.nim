@@ -1,7 +1,15 @@
 import std/[unittest, tables]
-import archive
+import archive/types
+import archive/io
+import archive/registry
+import archive/files
+import archive/formats/tar
+import archive/formats/gz
+import archive/formats/brotli
 
-registerDefaults()
+registerTar()
+registerGz()
+registerBrotli()
 
 proc handlerFor(ext: string): FormatHandler =
   for h in registeredFormats():

@@ -1,7 +1,14 @@
 import std/[unittest]
-import archive
+import archive/types
+import archive/io
+import archive/registry
+import archive/files
+import archive/vfs
+import archive/formats/tar
+import archive/formats/gz
 
-registerDefaults()
+registerTar()
+registerGz()
 
 proc handlerFor(ext: string): FormatHandler =
   for h in registeredFormats():
