@@ -7,4 +7,5 @@ testresults/
 !/tests/bench
 !/tests/*.nim
 !/tests/*.nims
+!/tests/testdata
 
