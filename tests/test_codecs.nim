@@ -4,14 +4,17 @@ import archive/io
 import archive/registry
 import archive/zlibf
 import archive/lz4f
+import archive/bz2f
 import archive/formats/gz
 import archive/formats/zlib
 import archive/formats/lz4
+import archive/formats/bz2
 import archive/formats/brotli
 
 registerGz()
 registerZlib()
 registerLz4()
+registerBz2()
 registerBrotli()
 
 proc handlerFor(ext: string): FormatHandler =
@@ -247,6 +250,113 @@ suite "codecs":
     bad[^1] = chr(ord(bad[^1]) xor 0xFF)
     expect(Lz4Error):
       discard lz4Decompress(bad)
+
+  test "bzip2 round trip via reusable buffer":
+    let bz = handlerFor(".bz2")
+    let payload = "the quick brown fox jumps over the lazy dog".repeat(20)
+    let dst = newOutput()
+    bz.compress(openInputString(payload), dst)
+    check(outputBytes(dst).len > 0)
+    let magic = peek(toInput(dst), 3)
+    check(spanLen(magic) == 3)
+    let mb = cast[ptr UncheckedArray[byte]](magic.p)
+    check(mb[0] == byte('B') and mb[1] == byte('Z') and mb[2] == byte('h'))
+    let enc = take(dst)
+    let plain = newOutput()
+    bz.decompress(openInputString(enc), plain)
+    check(take(plain) == payload)
+
+  test "bzip2 empty payload":
+    let bz = handlerFor(".bz2")
+    let dst = newOutput()
+    bz.compress(openInputString(""), dst)
+    let enc = take(dst)
+    check(enc[0 .. 3] == "BZh6") # default level 6
+    let back = newOutput()
+    bz.decompress(openInputString(enc), back)
+    check(take(back) == "")
+
+  test "bzip2 all byte values round trip":
+    let bz = handlerFor(".bz2")
+    var s = newString(256)
+    for i in 0 ..< 256:
+      s[i] = chr(i)
+    let dst = newOutput()
+    bz.compress(openInputString(s), dst)
+    let back = newOutput()
+    bz.decompress(toInput(dst), back)
+    check(take(back) == s)
+
+  test "bzip2 levels produce valid headers":
+    check(bz2Compress("hello world", 1)[0 .. 3] == "BZh1")
+    check(bz2Compress("hello world", 9)[0 .. 3] == "BZh9")
+    check(bz2Decompress(bz2Compress("level one ".repeat(50), 1)) ==
+      "level one ".repeat(50))
+    check(bz2Decompress(bz2Compress("level nine ".repeat(50), 9)) ==
+      "level nine ".repeat(50))
+    expect(Bz2Error):
+      discard bz2Compress("x", 10)
+
+  test "bzip2 crc32 known vector":
+    check(bzCrcChecksum("") == 0'u32)
+    check(bzCrcChecksum("123456789") == 0xFC891918'u32)
+
+  test "bzip2 decodes python reference fixture":
+    let bz = handlerFor(".bz2")
+    let inp = openInputFile("tests/testdata/interop.txt.bz2")
+    let want = openInputFile("tests/testdata/interop.txt")
+    let dst = newOutput()
+    bz.decompress(inp, dst)
+    check(take(dst) == readAll(want))
+
+  test "bzip2 multi-block round trip":
+    let payload = "abcdefgh".repeat(30000) # 240KB: 3 blocks at level 1
+    let enc = bz2Compress(payload, 1)
+    check(enc.len < payload.len div 4)
+    check(bz2Decompress(enc) == payload)
+
+  test "bzip2 concatenated streams decode":
+    let enc = bz2Compress("first-") & bz2Compress("second")
+    check(bz2Decompress(enc) == "first-second")
+
+  test "bzip2 decodes multi-block cli fixture":
+    let bz = handlerFor(".bz2")
+    let dst = newOutput()
+    bz.decompress(openInputFile("tests/testdata/multi-blocks.bz2"), dst)
+    let back = take(dst)
+    check(back.len == 247200)
+    check(back[0 ..< 64] ==
+      "The quick brown fox jumps over the lazy dog. Pack my box with fi")
+
+  test "bzip2 corrupt input raises":
+    let bz = handlerFor(".bz2")
+    expect(Bz2Error):
+      let dst = newOutput()
+      bz.decompress(openInputString("definitely not bzip2!!"), dst)
+
+  test "bzip2 bad block checksum raises":
+    let good = bz2Compress("hello world".repeat(10), 9)
+    var bad = good
+    bad[12] = chr(ord(bad[12]) xor 0xFF) # inside stored block CRC
+    expect(Bz2Error):
+      discard bz2Decompress(bad)
+
+  test "bzip2 bad stream checksum raises":
+    let good = bz2Compress("hello world".repeat(10), 9)
+    var bad = good
+    bad[^1] = chr(ord(bad[^1]) xor 0xFF) # inside combined CRC
+    expect(Bz2Error):
+      discard bz2Decompress(bad)
+
+  test "bzip2 bwt edge cases round trip":
+    for s in ["", "a", "aaaa", "abababab", "banana", "mississippi"]:
+      var bb = newSeq[byte](s.len)
+      for i in 0 ..< s.len:
+        bb[i] = byte(s[i])
+      let (enc, origin) = bwtEncode(bb)
+      var dec = enc
+      bwtDecode(dec, origin)
+      check(cast[string](dec) == s)
 
   test "lz4 blocks obey end-of-block parsing restrictions":
     # lz4_Block_format.md: last sequence is literals-only with >= 5 bytes,

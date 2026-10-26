@@ -16,12 +16,14 @@ else:
   import ./archive/flate
   import ./archive/gzipf
   import ./archive/zlibf
+  import ./archive/bz2f
   import ./archive/lz4f
   import ./archive/zipfile
   import ./archive/formats/tar
   import ./archive/formats/zip
   import ./archive/formats/gz
   import ./archive/formats/zlib
+  import ./archive/formats/bz2
   import ./archive/formats/lz4
   import ./archive/formats/brotli
 
@@ -35,12 +37,14 @@ else:
   export flate
   export gzipf
   export zlibf
+  export bz2f
   export lz4f
   export zipfile
   export tar
   export zip
   export gz
   export zlib
+  export bz2
   export lz4
   export brotli
 
@@ -50,5 +54,6 @@ else:
     registerZip()
     registerGz()
     registerZlib()
+    registerBz2()
     registerLz4()
     registerBrotli()

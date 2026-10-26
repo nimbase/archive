@@ -10,7 +10,7 @@ porting Go `compress/flate`, `compress/gzip`, `archive/zip`,
 ## Goals
 
 - Single API for compress/decompress, create/extract, walk virtual file systems
-  across tar, zip, gz, brotli (+ later bz2, xz, zstd, rar/7z read-only).
+  across tar, zip, gz, zz, lz4, bz2, br (+ later xz, zstd, rar/7z read-only).
 - Format detection by filename AND by magic bytes (`Identify`) via indexed
   peeks; inputs are never consumed or copied.
 - `CompressedArchive` composition (e.g. tar.gz, tar.br): outer compression
@@ -44,6 +44,7 @@ src/archive/
   gzipf.nim                # gzip framing over Input/Output
   zlibf.nim                # zlib framing (RFC 1950) + Adler-32 over Input/Output
   lz4f.nim                 # LZ4 frame format + xxHash32 over Input/Output
+  bz2f.nim                 # bzip2 (BWT + MTF + Huffman) over Input/Output
   zipfile.nim              # zip reader/writer over Input/Output
   vfs.nim                  # FileFs, DirFs, ArchiveFs, DeepFs, TopDir helpers
   formats/
@@ -53,7 +54,8 @@ src/archive/
     brotli.nim             # wraps nbrotli (hard require)
     zlib.nim               # extension ".zz" (Go parity), own zlibf backend
     lz4.nim                # extension ".lz4" (Go parity), own lz4f backend
-    # phase 3: bz2.nim, xz.nim, zstd.nim, sz.nim, lzip.nim, minlz.nim
+    bz2.nim                # extension ".bz2" (Go parity), own bz2f backend
+    # phase 3: xz.nim, zstd.nim, sz.nim, lzip.nim, minlz.nim
     # phase 4: rar.nim, sevenz.nim (read-only)
 tests/
   test_identify.nim
@@ -125,7 +127,7 @@ tests/
   mistranslates crc32 to Castagnoli: check value E3069283 vs CBF43926).
   7 suites pass with and without the feature; system `gzip`/`unzip`
   interop re-verified both ways.
-- Phase 3: bz2, xz, zstd, sz/s2, lzip, minlz (same approach: port Go
+- Phase 3: xz, zstd, sz/s2, lzip, minlz (same approach: port Go
   framing + algorithms, no third-party Nim deps). lz4 (.lz4) DONE:
   `zlibf.nim` (RFC 1950 framing over own flate + scalar Adler-32 with
   NMAX chunking) + `formats/zlib.nim` (Go-parity ".zz" extension,
