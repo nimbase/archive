@@ -3,12 +3,15 @@ import archive/types
 import archive/io
 import archive/registry
 import archive/zlibf
+import archive/lz4f
 import archive/formats/gz
 import archive/formats/zlib
+import archive/formats/lz4
 import archive/formats/brotli
 
 registerGz()
 registerZlib()
+registerLz4()
 registerBrotli()
 
 proc handlerFor(ext: string): FormatHandler =
@@ -139,3 +142,173 @@ suite "codecs":
     bad[^1] = chr(ord(bad[^1]) xor 0xFF)
     expect(ZlibError):
       discard zlibDecompress(bad)
+
+  test "lz4 round trip via reusable buffer":
+    let lz = handlerFor(".lz4")
+    let payload = "the quick brown fox jumps over the lazy dog".repeat(20)
+    let dst = newOutput()
+    lz.compress(openInputString(payload), dst)
+    check(outputBytes(dst).len > 0)
+    let magic = peek(toInput(dst), 4)
+    check(spanLen(magic) == 4)
+    let mb = cast[ptr UncheckedArray[byte]](magic.p)
+    check(mb[0] == 0x04'u8 and mb[1] == 0x22'u8)
+    check(mb[2] == 0x4D'u8 and mb[3] == 0x18'u8)
+    let enc = take(dst)
+    let plain = newOutput()
+    lz.decompress(openInputString(enc), plain)
+    check(take(plain) == payload)
+
+  test "lz4 empty payload":
+    let lz = handlerFor(".lz4")
+    let dst = newOutput()
+    lz.compress(openInputString(""), dst)
+    check(outputBytes(dst).len == 7 + 4 + 4) # header + EndMark + checksum
+    let back = newOutput()
+    lz.decompress(toInput(dst), back)
+    check(take(back) == "")
+
+  test "lz4 all byte values round trip":
+    let lz = handlerFor(".lz4")
+    var s = newString(256)
+    for i in 0 ..< 256:
+      s[i] = chr(i)
+    let dst = newOutput()
+    lz.compress(openInputString(s), dst)
+    let back = newOutput()
+    lz.decompress(toInput(dst), back)
+    check(take(back) == s)
+
+  test "lz4 writer header flags":
+    let enc = lz4Compress("hello world")
+    check(enc.len > 7)
+    check(enc[4].uint8 == 0x64'u8) # independent, content checksum
+    check(enc[5].uint8 == 0x40'u8) # 64KB blocks
+
+  test "lz4 multi-block and stored blocks round trip":
+    var rnd = newString(100000)
+    var x = 0x12345678'u32
+    for i in 0 ..< rnd.len:
+      x = x * 1664525'u32 + 1013904223'u32
+      rnd[i] = chr((x shr 16) and 0xFF)
+    let encRnd = lz4Compress(rnd)
+    check(encRnd.len > rnd.len) # incompressible: stored blocks + framing
+    check(lz4Decompress(encRnd) == rnd)
+    let big = "abcdefgh".repeat(30000) # 240KB: multiple compressed blocks
+    let encBig = lz4Compress(big)
+    check(encBig.len < big.len div 4)
+    check(lz4Decompress(encBig) == big)
+
+  test "lz4 xxh32 known vectors":
+    check(xxh32(nil, 0) == 0x02CC5D05'u32)
+    check(xxh32("abc") == 0x32D153FF'u32)
+    check(xxh32("0123456789ABCDEF") == 0xF9F50986'u32) # lz4 CLI ground truth
+
+  test "lz4 decodes reference cli fixture":
+    let lz = handlerFor(".lz4")
+    let inp = openInputFile("tests/testdata/interop.txt.lz4")
+    let want = openInputFile("tests/testdata/interop.txt")
+    let dst = newOutput()
+    lz.decompress(inp, dst)
+    check(take(dst) == readAll(want))
+
+  test "lz4 decodes multi-block fixture with block checksums":
+    let lz = handlerFor(".lz4")
+    let dst = newOutput()
+    lz.decompress(openInputFile("tests/testdata/big-blocks.lz4"), dst)
+    let back = take(dst)
+    check(back.len == 220000)
+    check(back[0 ..< 64] == "abcdefghabcdefgh".repeat(4))
+    check(back[^96 .. ^1] == "xyzzy-plugh-".repeat(8))
+
+  test "lz4 content-size frame decodes":
+    let payload = "sized content ".repeat(100)
+    let enc = lz4Compress(payload)
+    var desc = newString(10)
+    desc[0] = char(0x6C) # FLG: content size + content checksum
+    desc[1] = char(0x40)
+    let sz = payload.len.uint64
+    for i in 0 ..< 8:
+      desc[2 + i] = char((sz shr (8 * i)) and 0xFF)
+    let hc = xxh32(unsafeAddr desc[0], 10)
+    let frame = "\x04\x22\x4D\x18" & desc &
+      char((hc shr 8) and 0xFF) & enc[7 .. ^1]
+    check(lz4Decompress(frame) == payload)
+
+  test "lz4 corrupt input raises":
+    let lz = handlerFor(".lz4")
+    expect(Lz4Error):
+      let dst = newOutput()
+      lz.decompress(openInputString("definitely not lz4!!!"), dst)
+
+  test "lz4 bad content checksum raises":
+    let good = lz4Compress("hello world".repeat(10))
+    var bad = good
+    bad[^1] = chr(ord(bad[^1]) xor 0xFF)
+    expect(Lz4Error):
+      discard lz4Decompress(bad)
+
+  test "lz4 blocks obey end-of-block parsing restrictions":
+    # lz4_Block_format.md: last sequence is literals-only with >= 5 bytes,
+    # last match starts >= 12 bytes before block end. liblz4 rejects
+    # violations, so enforce structurally (no CLI available in tests).
+    proc checkBlocks(enc: string) =
+      var pos = 7 # our header: magic(4) + FLG + BD + hc
+      while true:
+        check(pos + 4 <= enc.len)
+        let sz = enc[pos].uint32 or (enc[pos + 1].uint32 shl 8) or
+          (enc[pos + 2].uint32 shl 16) or (enc[pos + 3].uint32 shl 24)
+        pos += 4
+        if sz == 0:
+          break # EndMark
+        let stored = (sz and 0x80000000'u32) != 0
+        let size = (sz and 0x7FFFFFFF'u32).int
+        check(pos + size <= enc.len)
+        if not stored:
+          var p = pos
+          let blkEnd = pos + size
+          var lastLit = -1
+          var endedByMatch = false
+          while p < blkEnd:
+            let tok = enc[p].uint8
+            inc p
+            var lit = (tok shr 4).int
+            if lit == 15:
+              while enc[p] == '\xFF':
+                lit += 255
+                inc p
+              lit += enc[p].uint8.int
+              inc p
+            p += lit
+            lastLit = lit
+            if p >= blkEnd:
+              endedByMatch = false # trailing literals end the block
+              break
+            p += 2 # offset
+            var ml = (tok and 0x0F).int + 4
+            if (tok and 0x0F) == 15:
+              while enc[p] == '\xFF':
+                ml += 255
+                inc p
+              ml += enc[p].uint8.int
+              inc p
+            endedByMatch = true
+          check(p == blkEnd)
+          check(not endedByMatch) # ends right after literals
+          check(lastLit >= 5)
+        pos += size
+    checkBlocks(lz4Compress("hello world. hello world. hello world. "))
+    checkBlocks(lz4Compress("a"))
+    checkBlocks(lz4Compress("ab"))
+    var rnd = newString(70000)
+    var x = 0x9E3779B9'u32
+    for i in 0 ..< rnd.len:
+      x = x * 1664525'u32 + 1013904223'u32
+      rnd[i] = chr((x shr 16) and 0xFF)
+    checkBlocks(lz4Compress(rnd))
+    checkBlocks(lz4Compress("abcdefgh".repeat(30000)))
+    var tiny = ""
+    for i in 1 .. 20:
+      tiny.add(chr(ord('a') + i mod 26))
+      check(lz4Decompress(lz4Compress(tiny)) == tiny)
+      checkBlocks(lz4Compress(tiny))

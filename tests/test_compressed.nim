@@ -5,10 +5,12 @@ import archive/registry
 import archive/files
 import archive/formats/tar
 import archive/formats/gz
+import archive/formats/lz4
 import archive/formats/brotli
 
 registerTar()
 registerGz()
+registerLz4()
 registerBrotli()
 
 proc handlerFor(ext: string): FormatHandler =
@@ -74,3 +76,23 @@ suite "compressed archives":
     # even when the stream is garbage).
     check(bare.compressed != nil)
     check(bare.compressed.compression.ext == ".br")
+
+  test "tar.lz4 round trip via CompressedArchive":
+    var ctx: ArchiveContext
+    let files = sampleFiles(ctx)
+    let ca = CompressedArchive(archival: handlerFor(".tar"),
+      extraction: handlerFor(".tar"), compression: handlerFor(".lz4"))
+    let dst = newOutput()
+    ca.archiveTo(ctx, dst, files)
+    check(outputBytes(dst).len > 0)
+    let res = identifyFormat("backup.tar.lz4", toInput(dst))
+    check(res.compressed != nil)
+    check(res.compressed.compression.ext == ".lz4")
+    check(res.compressed.extraction.ext == ".tar")
+    var bodies = initOrderedTable[string, string]()
+    ca.extractFrom(ctx, toInput(dst)) do (
+        c: ArchiveContext; info: FileInfo):
+      if info.isRegular():
+        bodies[info.nameInArchive] = readAll(info.open())
+    check(bodies["docs/readme.txt"] == "hello archive")
+    check(bodies["bin/run"] == "binary")

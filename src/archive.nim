@@ -16,11 +16,13 @@ else:
   import ./archive/flate
   import ./archive/gzipf
   import ./archive/zlibf
+  import ./archive/lz4f
   import ./archive/zipfile
   import ./archive/formats/tar
   import ./archive/formats/zip
   import ./archive/formats/gz
   import ./archive/formats/zlib
+  import ./archive/formats/lz4
   import ./archive/formats/brotli
 
   export types
@@ -33,11 +35,13 @@ else:
   export flate
   export gzipf
   export zlibf
+  export lz4f
   export zipfile
   export tar
   export zip
   export gz
   export zlib
+  export lz4
   export brotli
 
   proc registerDefaults*() =
@@ -46,4 +50,5 @@ else:
     registerZip()
     registerGz()
     registerZlib()
+    registerLz4()
     registerBrotli()

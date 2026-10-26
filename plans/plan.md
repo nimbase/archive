@@ -43,6 +43,7 @@ src/archive/
   flate.nim                # DEFLATE inflate/deflate over Input/Output
   gzipf.nim                # gzip framing over Input/Output
   zlibf.nim                # zlib framing (RFC 1950) + Adler-32 over Input/Output
+  lz4f.nim                 # LZ4 frame format + xxHash32 over Input/Output
   zipfile.nim              # zip reader/writer over Input/Output
   vfs.nim                  # FileFs, DirFs, ArchiveFs, DeepFs, TopDir helpers
   formats/
@@ -51,7 +52,8 @@ src/archive/
     gz.nim
     brotli.nim             # wraps nbrotli (hard require)
     zlib.nim               # extension ".zz" (Go parity), own zlibf backend
-    # phase 3: bz2.nim, xz.nim, zstd.nim, lz4.nim, sz.nim, lzip.nim, minlz.nim
+    lz4.nim                # extension ".lz4" (Go parity), own lz4f backend
+    # phase 3: bz2.nim, xz.nim, zstd.nim, sz.nim, lzip.nim, minlz.nim
     # phase 4: rar.nim, sevenz.nim (read-only)
 tests/
   test_identify.nim
@@ -123,8 +125,8 @@ tests/
   mistranslates crc32 to Castagnoli: check value E3069283 vs CBF43926).
   7 suites pass with and without the feature; system `gzip`/`unzip`
   interop re-verified both ways.
-- Phase 3: bz2, xz, zstd, lz4, sz/s2, lzip, minlz (same approach: port Go
-  framing + algorithms, no third-party Nim deps). zlib (.zz) DONE:
+- Phase 3: bz2, xz, zstd, sz/s2, lzip, minlz (same approach: port Go
+  framing + algorithms, no third-party Nim deps). lz4 (.lz4) DONE:
   `zlibf.nim` (RFC 1950 framing over own flate + scalar Adler-32 with
   NMAX chunking) + `formats/zlib.nim` (Go-parity ".zz" extension,
   procedural header validation covering Go's 32-entry table, level-mapped
@@ -144,6 +146,18 @@ tests/
 - Hardware intrinsics must be runtime-validated, not just
   compile-gated: this machine's crc32 computes Castagnoli. Gate all
   SIMD kernels behind a check-value self-test with scalar fallback.
+- Verify hashes against ground truth, not memory: our first xxh32
+  wrongly included XXH64's per-lane merge round (short-input vectors
+  passed since they skip the lane path). Cross-checked against
+  cespare/xxhash and the lz4 CLI's own checksums before trusting it.
+- LZ4 on-disk magic is 0x184D2204 (bytes 04 22 4D 18), not 0x184D2A04
+  (the 2A range is skippable frames). Go's lz4Header was the tiebreaker.
+- LZ4 blocks must end with a literals-only run of >= 5 bytes and the
+  last match must start >= 12 bytes before block end (MFLIMIT/lastLits);
+  liblz4 rejects violations while lenient decoders accept them, so
+  round-trip tests alone cannot catch a non-compliant encoder. Enforce
+  in the encoder (search bound + extension cap) and pin with a
+  structural block-parser test, not just CLI interop.
 - Closures created in a loop share the captured slot: all per-file
   `open` closures served the last file's data until replaced with
   `stringOpener`/`fileOpener` factories in `types.nim`.
