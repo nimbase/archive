@@ -20,7 +20,7 @@ proc extension*(b: Bz2): string = ".bz2"
 proc mediaType*(b: Bz2): string = "application/x-bzip2"
 
 proc matchBz2*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == ".bz2":
+  if splitFile(filename.toLowerAscii()).ext == formatExt[fmtBz2]:
     result.byName = true
   if inp != nil:
     let s = peek(inp, 3)
@@ -39,8 +39,7 @@ proc openBz2Reader*(inp: Input): Input =
   toInput(dst)
 
 proc registerBz2*(b: Bz2 = Bz2()) =
-  let h = FormatHandler(ext: ".bz2", mediaType: "application/x-bzip2",
-      kinds: {fkCompression})
+  let h = newHandler(fmtBz2)
   let bb = b
   h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
     matchBz2(filename, inp)

@@ -256,7 +256,7 @@ proc writeFileToArchive*(t: Tar; dst: Output; f: FileInfo) =
   ## Port of Go writeFileToArchive.
   var hdr = headerForFile(t, f)
   if hdr.name.len > 100:
-    let (nm, prefix) = splitName(hdr.name)
+    let (nm, _) = splitName(hdr.name)
     if nm == "" and t.format != tfGnu:
       writePaxHeader(dst, hdr.name, [("path", hdr.name)])
   writeHeader(dst, hdr)
@@ -337,7 +337,7 @@ proc extractTar*(t: Tar; ctx: ArchiveContext; inp: Input;
     var hdr: TarHeader
     try:
       hdr = parseHeader(blk)
-    except CatchableError as e:
+    except CatchableError:
       if t.continueOnError and not ctx.cancelled():
         continue
       raise
@@ -460,8 +460,7 @@ proc insertTar*(t: Tar; ctx: ArchiveContext; inp: Input; dst: Output;
     writeFileToArchive(t, dst, f)
 
 proc registerTar*(t: Tar = Tar()) =
-  let h = FormatHandler(ext: ".tar", mediaType: "application/x-tar",
-      kinds: {fkArchival, fkExtraction})
+  let h = newHandler(fmtTar)
   let tt = t
   h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
     matchTar(filename, inp)

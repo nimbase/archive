@@ -8,10 +8,7 @@ import archive/formats/zip
 registerZip()
 
 proc zipHandler(): FormatHandler =
-  for h in registeredFormats():
-    if h.ext == ".zip":
-      return h
-  raise newException(ArchiveError, "zip not registered")
+  handler(fmtZip)
 
 suite "zip":
   test "round trip files":

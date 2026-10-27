@@ -20,7 +20,7 @@ proc extension*(l: Lz4): string = ".lz4"
 proc mediaType*(l: Lz4): string = "application/x-lz4"
 
 proc matchLz4*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == ".lz4":
+  if splitFile(filename.toLowerAscii()).ext == formatExt[fmtLz4]:
     result.byName = true
   if inp != nil:
     let s = peek(inp, 4)
@@ -40,8 +40,7 @@ proc openLz4Reader*(inp: Input): Input =
   toInput(dst)
 
 proc registerLz4*(l: Lz4 = Lz4()) =
-  let h = FormatHandler(ext: ".lz4", mediaType: "application/x-lz4",
-      kinds: {fkCompression})
+  let h = newHandler(fmtLz4)
   let ll = l
   h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
     matchLz4(filename, inp)

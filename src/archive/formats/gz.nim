@@ -24,7 +24,7 @@ proc extension*(g: Gz): string = ".gz"
 proc mediaType*(g: Gz): string = "application/gzip"
 
 proc matchGz*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == ".gz":
+  if splitFile(filename.toLowerAscii()).ext == formatExt[fmtGz]:
     result.byName = true
   if inp != nil:
     let s = peek(inp, gzMagic.len)
@@ -43,8 +43,7 @@ proc openGzReader*(inp: Input; multistream = true): Input =
   toInput(dst)
 
 proc registerGz*(g: Gz = Gz()) =
-  let h = FormatHandler(ext: ".gz", mediaType: "application/gzip",
-      kinds: {fkCompression})
+  let h = newHandler(fmtGz)
   let gg = g
   h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
     matchGz(filename, inp)

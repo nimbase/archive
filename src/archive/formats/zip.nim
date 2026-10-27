@@ -25,7 +25,7 @@ proc extension*(z: Zip): string = ".zip"
 proc mediaType*(z: Zip): string = "application/zip"
 
 proc matchZip*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == ".zip":
+  if splitFile(filename.toLowerAscii()).ext == formatExt[fmtZip]:
     result.byName = true
   if inp != nil:
     let s = peek(inp, 4)
@@ -37,10 +37,16 @@ proc matchZip*(filename: string; inp: Input): MatchResult =
           result.byStream = true
           break
 
-var compressedExts = ["7z", "avi", "br", "bz2", "cab", "docx", "gif", "gz",
-  "jar", "jpeg", "jpg", "lz", "lz4", "lzma", "m4v", "mov", "mp3", "mp4",
+var compressedExts = @["7z", "avi", "cab", "docx", "gif",
+  "jar", "jpeg", "jpg", "lz", "lzma", "m4v", "mov", "mp3", "mp4",
   "mpeg", "mpg", "png", "pptx", "rar", "sz", "tbz2", "tgz", "tsz", "txz",
-  "xlsx", "xz", "zip", "zipx"]
+  "xlsx", "xz", "zipx"]
+
+for f in [fmtZip, fmtGz, fmtBz2, fmtLz4, fmtBrotli]:
+  ## Our own formats that zip stores without recompressing. Sourced from
+  ## the canonical table (no leading dot), never literals. ".zz" stays
+  ## out, preserving historical store/deflate decisions.
+  compressedExts.add(formatExt[f].strip(chars = {'.'}))
 
 proc isCompressedExt(name: string): bool =
   splitFile(name.toLowerAscii()).ext.strip(chars = {'.'}) in compressedExts
@@ -198,8 +204,7 @@ proc insertZip*(z: Zip; ctx: ArchiveContext; inp: Input; dst: Output;
     raise newException(ArchiveError, "zip rewrite: " & e.msg)
 
 proc registerZip*(z: Zip = Zip()) =
-  let h = FormatHandler(ext: ".zip", mediaType: "application/zip",
-      kinds: {fkArchival, fkExtraction})
+  let h = newHandler(fmtZip)
   let zz = z
   h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
     matchZip(filename, inp)

@@ -1,4 +1,4 @@
-import std/[unittest, tables]
+import std/[unittest]
 import archive/types
 import archive/io
 import archive/registry
@@ -12,12 +12,6 @@ registerTar()
 registerZip()
 registerGz()
 registerBrotli()
-
-proc handlerFor(ext: string): FormatHandler =
-  for h in registeredFormats():
-    if h.ext == ext:
-      return h
-  raise newException(ArchiveError, ext & " not registered")
 
 suite "identify":
   test "tar by name and by stream":
@@ -34,7 +28,7 @@ suite "identify":
 
   test "gzip magic wins over unknown name":
     var ctx: ArchiveContext
-    let gz = handlerFor(".gz")
+    let gz = handler(fmtGz)
     let dst = newOutput()
     let src = openInputString("hello world")
     gz.compress(src, dst)
@@ -49,8 +43,8 @@ suite "identify":
     let files = filesFromEntries(ctx, FromFSOptions(),
       [FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: 3,
         isRegular: true), data: "abc")], ".", "root")
-    let tarH = handlerFor(".tar")
-    let gzH = handlerFor(".gz")
+    let tarH = handler(fmtTar)
+    let gzH = handler(fmtGz)
     let inner = newOutput()
     tarH.archive(ctx, inner, files)
     let innerInp = toInput(inner)

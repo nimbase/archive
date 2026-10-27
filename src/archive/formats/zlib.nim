@@ -20,7 +20,7 @@ proc extension*(z: Zlib): string = ".zz"
 proc mediaType*(z: Zlib): string = "application/zlib"
 
 proc matchZlib*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == ".zz":
+  if splitFile(filename.toLowerAscii()).ext == formatExt[fmtZlib]:
     result.byName = true
   if inp != nil:
     let s = peek(inp, 2)
@@ -39,8 +39,7 @@ proc openZlibReader*(inp: Input): Input =
   toInput(dst)
 
 proc registerZlib*(z: Zlib = Zlib()) =
-  let h = FormatHandler(ext: ".zz", mediaType: "application/zlib",
-      kinds: {fkCompression})
+  let h = newHandler(fmtZlib)
   let zz = z
   h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
     matchZlib(filename, inp)

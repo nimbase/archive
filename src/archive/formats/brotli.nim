@@ -58,7 +58,7 @@ proc isValidBrotliStream*(prefix: Span): bool =
   copyMem(addr probe[0], prefix.p, n)
   let probeInp = openInputString(probe)
   for h in registeredFormats():
-    if h.ext == ".br":
+    if h.format == fmtBrotli:
       continue
     if h.doMatch != nil:
       let mr = h.doMatch("", probeInp)
@@ -76,7 +76,7 @@ proc isValidBrotliStream*(prefix: Span): bool =
   false
 
 proc matchBrotli*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == ".br":
+  if splitFile(filename.toLowerAscii()).ext == formatExt[fmtBrotli]:
     result.byName = true
   if inp != nil:
     if isValidBrotliStream(peek(inp, 1024)):
@@ -127,8 +127,7 @@ proc openBrotliReader*(inp: Input): Input =
   toInput(dst)
 
 proc registerBrotli*(b: Brotli = defaultBrotli()) =
-  let h = FormatHandler(ext: ".br", mediaType: "application/x-br",
-      kinds: {fkCompression})
+  let h = newHandler(fmtBrotli)
   let bb = b
   h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
     matchBrotli(filename, inp)

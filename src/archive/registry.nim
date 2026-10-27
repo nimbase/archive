@@ -8,6 +8,19 @@ import ./io
 import ./types
 
 type
+  Format* = enum
+    ## Closed set of built-in formats. Use this instead of extension
+    ## strings: typos become compile errors, not runtime NoMatchErrors.
+    ## Append-only: new formats go at the end to keep ord values stable.
+    fmtTar
+    fmtZip
+    fmtGz
+    fmtZlib   ## zlib framing (".zz")
+    fmtLz4
+    fmtBz2
+    fmtBrotli
+    fmtCustom ## user-registered format with its own extension
+
   FormatKind* = enum
     fkCompression
     fkArchival
@@ -16,7 +29,8 @@ type
   FormatHandler* = ref object
     ## Registered format entry. Per-format settings live in the
     ## formats/* modules; the registry keeps closures bound to defaults.
-    ext*: string          ## e.g. ".tar"
+    format*: Format
+    ext*: string          ## e.g. ".tar" (canonical: formatExt[format])
     mediaType*: string
     kinds*: set[FormatKind]
     doMatch*: proc(filename: string; inp: Input): MatchResult {.closure.}
@@ -27,6 +41,23 @@ type
     extract*: proc(ctx: ArchiveContext; inp: Input;
         handle: FileHandler) {.closure.}
 
+const
+  formatExt*: array[Format, string] = [".tar", ".zip", ".gz", ".zz",
+    ".lz4", ".bz2", ".br", ""]
+    ## Canonical extension per format. Single source of truth: matchers
+    ## and CompressedArchive names derive from here, never literals.
+
+  formatMediaType*: array[Format, string] = ["application/x-tar",
+    "application/zip", "application/gzip", "application/zlib",
+    "application/x-lz4", "application/x-bzip2", "application/x-br", ""]
+    ## Canonical MIME type per format.
+
+  formatKinds*: array[Format, set[FormatKind]] = [{fkArchival, fkExtraction},
+    {fkArchival, fkExtraction}, {fkCompression}, {fkCompression},
+    {fkCompression}, {fkCompression}, {fkCompression}, {}]
+    ## Canonical capability set per format.
+
+type
   CompressedArchive* = ref object
     ## An archive compressed externally (e.g. tar.gz). Port of Go struct.
     archival*: FormatHandler
@@ -38,10 +69,29 @@ type
     format*: FormatHandler
     compressed*: CompressedArchive
 
+proc newHandler*(fmt: Format): FormatHandler =
+  ## Handler skeleton with ext/mediaType/kinds filled from the canonical
+  ## tables. Formats modules only attach closures after this.
+  if fmt == fmtCustom:
+    raise newException(ArchiveError,
+      "fmtCustom needs explicit ext/mediaType/kinds")
+  FormatHandler(format: fmt, ext: formatExt[fmt],
+    mediaType: formatMediaType[fmt], kinds: formatKinds[fmt])
+
 var formats = initTable[string, FormatHandler]()
 
 proc registerFormat*(h: FormatHandler) =
   ## Port of Go RegisterFormat. Panics (raises) on duplicate.
+  ## For built-in formats the ext must match the canonical table, so
+  ## literals cannot drift between matchers and the registry.
+  if h.format != fmtCustom:
+    if h.ext != formatExt[h.format]:
+      raise newException(ArchiveError, "format ext mismatch: " & h.ext &
+        " != " & formatExt[h.format])
+    h.mediaType = formatMediaType[h.format]
+    h.kinds = formatKinds[h.format]
+  elif h.ext.len == 0:
+    raise newException(ArchiveError, "custom format needs an extension")
   let name = h.ext.toLowerAscii().strip(chars = {'.'})
   if formats.hasKey(name):
     raise newException(ArchiveError, "format " & name & " is already registered")
@@ -50,6 +100,30 @@ proc registerFormat*(h: FormatHandler) =
 proc registeredFormats*(): seq[FormatHandler] =
   for _, v in formats:
     result.add(v)
+
+proc handler*(fmt: Format): FormatHandler =
+  ## Enum lookup: `handler(fmtBz2)` instead of `handlerFor(".bz2")`.
+  ## Raises ArchiveError when the format was never registered.
+  let h = formats.getOrDefault(formatExt[fmt].toLowerAscii().strip(
+    chars = {'.'}))
+  if h == nil:
+    raise newException(ArchiveError,
+      "format not registered: " & formatExt[fmt])
+  h
+
+proc formatForExt*(ext: string): Format =
+  ## Reverse lookup from an extension string (with or without dot,
+  ## any case) to the enum. Raises ArchiveError when unknown.
+  let norm = ext.toLowerAscii().strip(chars = {'.'})
+  for f in fmtTar .. fmtBrotli:
+    if formatExt[f].strip(chars = {'.'}) == norm:
+      return f
+  raise newException(ArchiveError, "unknown format extension: " & ext)
+
+proc handlerFor*(ext: string): FormatHandler =
+  ## String lookup kept for filename-driven code (identify paths,
+  ## user-supplied extensions). Prefer handler(fmt) for built-ins.
+  handler(formatForExt(ext))
 
 proc extension*(h: FormatHandler): string = h.ext
 proc mediaTypeOf*(h: FormatHandler): string = h.mediaType

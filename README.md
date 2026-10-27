@@ -15,6 +15,8 @@
 
 ## Features
 - Archive and compress across tar, zip, gzip, zlib (.zz), lz4, bzip2 and brotli with one uniform API.
+- `Format` enum instead of extension strings: `handler(fmtBz2)`, `compress(fmtGz, data)`; typos are compile errors, ext/media-type tables are canonical.
+- High-level one-shots: `compress`/`decompress` (strings, files, buffers), `archiveDir`/`archiveData`, auto-identifying `extractFile`/`extractAll`/`listEntries`.
 - Own DEFLATE/gzip/zip/tar/crc32 ports from Go stdlib: no C bindings, no zippy dependency, brotli via `nbrotli`.
 - Zero-copy I/O core: memory-mapped inputs, caller-reused output buffers, borrowed spans; no `streams` anywhere.
 - Format detection by filename and magic bytes without consuming input, plus tar.gz-style two-layer composition.
@@ -24,57 +26,46 @@
 - Interop-tested both directions against system gzip/unzip, bzip2, lz4 and CPython zlib/bz2.
 
 ## Examples
-Import the specific modules you need (`import archive` alone is a compile-time error by design):
+High-level API first (`import archive`); zero-copy `Input`/`Output`
+plumbing is still there when you need it:
+
+One-shot compression with per-call level (`0` = codec default):
 
 ```nim
-import archive/types
-import archive/io
-import archive/registry
-import archive/files
-import archive/formats/tar
+import archive/registry   # Format enum, handler(fmt), registerDefaults
+import archive              # high-level API: compress, archiveDir, extractAll, ...
 import archive/formats/gz
-
-registerTar()
-registerGz()
-
-proc handler(ext: string): FormatHandler =
-  for h in registeredFormats():
-    if h.ext == ext: return h
-  raise newException(ArchiveError, "not registered: " & ext)
-```
-
-Create `backup.tar.gz` from a directory (files are memory-mapped lazily, nothing is read up front):
-
-```nim
-var ctx: ArchiveContext
-let files = filesFromDisk(ctx, FromDiskOptions(), [("my-docs", "docs")])
-let ca = CompressedArchive(archival: handler(".tar"),
-  extraction: handler(".tar"), compression: handler(".gz"))
-let dst = newOutput()
-ca.archiveTo(ctx, dst, files)
-writeFile("backup.tar.gz", take(dst))
-```
-
-Identify a stream and extract selectively:
-
-```nim
-var ctx: ArchiveContext
-let inp = openInputFile("backup.tar.gz")
-let res = identifyFormat("backup.tar.gz", inp)
-res.compressed.extractFrom(ctx, inp) do (c: ArchiveContext; info: FileInfo):
-  if info.isRegular() and info.nameInArchive.endsWith(".nim"):
-    echo info.nameInArchive, ": ", readAll(info.open()).len, " bytes"
-```
-
-One-shot compression with a reusable buffer:
-
-```nim
 import archive/formats/bz2
-registerBz2()
+registerGz(); registerBz2()
+
+let enc = compress(fmtBz2, "hello ".repeat(100), level = 9)
+assert decompress(fmtBz2, enc) == "hello ".repeat(100)
+```
+
+Archive a directory to `backup.tar.gz` and read it back (files are
+memory-mapped lazily, nothing is read up front):
+
+```nim
+import std/options
+import archive/formats/tar
+registerTar()
+
+var ctx: ArchiveContext
+archiveDir(fmtTar, "my-docs", "backup.tar.gz", "docs",
+  compression = some(fmtGz))
+for e in extractAll("backup.tar.gz", ctx):
+  if e.name.endsWith(".nim"):
+    echo e.name, ": ", e.data.len, " bytes"
+```
+
+Same work with reusable buffers instead of fresh strings:
+
+```nim
+import archive/io
 let dst = newOutput()
-handler(".bz2").compress(openInputString("hello ".repeat(100)), dst)
+compressInto(fmtGz, openInputString("hello ".repeat(100)), dst)
 let back = newOutput()
-handler(".bz2").decompress(toInput(dst), back)
+decompressInto(fmtGz, toInput(dst), back)
 assert take(back) == "hello ".repeat(100)
 ```
 

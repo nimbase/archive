@@ -3,6 +3,7 @@ import archive/types
 import archive/io
 import archive/registry
 import archive/files
+import archive
 import archive/vfs
 import archive/formats/tar
 import archive/formats/gz
@@ -10,11 +11,6 @@ import archive/formats/gz
 registerTar()
 registerGz()
 
-proc handlerFor(ext: string): FormatHandler =
-  for h in registeredFormats():
-    if h.ext == ext:
-      return h
-  raise newException(ArchiveError, ext & " not registered")
 
 suite "vfs":
   test "dir filesystem lists entries":
@@ -47,8 +43,7 @@ suite "vfs":
     let files = filesFromEntries(ctx, FromFSOptions(),
       [FsEntry(path: "note.txt", meta: FileMeta(name: "note.txt", size: 4,
         isRegular: true), data: "note")], ".", "")
-    let ca = CompressedArchive(archival: handlerFor(".tar"),
-      extraction: handlerFor(".tar"), compression: handlerFor(".gz"))
+    let ca = compressedArchive(fmtTar, fmtGz)
     let dst = newOutput()
     ca.archiveTo(ctx, dst, files)
     let blob = take(dst)

@@ -17,15 +17,10 @@ registerLz4()
 registerBz2()
 registerBrotli()
 
-proc handlerFor(ext: string): FormatHandler =
-  for h in registeredFormats():
-    if h.ext == ext:
-      return h
-  raise newException(ArchiveError, ext & " not registered")
 
 suite "codecs":
   test "gzip round trip via reusable buffer":
-    let gz = handlerFor(".gz")
+    let gz = handler(fmtGz)
     let payload = "the quick brown fox jumps over the lazy dog".repeat(20)
     let dst = newOutput()
     gz.compress(openInputString(payload), dst)
@@ -40,7 +35,7 @@ suite "codecs":
     check(take(plain) == payload)
 
   test "gzip empty payload":
-    let gz = handlerFor(".gz")
+    let gz = handler(fmtGz)
     let dst = newOutput()
     gz.compress(openInputString(""), dst)
     let back = newOutput()
@@ -48,7 +43,7 @@ suite "codecs":
     check(take(back) == "")
 
   test "decodes system gzip fixture (dynamic Huffman)":
-    let gz = handlerFor(".gz")
+    let gz = handler(fmtGz)
     let inp = openInputFile("tests/testdata/interop.txt.gz")
     let want = openInputFile("tests/testdata/interop.txt")
     let dst = newOutput()
@@ -56,7 +51,7 @@ suite "codecs":
     check(take(dst) == readAll(want))
 
   test "brotli round trip":
-    let br = handlerFor(".br")
+    let br = handler(fmtBrotli)
     let payload = "Hello, Brotli! ".repeat(50)
     let dst = newOutput()
     br.compress(openInputString(payload), dst)
@@ -66,7 +61,7 @@ suite "codecs":
     check(take(back) == payload)
 
   test "brotli decode is store-wrapped but correct":
-    let br = handlerFor(".br")
+    let br = handler(fmtBrotli)
     let payload = "abc123".repeat(100)
     let dst = newOutput()
     br.compress(openInputString(payload), dst)
@@ -75,13 +70,13 @@ suite "codecs":
     check(take(back) == payload)
 
   test "brotli corrupt input raises":
-    let br = handlerFor(".br")
+    let br = handler(fmtBrotli)
     expect(ArchiveError):
       let dst = newOutput()
       br.decompress(openInputString("definitely not brotli!!!"), dst)
 
   test "zlib round trip via reusable buffer":
-    let zz = handlerFor(".zz")
+    let zz = handler(fmtZlib)
     let payload = "the quick brown fox jumps over the lazy dog".repeat(20)
     let dst = newOutput()
     zz.compress(openInputString(payload), dst)
@@ -97,7 +92,7 @@ suite "codecs":
     check(take(plain) == payload)
 
   test "zlib empty payload":
-    let zz = handlerFor(".zz")
+    let zz = handler(fmtZlib)
     let dst = newOutput()
     zz.compress(openInputString(""), dst)
     let back = newOutput()
@@ -105,7 +100,7 @@ suite "codecs":
     check(take(back) == "")
 
   test "zlib all byte values round trip":
-    let zz = handlerFor(".zz")
+    let zz = handler(fmtZlib)
     var s = newString(256)
     for i in 0 ..< 256:
       s[i] = chr(i)
@@ -126,7 +121,7 @@ suite "codecs":
     check(hb[0] == 0x78'u8 and hb[1] == 0x01'u8)
 
   test "zlib decodes python reference fixture":
-    let zz = handlerFor(".zz")
+    let zz = handler(fmtZlib)
     let inp = openInputFile("tests/testdata/interop.txt.zz")
     let want = openInputFile("tests/testdata/interop.txt")
     let dst = newOutput()
@@ -134,7 +129,7 @@ suite "codecs":
     check(take(dst) == readAll(want))
 
   test "zlib corrupt input raises":
-    let zz = handlerFor(".zz")
+    let zz = handler(fmtZlib)
     expect(ZlibError):
       let dst = newOutput()
       zz.decompress(openInputString("definitely not zlib!!!"), dst)
@@ -147,7 +142,7 @@ suite "codecs":
       discard zlibDecompress(bad)
 
   test "lz4 round trip via reusable buffer":
-    let lz = handlerFor(".lz4")
+    let lz = handler(fmtLz4)
     let payload = "the quick brown fox jumps over the lazy dog".repeat(20)
     let dst = newOutput()
     lz.compress(openInputString(payload), dst)
@@ -163,7 +158,7 @@ suite "codecs":
     check(take(plain) == payload)
 
   test "lz4 empty payload":
-    let lz = handlerFor(".lz4")
+    let lz = handler(fmtLz4)
     let dst = newOutput()
     lz.compress(openInputString(""), dst)
     check(outputBytes(dst).len == 7 + 4 + 4) # header + EndMark + checksum
@@ -172,7 +167,7 @@ suite "codecs":
     check(take(back) == "")
 
   test "lz4 all byte values round trip":
-    let lz = handlerFor(".lz4")
+    let lz = handler(fmtLz4)
     var s = newString(256)
     for i in 0 ..< 256:
       s[i] = chr(i)
@@ -208,7 +203,7 @@ suite "codecs":
     check(xxh32("0123456789ABCDEF") == 0xF9F50986'u32) # lz4 CLI ground truth
 
   test "lz4 decodes reference cli fixture":
-    let lz = handlerFor(".lz4")
+    let lz = handler(fmtLz4)
     let inp = openInputFile("tests/testdata/interop.txt.lz4")
     let want = openInputFile("tests/testdata/interop.txt")
     let dst = newOutput()
@@ -216,7 +211,7 @@ suite "codecs":
     check(take(dst) == readAll(want))
 
   test "lz4 decodes multi-block fixture with block checksums":
-    let lz = handlerFor(".lz4")
+    let lz = handler(fmtLz4)
     let dst = newOutput()
     lz.decompress(openInputFile("tests/testdata/big-blocks.lz4"), dst)
     let back = take(dst)
@@ -239,7 +234,7 @@ suite "codecs":
     check(lz4Decompress(frame) == payload)
 
   test "lz4 corrupt input raises":
-    let lz = handlerFor(".lz4")
+    let lz = handler(fmtLz4)
     expect(Lz4Error):
       let dst = newOutput()
       lz.decompress(openInputString("definitely not lz4!!!"), dst)
@@ -252,7 +247,7 @@ suite "codecs":
       discard lz4Decompress(bad)
 
   test "bzip2 round trip via reusable buffer":
-    let bz = handlerFor(".bz2")
+    let bz = handler(fmtBz2)
     let payload = "the quick brown fox jumps over the lazy dog".repeat(20)
     let dst = newOutput()
     bz.compress(openInputString(payload), dst)
@@ -267,7 +262,7 @@ suite "codecs":
     check(take(plain) == payload)
 
   test "bzip2 empty payload":
-    let bz = handlerFor(".bz2")
+    let bz = handler(fmtBz2)
     let dst = newOutput()
     bz.compress(openInputString(""), dst)
     let enc = take(dst)
@@ -277,7 +272,7 @@ suite "codecs":
     check(take(back) == "")
 
   test "bzip2 all byte values round trip":
-    let bz = handlerFor(".bz2")
+    let bz = handler(fmtBz2)
     var s = newString(256)
     for i in 0 ..< 256:
       s[i] = chr(i)
@@ -302,7 +297,7 @@ suite "codecs":
     check(bzCrcChecksum("123456789") == 0xFC891918'u32)
 
   test "bzip2 decodes python reference fixture":
-    let bz = handlerFor(".bz2")
+    let bz = handler(fmtBz2)
     let inp = openInputFile("tests/testdata/interop.txt.bz2")
     let want = openInputFile("tests/testdata/interop.txt")
     let dst = newOutput()
@@ -320,7 +315,7 @@ suite "codecs":
     check(bz2Decompress(enc) == "first-second")
 
   test "bzip2 decodes multi-block cli fixture":
-    let bz = handlerFor(".bz2")
+    let bz = handler(fmtBz2)
     let dst = newOutput()
     bz.decompress(openInputFile("tests/testdata/multi-blocks.bz2"), dst)
     let back = take(dst)
@@ -329,7 +324,7 @@ suite "codecs":
       "The quick brown fox jumps over the lazy dog. Pack my box with fi")
 
   test "bzip2 corrupt input raises":
-    let bz = handlerFor(".bz2")
+    let bz = handler(fmtBz2)
     expect(Bz2Error):
       let dst = newOutput()
       bz.decompress(openInputString("definitely not bzip2!!"), dst)

@@ -37,8 +37,13 @@ src/archive/
   types.nim                # FileInfo, FileMeta, MatchResult, ArchiveError, SkipDir/SkipAll
   simd.nim                 # AVX2/SSE4.2 kernels + silicon self-test (feature "nimsimd")
   io.nim                   # Input (mmap/string zero-copy cursor), Output (reusable buffer), Span
-  registry.nim             # FormatKind, FormatHandler, registerFormat, Identify
+  registry.nim             # Format enum + canonical ext/mediaType/kinds tables,
+                           # newHandler/handler/handlerFor/formatForExt, Identify
   files.nim                # filesFromDisk, filesFromFs, name mapping, symlink guard
+  archive.nim (root)       # entry point + high-level one-shots: compress/
+                           # decompress (+File), archiveData/archiveToFile/
+                           # archiveDir, extractFile/extractAll/listEntries,
+                           # compressedArchive, identifyPath
   crc32.nim                # IEEE CRC-32 (scalar table + hw dispatch)
   flate.nim                # DEFLATE inflate/deflate over Input/Output
   gzipf.nim                # gzip framing over Input/Output
@@ -79,9 +84,11 @@ tests/
   at loop heads; abort with `ArchiveError` if set. Keep signatures simple.
 - Errors: Nim exceptions (`ArchiveError`, `NoMatchError`), not Go-style tuples.
 - Registry: `Table[string, FormatHandler]` keyed by lowercased extension without
-  dot. Each handler stores `ext`, `mediaType`, `kinds: set[FormatKind]`,
-  plus `doMatch`, `compressInto`, `decompressInto`, `archive`, `extract`
-  closures over Input/Output.
+  dot (custom formats stay possible via `fmtCustom`). Built-ins are looked up
+  by `Format` enum (`handler(fmtBz2)`); ext/mediaType/kinds come from canonical
+  tables via `newHandler`, so literals cannot drift between matchers and the
+  registry (`registerFormat` enforces the match). `handlerFor`/`formatForExt`
+  remain for filename-driven code.
 - `FileInfo`: object with `nameInArchive`, `linkTarget`, `size`, `mode`,
   `modTime`, `isDir`, `header: ref object` passthrough,
   `open: proc(): Input` (zero-copy for mapped entries).
