@@ -1,153 +1,144 @@
-## Format registry and identification, ported from formats.go.
+## Format dispatch and identification.
+##
+## No registry, no globals: `Format` is a string-valued enum (`$fmt` is
+## the canonical extension), capabilities and MIME types are exhaustive
+## `case` procs in types.nim, and every operation below dispatches
+## statically. Safe to call from any thread.
 ##
 ## Inputs are zero-copy cursors: matching only peeks indexed spans, so
 ## no rewind buffering is needed at all (the Go rewindReader disappears).
 
-import std/[tables, strutils]
+import std/[options, strutils]
 import ./io
 import ./types
+import ./formats/tar
+import ./formats/zip
+import ./formats/gz
+import ./formats/zlib
+import ./formats/lz4
+import ./formats/bz2
+import ./formats/brotli
 
 type
-  Format* = enum
-    ## Closed set of built-in formats. Use this instead of extension
-    ## strings: typos become compile errors, not runtime NoMatchErrors.
-    ## Append-only: new formats go at the end to keep ord values stable.
-    fmtTar
-    fmtZip
-    fmtGz
-    fmtZlib   ## zlib framing (".zz")
-    fmtLz4
-    fmtBz2
-    fmtBrotli
-    fmtCustom ## user-registered format with its own extension
-
-  FormatKind* = enum
-    fkCompression
-    fkArchival
-    fkExtraction
-
-  FormatHandler* = ref object
-    ## Registered format entry. Per-format settings live in the
-    ## formats/* modules; the registry keeps closures bound to defaults.
-    format*: Format
-    ext*: string          ## e.g. ".tar" (canonical: formatExt[format])
-    mediaType*: string
-    kinds*: set[FormatKind]
-    doMatch*: proc(filename: string; inp: Input): MatchResult {.closure.}
-    compress*: proc(inp: Input; dst: Output) {.closure.}
-    decompress*: proc(inp: Input; dst: Output) {.closure.}
-    archive*: proc(ctx: ArchiveContext; dst: Output;
-        files: seq[FileInfo]) {.closure.}
-    extract*: proc(ctx: ArchiveContext; inp: Input;
-        handle: FileHandler) {.closure.}
-
-const
-  formatExt*: array[Format, string] = [".tar", ".zip", ".gz", ".zz",
-    ".lz4", ".bz2", ".br", ""]
-    ## Canonical extension per format. Single source of truth: matchers
-    ## and CompressedArchive names derive from here, never literals.
-
-  formatMediaType*: array[Format, string] = ["application/x-tar",
-    "application/zip", "application/gzip", "application/zlib",
-    "application/x-lz4", "application/x-bzip2", "application/x-br", ""]
-    ## Canonical MIME type per format.
-
-  formatKinds*: array[Format, set[FormatKind]] = [{fkArchival, fkExtraction},
-    {fkArchival, fkExtraction}, {fkCompression}, {fkCompression},
-    {fkCompression}, {fkCompression}, {fkCompression}, {}]
-    ## Canonical capability set per format.
-
-type
-  CompressedArchive* = ref object
-    ## An archive compressed externally (e.g. tar.gz). Port of Go struct.
-    archival*: FormatHandler
-    extraction*: FormatHandler
-    compression*: FormatHandler
-
   IdentifyResult* = object
-    ## Exactly one of format/compressed is non-nil.
-    format*: FormatHandler
-    compressed*: CompressedArchive
+    ## Outcome of identify(). `format` is always set: the archival
+    ## format, or the lone compression format for compression-only
+    ## streams (use decompressFile for those).
+    format*: Format
+    compression*: Option[Format]  ## some when format is compressed externally
 
-proc newHandler*(fmt: Format): FormatHandler =
-  ## Handler skeleton with ext/mediaType/kinds filled from the canonical
-  ## tables. Formats modules only attach closures after this.
-  if fmt == fmtCustom:
-    raise newException(ArchiveError,
-      "fmtCustom needs explicit ext/mediaType/kinds")
-  FormatHandler(format: fmt, ext: formatExt[fmt],
-    mediaType: formatMediaType[fmt], kinds: formatKinds[fmt])
-
-var formats = initTable[string, FormatHandler]()
-
-proc registerFormat*(h: FormatHandler) =
-  ## Port of Go RegisterFormat. Panics (raises) on duplicate.
-  ## For built-in formats the ext must match the canonical table, so
-  ## literals cannot drift between matchers and the registry.
-  if h.format != fmtCustom:
-    if h.ext != formatExt[h.format]:
-      raise newException(ArchiveError, "format ext mismatch: " & h.ext &
-        " != " & formatExt[h.format])
-    h.mediaType = formatMediaType[h.format]
-    h.kinds = formatKinds[h.format]
-  elif h.ext.len == 0:
-    raise newException(ArchiveError, "custom format needs an extension")
-  let name = h.ext.toLowerAscii().strip(chars = {'.'})
-  if formats.hasKey(name):
-    raise newException(ArchiveError, "format " & name & " is already registered")
-  formats[name] = h
-
-proc registeredFormats*(): seq[FormatHandler] =
-  for _, v in formats:
-    result.add(v)
-
-proc handler*(fmt: Format): FormatHandler =
-  ## Enum lookup: `handler(fmtBz2)` instead of `handlerFor(".bz2")`.
-  ## Raises ArchiveError when the format was never registered.
-  let h = formats.getOrDefault(formatExt[fmt].toLowerAscii().strip(
-    chars = {'.'}))
-  if h == nil:
-    raise newException(ArchiveError,
-      "format not registered: " & formatExt[fmt])
-  h
-
-proc formatForExt*(ext: string): Format =
-  ## Reverse lookup from an extension string (with or without dot,
-  ## any case) to the enum. Raises ArchiveError when unknown.
-  let norm = ext.toLowerAscii().strip(chars = {'.'})
-  for f in fmtTar .. fmtBrotli:
-    if formatExt[f].strip(chars = {'.'}) == norm:
-      return f
-  raise newException(ArchiveError, "unknown format extension: " & ext)
-
-proc handlerFor*(ext: string): FormatHandler =
-  ## String lookup kept for filename-driven code (identify paths,
-  ## user-supplied extensions). Prefer handler(fmt) for built-ins.
-  handler(formatForExt(ext))
-
-proc extension*(h: FormatHandler): string = h.ext
-proc mediaTypeOf*(h: FormatHandler): string = h.mediaType
-proc isCompression*(h: FormatHandler): bool = fkCompression in h.kinds
-proc isArchival*(h: FormatHandler): bool = fkArchival in h.kinds
-proc isExtraction*(h: FormatHandler): bool = fkExtraction in h.kinds
+  CompressedArchive* = object
+    ## A tar.gz-style pair as plain values: archival archive wrapped
+    ## in an outer compression layer. No handlers, nothing shared.
+    archival*: Format
+    compression*: Format
 
 proc extension*(c: CompressedArchive): string =
-  var base = ""
-  if c.archival != nil:
-    base = c.archival.ext
-  elif c.extraction != nil:
-    base = c.extraction.ext
-  base & c.compression.ext
+  ## Multi-extension name, e.g. ".tar.gz".
+  $c.archival & $c.compression
 
-proc mediaTypeOf*(c: CompressedArchive): string =
-  c.compression.mediaType
+proc mediaTypeOf*(c: CompressedArchive): MediaType =
+  mediaTypeOf(c.compression)
 
 proc baseName*(filename: string): string =
   let f = filename.replace('\\', '/')
   let idx = f.rfind('/')
   if idx < 0: f else: f[idx + 1 .. ^1]
 
-proc matchOne(h: FormatHandler; filename: string; inp: Input;
+proc formatForExt*(ext: string): Format =
+  ## Reverse lookup from an extension string (with or without dot,
+  ## any case) to the enum. Pure: iterates the closed set, no table.
+  ## Raises ArchiveError when unknown.
+  let norm = ext.toLowerAscii().strip(chars = {'.'})
+  for f in Format:
+    if ($f).strip(chars = {'.'}) == norm:
+      return f
+  raise newException(ArchiveError, "unknown format extension: " & ext)
+
+proc matchFormat*(fmt: Format; filename: string; inp: Input): MatchResult =
+  ## Static dispatch to the per-format matcher. Deterministic: no
+  ## table iteration order involved.
+  case fmt
+  of fmtTar: matchTar(filename, inp)
+  of fmtZip: matchZip(filename, inp)
+  of fmtGz: matchGz(filename, inp)
+  of fmtZlib: matchZlib(filename, inp)
+  of fmtLz4: matchLz4(filename, inp)
+  of fmtBz2: matchBz2(filename, inp)
+  of fmtBrotli: matchBrotli(filename, inp)
+
+proc compressInto*(fmt: Format; inp: Input; dst: Output; level = 0) =
+  ## One-shot compress. Level 0 selects the codec default
+  ## (gzip/zlib/bzip2: 6; lz4: fast path, level ignored; brotli:
+  ## store-encode, level ignored). Codec errors propagate raw.
+  case fmt
+  of fmtGz: gzipCompressInto(inp, dst, level)
+  of fmtZlib: zlibCompressInto(inp, dst, level)
+  of fmtLz4: lz4CompressInto(inp, dst, level)
+  of fmtBz2: bz2CompressInto(inp, dst, level)
+  of fmtBrotli: brotliCompressInto(inp, dst)
+  of fmtTar, fmtZip:
+    raise newException(ArchiveError,
+      "not a compression format: " & $fmt)
+
+proc decompressInto*(fmt: Format; inp: Input; dst: Output) =
+  ## One-shot decompress. Codec errors propagate raw.
+  case fmt
+  of fmtGz: gzipDecompressInto(inp, dst)
+  of fmtZlib: zlibDecompressInto(inp, dst)
+  of fmtLz4: lz4DecompressInto(inp, dst)
+  of fmtBz2: bz2DecompressInto(inp, dst)
+  of fmtBrotli: brotliDecompressInto(inp, dst)
+  of fmtTar, fmtZip:
+    raise newException(ArchiveError,
+      "not a compression format: " & $fmt)
+
+proc archiveFormat*(fmt: Format; ctx: ArchiveContext; dst: Output;
+    files: seq[FileInfo]) =
+  ## Archive with default settings. For custom settings call
+  ## archiveTar/archiveZip directly and compose manually if needed.
+  case fmt
+  of fmtTar: archiveTar(Tar(), ctx, dst, files)
+  of fmtZip: archiveZip(Zip(), ctx, dst, files)
+  else:
+    raise newException(ArchiveError,
+      "not an archival format: " & $fmt)
+
+proc extractFormat*(fmt: Format; ctx: ArchiveContext; inp: Input;
+    handle: FileHandler) =
+  ## Extract with default settings. For custom settings call
+  ## extractTar/extractZip directly.
+  case fmt
+  of fmtTar: extractTar(Tar(), ctx, inp, handle)
+  of fmtZip: extractZip(Zip(), ctx, inp, handle)
+  else:
+    raise newException(ArchiveError,
+      "not an extraction format: " & $fmt)
+
+proc compressedArchive*(archival, compression: Format): CompressedArchive =
+  ## Build a tar.gz-style pair. Extraction always uses the archival
+  ## format (every archival format also extracts).
+  if not archival.isArchival():
+    raise newException(ArchiveError,
+      "not an archival format: " & $archival)
+  if not compression.isCompression():
+    raise newException(ArchiveError,
+      "not a compression format: " & $compression)
+  CompressedArchive(archival: archival, compression: compression)
+
+proc archiveTo*(c: CompressedArchive; ctx: ArchiveContext;
+    dst: Output; files: seq[FileInfo]; level = 0) =
+  let tmp = newOutput()
+  archiveFormat(c.archival, ctx, tmp, files)
+  compressInto(c.compression, toInput(tmp), dst, level)
+
+proc extractFrom*(c: CompressedArchive; ctx: ArchiveContext;
+    inp: Input; handle: FileHandler) =
+  let tmp = newOutput()
+  decompressInto(c.compression, inp, tmp)
+  extractFormat(c.archival, ctx, toInput(tmp), handle)
+
+proc matchOne(fmt: Format; filename: string; inp: Input;
     inner: Input): MatchResult =
   ## inp may be nil (name-only match). inner is pre-decompressed input
   ## for matching archive formats inside compression, or nil.
@@ -155,125 +146,77 @@ proc matchOne(h: FormatHandler; filename: string; inp: Input;
   if fname == ".":
     fname = ""
   if inner != nil:
-    return h.doMatch(fname, inner)
+    return matchFormat(fmt, fname, inner)
   if inp == nil:
-    return h.doMatch(fname, nil)
+    return matchFormat(fmt, fname, nil)
   # Peek without consuming: matching reads via indices only.
   let saved = inputPos(inp)
-  let res = h.doMatch(fname, inp)
+  let res = matchFormat(fmt, fname, inp)
   seek(inp, saved)
   res
 
 proc identify*(ctx: ArchiveContext; filename: string;
     inp: Input = nil): IdentifyResult =
-  ## Port of Go Identify. Returns the most specific match or raises
-  ## NoMatchError. Never consumes `inp`.
-  var compression, archival, extraction: FormatHandler
+  ## Most specific match or NoMatchError. Never consumes `inp`.
+  ## Probes in enum order (deterministic): compression candidates
+  ## first with brotli last so definite magic bytes win over its
+  ## heuristic stream sniff, then archival formats inside.
   let base = baseName(filename)
 
-  for _, h in formats:
-    if not h.isCompression():
+  var comp = none(Format)
+  var compByName = false
+  for fmt in Format:
+    if not fmt.isCompression():
       continue
     ctx.checkCancelled()
     let mr =
-      try: matchOne(h, base, inp, nil)
+      try: matchOne(fmt, base, inp, nil)
       except CatchableError as e:
-        raise newException(ArchiveError, "matching " & h.ext & ": " & e.msg)
+        raise newException(ArchiveError, "matching " & $fmt & ": " & e.msg)
     if mr.matched():
-      compression = h
+      comp = some(fmt)
+      compByName = mr.byName
       break
 
   # Decompress once for inner matching, reused across candidates.
   var inner: Input = nil
   let scratch = newOutput()
-  if compression != nil and inp != nil and compression.decompress != nil:
+  if comp.isSome and inp != nil:
     try:
-      compression.decompress(inp, scratch)
+      decompressInto(comp.get, inp, scratch)
       inner = toInput(scratch)
     except CatchableError:
       inner = nil
 
-  for _, h in formats:
-    if not (h.isArchival() or h.isExtraction()):
+  var arch = none(Format)
+  for fmt in Format:
+    if not (fmt.isArchival() or fmt.isExtraction()):
       continue
     ctx.checkCancelled()
     let mr =
-      try: matchOne(h, base, inp, inner)
+      try: matchOne(fmt, base, inp, inner)
       except CatchableError as e:
-        raise newException(ArchiveError, "matching " & h.ext & ": " & e.msg)
+        raise newException(ArchiveError, "matching " & $fmt & ": " & e.msg)
     if mr.matched():
-      if h.isArchival(): archival = h
-      if h.isExtraction(): extraction = h
+      arch = some(fmt)
       break
 
-  let hasComp = compression != nil
-  let hasAr = archival != nil
-  let hasEx = extraction != nil
-  if hasComp and not hasAr and not hasEx:
-    return IdentifyResult(format: compression)
-  if not hasComp and hasAr and not hasEx:
-    return IdentifyResult(format: archival)
-  if not hasComp and not hasAr and hasEx:
-    return IdentifyResult(format: extraction)
-  if not hasComp and hasAr and hasEx:
-    let f = if archival != nil: archival else: extraction
-    return IdentifyResult(format: f)
-  if hasComp and hasEx:
-    return IdentifyResult(
-      compressed: CompressedArchive(archival: archival,
-        extraction: extraction, compression: compression))
+  if comp.isSome and arch.isSome:
+    if inner == nil and not compByName:
+      # Phantom layer: stream-only sniff that does not actually decode
+      # (e.g. a heuristic claiming another format's bytes). Drop it and
+      # report the inner archive alone.
+      return IdentifyResult(format: arch.get)
+    return IdentifyResult(format: arch.get, compression: comp)
+  if comp.isSome and inner == nil and not compByName:
+    # Same phantom case with no inner archive at all: undecodable.
+    raise newException(NoMatchError, "no formats matched: " & filename)
+  if comp.isSome:
+    return IdentifyResult(format: comp.get)
+  if arch.isSome:
+    return IdentifyResult(format: arch.get)
   raise newException(NoMatchError, "no formats matched: " & filename)
 
 proc identifyFormat*(filename: string; inp: Input = nil): IdentifyResult =
   var ctx: ArchiveContext
   identify(ctx, filename, inp)
-
-# --- CompressedArchive operations (port of formats.go methods) ---
-
-proc archiveTo*(c: CompressedArchive; ctx: ArchiveContext;
-    dst: Output; files: seq[FileInfo]) =
-  if c.archival == nil or c.archival.archive == nil:
-    raise newException(ArchiveError, "no archival format")
-  if c.compression != nil and c.compression.compress != nil:
-    let tmp = newOutput()
-    c.archival.archive(ctx, tmp, files)
-    c.compression.compress(toInput(tmp), dst)
-  else:
-    c.archival.archive(ctx, dst, files)
-
-proc extractFrom*(c: CompressedArchive; ctx: ArchiveContext;
-    inp: Input; handle: FileHandler) =
-  if c.extraction == nil or c.extraction.extract == nil:
-    raise newException(ArchiveError, "no extraction format")
-  if c.compression != nil and c.compression.decompress != nil:
-    let tmp = newOutput()
-    c.compression.decompress(inp, tmp)
-    c.extraction.extract(ctx, toInput(tmp), handle)
-  else:
-    c.extraction.extract(ctx, inp, handle)
-
-proc matchCompressed*(c: CompressedArchive; filename: string;
-    inp: Input): MatchResult =
-  ## Port of CompressedArchive.Match.
-  var conglomerate: MatchResult
-  if c.compression != nil:
-    let mr = c.compression.doMatch(filename, inp)
-    if not mr.matched():
-      return mr
-    let tmp = newOutput()
-    try:
-      c.compression.decompress(inp, tmp)
-    except CatchableError:
-      return mr
-    let inner = toInput(tmp)
-    conglomerate = mr
-    if c.archival != nil:
-      let mr2 = c.archival.doMatch(filename, inner)
-      if not mr2.matched():
-        return mr2
-      conglomerate.byName = conglomerate.byName or mr2.byName
-      conglomerate.byStream = conglomerate.byStream or mr2.byStream
-    return conglomerate
-  if c.archival != nil:
-    return c.archival.doMatch(filename, inp)
-  return conglomerate

@@ -48,6 +48,63 @@ type
     byName*: bool
     byStream*: bool
 
+  FormatKind* = enum
+    fkCompression
+    fkArchival
+    fkExtraction
+
+  Format* = enum
+    ## Closed set of built-in formats. The enum carries its own wire
+    ## strings: `$fmt` is the canonical extension, so no lookup table
+    ## exists at runtime — dispatch is static (`case fmt of`) and every
+    ## use is thread-safe by construction.
+    ## Append-only: new formats go at the end to keep ord values stable.
+    fmtTar = ".tar"
+    fmtZip = ".zip"
+    fmtGz = ".gz"
+    fmtZlib = ".zz"   ## zlib framing
+    fmtLz4 = ".lz4"
+    fmtBz2 = ".bz2"
+    fmtBrotli = ".br"
+
+  MediaType* = enum
+    ## Canonical MIME types, same string-enum pattern as Format.
+    mtTar = "application/x-tar"
+    mtZip = "application/zip"
+    mtGz = "application/gzip"
+    mtZlib = "application/zlib"
+    mtLz4 = "application/x-lz4"
+    mtBz2 = "application/x-bzip2"
+    mtBrotli = "application/x-br"
+
+proc mediaTypeOf*(fmt: Format): MediaType =
+  ## Exhaustive case (not a table): the compiler rejects a missing
+  ## format, and there is no runtime state to share between threads.
+  case fmt
+  of fmtTar: mtTar
+  of fmtZip: mtZip
+  of fmtGz: mtGz
+  of fmtZlib: mtZlib
+  of fmtLz4: mtLz4
+  of fmtBz2: mtBz2
+  of fmtBrotli: mtBrotli
+
+proc kindsOf*(fmt: Format): set[FormatKind] =
+  ## Capability set per format, same exhaustive-case pattern.
+  case fmt
+  of fmtTar, fmtZip: {fkArchival, fkExtraction}
+  of fmtGz, fmtZlib, fmtLz4, fmtBz2, fmtBrotli: {fkCompression}
+
+proc isCompression*(fmt: Format): bool {.inline.} =
+  fkCompression in kindsOf(fmt)
+
+proc isArchival*(fmt: Format): bool {.inline.} =
+  fkArchival in kindsOf(fmt)
+
+proc isExtraction*(fmt: Format): bool {.inline.} =
+  fkExtraction in kindsOf(fmt)
+
+type
   ArchiveContext* = object
     ## Minimal cancellation token replacing Go's context.Context.
     cancelled*: ptr bool

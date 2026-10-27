@@ -9,7 +9,6 @@ from std/os import splitFile
 import ../lz4f
 import ../io
 import ../types
-import ../registry
 
 export lz4f
 
@@ -20,7 +19,7 @@ proc extension*(l: Lz4): string = ".lz4"
 proc mediaType*(l: Lz4): string = "application/x-lz4"
 
 proc matchLz4*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == formatExt[fmtLz4]:
+  if splitFile(filename.toLowerAscii()).ext == $fmtLz4:
     result.byName = true
   if inp != nil:
     let s = peek(inp, 4)
@@ -39,13 +38,3 @@ proc openLz4Reader*(inp: Input): Input =
     raise newException(ArchiveError, "lz4 decompress: " & e.msg)
   toInput(dst)
 
-proc registerLz4*(l: Lz4 = Lz4()) =
-  let h = newHandler(fmtLz4)
-  let ll = l
-  h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
-    matchLz4(filename, inp)
-  h.compress = proc(inp: Input; dst: Output) {.closure.} =
-    lz4f.lz4CompressInto(inp, dst, ll.compressionLevel)
-  h.decompress = proc(inp: Input; dst: Output) {.closure.} =
-    lz4DecompressInto(inp, dst)
-  registerFormat(h)

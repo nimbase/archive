@@ -7,45 +7,29 @@ import archive/registry
 import archive/files
 import archive
 import archive/bz2f
-import archive/formats/tar
-import archive/formats/zip
-import archive/formats/gz
-import archive/formats/zlib
-import archive/formats/lz4
-import archive/formats/bz2
-import archive/formats/brotli
 
-registerTar()
-registerZip()
-registerGz()
-registerZlib()
-registerLz4()
-registerBz2()
-registerBrotli()
+suite "static format dispatch":
+  test "Format carries its own extension":
+    check($fmtTar == ".tar")
+    check($fmtZlib == ".zz")
+    check($fmtBrotli == ".br")
+    for fmt in Format:
+      check($fmt == $fmt) # exhaustive iteration compiles
 
-suite "enum registry":
-  test "handler by enum matches handler by string":
-    for fmt in [fmtTar, fmtZip, fmtGz, fmtZlib, fmtLz4, fmtBz2, fmtBrotli]:
-      check(handler(fmt) == handlerFor(formatExt[fmt]))
-      check(handler(fmt).ext == formatExt[fmt])
-      check(handler(fmt).mediaType == formatMediaType[fmt])
-      check(handler(fmt).kinds == formatKinds[fmt])
-
-  test "tables are canonical":
-    check(formatExt[fmtTar] == ".tar")
-    check(formatExt[fmtZlib] == ".zz")
-    check(formatMediaType[fmtGz] == "application/gzip")
-    check(fkCompression in formatKinds[fmtBz2])
-    check(formatKinds[fmtTar] == {fkArchival, fkExtraction})
+  test "media types and kinds derive from Format":
+    check(mediaTypeOf(fmtGz) == mtGz)
+    check($mediaTypeOf(fmtBz2) == "application/x-bzip2")
+    check(fmtBz2.isCompression())
+    check(fmtTar.isArchival() and fmtTar.isExtraction())
+    check(kindsOf(fmtTar) == {fkArchival, fkExtraction})
+    check(fmtGz.kindsOf() == {fkCompression})
 
   test "formatForExt normalizes":
     check(formatForExt(".GZ") == fmtGz)
     check(formatForExt("tar") == fmtTar)
     check(formatForExt(".bz2") == fmtBz2)
 
-  test "unknown lookups raise":
-    expect(ArchiveError):
-      discard handlerFor(".nope")
+  test "unknown extension raises":
     expect(ArchiveError):
       discard formatForExt(".nope")
 
@@ -56,6 +40,11 @@ suite "enum registry":
       discard compressedArchive(fmtGz, fmtGz)
     expect(ArchiveError):
       discard compressedArchive(fmtTar, fmtTar)
+
+  test "matchFormat agrees with identify":
+    var ctx: ArchiveContext
+    check(matchFormat(fmtTar, "x.tar", nil).byName)
+    check(not matchFormat(fmtZip, "x.tar", nil).matched())
 
 suite "high-level api":
   test "compress round trip per format":
@@ -79,7 +68,7 @@ suite "high-level api":
     let dir = getTempDir()
     for fmt in [fmtGz, fmtZlib, fmtLz4, fmtBz2, fmtBrotli]:
       let src = joinPath(dir, "api_src.txt")
-      let enc = joinPath(dir, "api_enc" & formatExt[fmt])
+      let enc = joinPath(dir, "api_enc" & $fmt)
       let back = joinPath(dir, "api_back.txt")
       writeFile(src, "file payload ".repeat(50))
       compressFile(fmt, src, enc)

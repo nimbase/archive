@@ -9,3 +9,6 @@ testresults/
 !/tests/*.nims
 !/tests/testdata
 
+/examples/*
+!/examples/*.nim
+!/examples/*.cfg

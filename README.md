@@ -16,9 +16,8 @@
 
 ## Features
 - Archive and compress across tar, zip, gzip, zlib (.zz), lz4, bzip2 and brotli with one uniform API
-- `Format` enum instead of extension strings: `handler(fmtBz2)`, `compress(fmtGz, data)`; typos are compile errors, ext/media-type tables are canonical
 - High-level one-shots: `compress`/`decompress` (strings, files, buffers), `archiveDir`/`archiveData`, auto-identifying `extractFile`/`extractAll`/`listEntries`
-- Own DEFLATE/gzip/zip/tar/crc32 ports from Go stdlib: no C bindings, no zippy dependency, brotli via [pkg/nbrotli](https://github.com/nimbase/nbrotli)
+- Own DEFLATE/gzip/zip/tar/crc32, no C bindings, brotli via [pkg/nbrotli](https://github.com/nimbase/nbrotli)
 - Zero-copy I/O core: memory-mapped inputs, caller-reused output buffers, borrowed spans; no `streams` anywhere
 - Format detection by filename and magic bytes without consuming input, plus tar.gz-style two-layer composition
 - Virtual filesystem with uniform reads over dirs, files, archives and compressed archives
@@ -27,15 +26,14 @@
 - Interop-tested both directions against system `gzip`/`unzip`, `bzip2`, `lz4` and CPython `zlib`/`bz2`
 
 ## Examples
+Runnable versions live in [`examples/`](examples/) (`nim.cfg` points at
+`../src`, so no install needed — just `clue build`). Snippets below:
 High-level API first (`import archive` + specific modules for types);
 zero-copy `Input`/`Output` plumbing is still there when you need it:
 
 ```nim
 import std/[options, strutils]
 import archive
-import archive/registry   # Format enum: fmtTar, fmtZip, fmtGz, ...
-import archive/types      # ArchiveContext, FileInfo, FileMeta, ...
-registerDefaults()        # register all built-in formats once
 
 # one-shot compression with per-call level (0 = codec default)
 let enc = compress(fmtBz2, "hello ".repeat(100), level = 9)

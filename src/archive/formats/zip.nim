@@ -10,7 +10,6 @@ from std/os import splitFile, lastPathPart
 import ../zipfile
 import ../io
 import ../types
-import ../registry
 
 export zipfile
 
@@ -25,7 +24,7 @@ proc extension*(z: Zip): string = ".zip"
 proc mediaType*(z: Zip): string = "application/zip"
 
 proc matchZip*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == formatExt[fmtZip]:
+  if splitFile(filename.toLowerAscii()).ext == $fmtZip:
     result.byName = true
   if inp != nil:
     let s = peek(inp, 4)
@@ -37,16 +36,18 @@ proc matchZip*(filename: string; inp: Input): MatchResult =
           result.byStream = true
           break
 
-var compressedExts = @["7z", "avi", "cab", "docx", "gif",
-  "jar", "jpeg", "jpg", "lz", "lzma", "m4v", "mov", "mp3", "mp4",
-  "mpeg", "mpg", "png", "pptx", "rar", "sz", "tbz2", "tgz", "tsz", "txz",
-  "xlsx", "xz", "zipx"]
+const compressedExts = ["7z", "avi", "br", "bz2", "cab", "docx", "gif",
+  "gz", "jar", "jpeg", "jpg", "lz", "lz4", "lzma", "m4v", "mov", "mp3",
+  "mp4", "mpeg", "mpg", "png", "pptx", "rar", "sz", "tbz2", "tgz",
+  "tsz", "txz", "xlsx", "xz", "zip", "zipx"]
+  ## Extensions zip stores without recompressing. Our own formats in
+  ## this list ("br", "bz2", "gz", "lz4", "zip") mirror `$Format`;
+  ## the static assert below fails compilation if they drift.
+  ## ".zz" stays out, preserving historical store/deflate decisions.
 
-for f in [fmtZip, fmtGz, fmtBz2, fmtLz4, fmtBrotli]:
-  ## Our own formats that zip stores without recompressing. Sourced from
-  ## the canonical table (no leading dot), never literals. ".zz" stays
-  ## out, preserving historical store/deflate decisions.
-  compressedExts.add(formatExt[f].strip(chars = {'.'}))
+static:
+  for f in [fmtZip, fmtGz, fmtBz2, fmtLz4, fmtBrotli]:
+    doAssert(($f)[1 .. ^1] in compressedExts)
 
 proc isCompressedExt(name: string): bool =
   splitFile(name.toLowerAscii()).ext.strip(chars = {'.'}) in compressedExts
@@ -100,7 +101,10 @@ proc archiveZip*(z: Zip; ctx: ArchiveContext; dst: Output;
           linkTarget: lt, data: lt, store: true, modTime: f.modTime,
           mode: 0o120777))
       else:
-        let fr = f.open()
+        var fr: Input
+        # gcsafe by confinement: opener runs synchronously in this thread.
+        {.gcsafe.}:
+          fr = f.open()
         keeps.add(fr)
         var content = peek(fr, remaining(fr))
         if content.len > int(f.size):
@@ -144,7 +148,9 @@ proc extractZip*(z: Zip; ctx: ArchiveContext; inp: Input;
         linkTarget: e.linkTarget,
         open: viewOpener(eb, (if e.keep != nil: e.keep else: inp)))
     try:
-      handle(ctx, info)
+      # gcsafe by confinement: handle runs synchronously in this thread.
+      {.gcsafe.}:
+        handle(ctx, info)
     except SkipAll:
       break
     except SkipDir:
@@ -186,7 +192,10 @@ proc insertZip*(z: Zip; ctx: ArchiveContext; inp: Input; dst: Output;
           linkTarget: lt, data: lt, store: true, modTime: f.modTime,
           mode: 0o120777)
       else:
-        let fr = f.open()
+        var fr: Input
+        # gcsafe by confinement: opener runs synchronously in this thread.
+        {.gcsafe.}:
+          fr = f.open()
         var content = peek(fr, remaining(fr))
         if content.len > int(f.size):
           content.len = int(f.size)
@@ -203,15 +212,3 @@ proc insertZip*(z: Zip; ctx: ArchiveContext; inp: Input; dst: Output;
   except CatchableError as e:
     raise newException(ArchiveError, "zip rewrite: " & e.msg)
 
-proc registerZip*(z: Zip = Zip()) =
-  let h = newHandler(fmtZip)
-  let zz = z
-  h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
-    matchZip(filename, inp)
-  h.archive = proc(ctx: ArchiveContext; dst: Output;
-      files: seq[FileInfo]) {.closure.} =
-    archiveZip(zz, ctx, dst, files)
-  h.extract = proc(ctx: ArchiveContext; inp: Input;
-      handle: FileHandler) {.closure.} =
-    extractZip(zz, ctx, inp, handle)
-  registerFormat(h)

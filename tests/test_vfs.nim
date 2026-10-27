@@ -3,13 +3,8 @@ import archive/types
 import archive/io
 import archive/registry
 import archive/files
-import archive
 import archive/vfs
-import archive/formats/tar
-import archive/formats/gz
 
-registerTar()
-registerGz()
 
 
 suite "vfs":

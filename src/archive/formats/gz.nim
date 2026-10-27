@@ -9,7 +9,6 @@ from std/os import splitFile
 import ../gzipf
 import ../io
 import ../types
-import ../registry
 
 export gzipf
 
@@ -24,7 +23,7 @@ proc extension*(g: Gz): string = ".gz"
 proc mediaType*(g: Gz): string = "application/gzip"
 
 proc matchGz*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == formatExt[fmtGz]:
+  if splitFile(filename.toLowerAscii()).ext == $fmtGz:
     result.byName = true
   if inp != nil:
     let s = peek(inp, gzMagic.len)
@@ -42,13 +41,3 @@ proc openGzReader*(inp: Input; multistream = true): Input =
     raise newException(ArchiveError, "gzip decompress: " & e.msg)
   toInput(dst)
 
-proc registerGz*(g: Gz = Gz()) =
-  let h = newHandler(fmtGz)
-  let gg = g
-  h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
-    matchGz(filename, inp)
-  h.compress = proc(inp: Input; dst: Output) {.closure.} =
-    gzipf.gzipCompressInto(inp, dst, gg.compressionLevel)
-  h.decompress = proc(inp: Input; dst: Output) {.closure.} =
-    gzipDecompressInto(inp, dst, not gg.disableMultistream)
-  registerFormat(h)

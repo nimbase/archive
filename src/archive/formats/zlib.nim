@@ -9,7 +9,6 @@ from std/os import splitFile
 import ../zlibf
 import ../io
 import ../types
-import ../registry
 
 export zlibf
 
@@ -20,7 +19,7 @@ proc extension*(z: Zlib): string = ".zz"
 proc mediaType*(z: Zlib): string = "application/zlib"
 
 proc matchZlib*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == formatExt[fmtZlib]:
+  if splitFile(filename.toLowerAscii()).ext == $fmtZlib:
     result.byName = true
   if inp != nil:
     let s = peek(inp, 2)
@@ -38,13 +37,3 @@ proc openZlibReader*(inp: Input): Input =
     raise newException(ArchiveError, "zlib decompress: " & e.msg)
   toInput(dst)
 
-proc registerZlib*(z: Zlib = Zlib()) =
-  let h = newHandler(fmtZlib)
-  let zz = z
-  h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
-    matchZlib(filename, inp)
-  h.compress = proc(inp: Input; dst: Output) {.closure.} =
-    zlibf.zlibCompressInto(inp, dst, zz.compressionLevel)
-  h.decompress = proc(inp: Input; dst: Output) {.closure.} =
-    zlibDecompressInto(inp, dst)
-  registerFormat(h)

@@ -5,25 +5,17 @@ import archive/registry
 import archive/zlibf
 import archive/lz4f
 import archive/bz2f
-import archive/formats/gz
 import archive/formats/zlib
 import archive/formats/lz4
 import archive/formats/bz2
-import archive/formats/brotli
 
-registerGz()
-registerZlib()
-registerLz4()
-registerBz2()
-registerBrotli()
 
 
 suite "codecs":
   test "gzip round trip via reusable buffer":
-    let gz = handler(fmtGz)
     let payload = "the quick brown fox jumps over the lazy dog".repeat(20)
     let dst = newOutput()
-    gz.compress(openInputString(payload), dst)
+    compressInto(fmtGz, openInputString(payload), dst)
     check(outputBytes(dst).len > 0)
     let magic = peek(toInput(dst), 2)
     check(spanLen(magic) == 2)
@@ -31,55 +23,49 @@ suite "codecs":
     check(mb[0] == 0x1f'u8 and mb[1] == 0x8b'u8)
     let enc = take(dst)
     let plain = newOutput()
-    gz.decompress(openInputString(enc), plain)
+    decompressInto(fmtGz, openInputString(enc), plain)
     check(take(plain) == payload)
 
   test "gzip empty payload":
-    let gz = handler(fmtGz)
     let dst = newOutput()
-    gz.compress(openInputString(""), dst)
+    compressInto(fmtGz, openInputString(""), dst)
     let back = newOutput()
-    gz.decompress(toInput(dst), back)
+    decompressInto(fmtGz, toInput(dst), back)
     check(take(back) == "")
 
   test "decodes system gzip fixture (dynamic Huffman)":
-    let gz = handler(fmtGz)
     let inp = openInputFile("tests/testdata/interop.txt.gz")
     let want = openInputFile("tests/testdata/interop.txt")
     let dst = newOutput()
-    gz.decompress(inp, dst)
+    decompressInto(fmtGz, inp, dst)
     check(take(dst) == readAll(want))
 
   test "brotli round trip":
-    let br = handler(fmtBrotli)
     let payload = "Hello, Brotli! ".repeat(50)
     let dst = newOutput()
-    br.compress(openInputString(payload), dst)
+    compressInto(fmtBrotli, openInputString(payload), dst)
     check(outputBytes(dst).len > 0)
     let back = newOutput()
-    br.decompress(toInput(dst), back)
+    decompressInto(fmtBrotli, toInput(dst), back)
     check(take(back) == payload)
 
   test "brotli decode is store-wrapped but correct":
-    let br = handler(fmtBrotli)
     let payload = "abc123".repeat(100)
     let dst = newOutput()
-    br.compress(openInputString(payload), dst)
+    compressInto(fmtBrotli, openInputString(payload), dst)
     let back = newOutput()
-    br.decompress(toInput(dst), back)
+    decompressInto(fmtBrotli, toInput(dst), back)
     check(take(back) == payload)
 
   test "brotli corrupt input raises":
-    let br = handler(fmtBrotli)
     expect(ArchiveError):
       let dst = newOutput()
-      br.decompress(openInputString("definitely not brotli!!!"), dst)
+      decompressInto(fmtBrotli, openInputString("definitely not brotli!!!"), dst)
 
   test "zlib round trip via reusable buffer":
-    let zz = handler(fmtZlib)
     let payload = "the quick brown fox jumps over the lazy dog".repeat(20)
     let dst = newOutput()
-    zz.compress(openInputString(payload), dst)
+    compressInto(fmtZlib, openInputString(payload), dst)
     check(outputBytes(dst).len > 0)
     let magic = peek(toInput(dst), 2)
     check(spanLen(magic) == 2)
@@ -88,26 +74,24 @@ suite "codecs":
     check(isValidZlibHeader(mb[0], mb[1]))
     let enc = take(dst)
     let plain = newOutput()
-    zz.decompress(openInputString(enc), plain)
+    decompressInto(fmtZlib, openInputString(enc), plain)
     check(take(plain) == payload)
 
   test "zlib empty payload":
-    let zz = handler(fmtZlib)
     let dst = newOutput()
-    zz.compress(openInputString(""), dst)
+    compressInto(fmtZlib, openInputString(""), dst)
     let back = newOutput()
-    zz.decompress(toInput(dst), back)
+    decompressInto(fmtZlib, toInput(dst), back)
     check(take(back) == "")
 
   test "zlib all byte values round trip":
-    let zz = handler(fmtZlib)
     var s = newString(256)
     for i in 0 ..< 256:
       s[i] = chr(i)
     let dst = newOutput()
-    zz.compress(openInputString(s), dst)
+    compressInto(fmtZlib, openInputString(s), dst)
     let back = newOutput()
-    zz.decompress(toInput(dst), back)
+    decompressInto(fmtZlib, toInput(dst), back)
     check(take(back) == s)
 
   test "zlib levels produce valid headers":
@@ -121,18 +105,16 @@ suite "codecs":
     check(hb[0] == 0x78'u8 and hb[1] == 0x01'u8)
 
   test "zlib decodes python reference fixture":
-    let zz = handler(fmtZlib)
     let inp = openInputFile("tests/testdata/interop.txt.zz")
     let want = openInputFile("tests/testdata/interop.txt")
     let dst = newOutput()
-    zz.decompress(inp, dst)
+    decompressInto(fmtZlib, inp, dst)
     check(take(dst) == readAll(want))
 
   test "zlib corrupt input raises":
-    let zz = handler(fmtZlib)
     expect(ZlibError):
       let dst = newOutput()
-      zz.decompress(openInputString("definitely not zlib!!!"), dst)
+      decompressInto(fmtZlib, openInputString("definitely not zlib!!!"), dst)
 
   test "zlib bad checksum raises":
     let good = zlibCompress("hello world".repeat(10))
@@ -142,10 +124,9 @@ suite "codecs":
       discard zlibDecompress(bad)
 
   test "lz4 round trip via reusable buffer":
-    let lz = handler(fmtLz4)
     let payload = "the quick brown fox jumps over the lazy dog".repeat(20)
     let dst = newOutput()
-    lz.compress(openInputString(payload), dst)
+    compressInto(fmtLz4, openInputString(payload), dst)
     check(outputBytes(dst).len > 0)
     let magic = peek(toInput(dst), 4)
     check(spanLen(magic) == 4)
@@ -154,27 +135,25 @@ suite "codecs":
     check(mb[2] == 0x4D'u8 and mb[3] == 0x18'u8)
     let enc = take(dst)
     let plain = newOutput()
-    lz.decompress(openInputString(enc), plain)
+    decompressInto(fmtLz4, openInputString(enc), plain)
     check(take(plain) == payload)
 
   test "lz4 empty payload":
-    let lz = handler(fmtLz4)
     let dst = newOutput()
-    lz.compress(openInputString(""), dst)
+    compressInto(fmtLz4, openInputString(""), dst)
     check(outputBytes(dst).len == 7 + 4 + 4) # header + EndMark + checksum
     let back = newOutput()
-    lz.decompress(toInput(dst), back)
+    decompressInto(fmtLz4, toInput(dst), back)
     check(take(back) == "")
 
   test "lz4 all byte values round trip":
-    let lz = handler(fmtLz4)
     var s = newString(256)
     for i in 0 ..< 256:
       s[i] = chr(i)
     let dst = newOutput()
-    lz.compress(openInputString(s), dst)
+    compressInto(fmtLz4, openInputString(s), dst)
     let back = newOutput()
-    lz.decompress(toInput(dst), back)
+    decompressInto(fmtLz4, toInput(dst), back)
     check(take(back) == s)
 
   test "lz4 writer header flags":
@@ -203,17 +182,15 @@ suite "codecs":
     check(xxh32("0123456789ABCDEF") == 0xF9F50986'u32) # lz4 CLI ground truth
 
   test "lz4 decodes reference cli fixture":
-    let lz = handler(fmtLz4)
     let inp = openInputFile("tests/testdata/interop.txt.lz4")
     let want = openInputFile("tests/testdata/interop.txt")
     let dst = newOutput()
-    lz.decompress(inp, dst)
+    decompressInto(fmtLz4, inp, dst)
     check(take(dst) == readAll(want))
 
   test "lz4 decodes multi-block fixture with block checksums":
-    let lz = handler(fmtLz4)
     let dst = newOutput()
-    lz.decompress(openInputFile("tests/testdata/big-blocks.lz4"), dst)
+    decompressInto(fmtLz4, openInputFile("tests/testdata/big-blocks.lz4"), dst)
     let back = take(dst)
     check(back.len == 220000)
     check(back[0 ..< 64] == "abcdefghabcdefgh".repeat(4))
@@ -234,10 +211,9 @@ suite "codecs":
     check(lz4Decompress(frame) == payload)
 
   test "lz4 corrupt input raises":
-    let lz = handler(fmtLz4)
     expect(Lz4Error):
       let dst = newOutput()
-      lz.decompress(openInputString("definitely not lz4!!!"), dst)
+      decompressInto(fmtLz4, openInputString("definitely not lz4!!!"), dst)
 
   test "lz4 bad content checksum raises":
     let good = lz4Compress("hello world".repeat(10))
@@ -247,10 +223,9 @@ suite "codecs":
       discard lz4Decompress(bad)
 
   test "bzip2 round trip via reusable buffer":
-    let bz = handler(fmtBz2)
     let payload = "the quick brown fox jumps over the lazy dog".repeat(20)
     let dst = newOutput()
-    bz.compress(openInputString(payload), dst)
+    compressInto(fmtBz2, openInputString(payload), dst)
     check(outputBytes(dst).len > 0)
     let magic = peek(toInput(dst), 3)
     check(spanLen(magic) == 3)
@@ -258,28 +233,26 @@ suite "codecs":
     check(mb[0] == byte('B') and mb[1] == byte('Z') and mb[2] == byte('h'))
     let enc = take(dst)
     let plain = newOutput()
-    bz.decompress(openInputString(enc), plain)
+    decompressInto(fmtBz2, openInputString(enc), plain)
     check(take(plain) == payload)
 
   test "bzip2 empty payload":
-    let bz = handler(fmtBz2)
     let dst = newOutput()
-    bz.compress(openInputString(""), dst)
+    compressInto(fmtBz2, openInputString(""), dst)
     let enc = take(dst)
     check(enc[0 .. 3] == "BZh6") # default level 6
     let back = newOutput()
-    bz.decompress(openInputString(enc), back)
+    decompressInto(fmtBz2, openInputString(enc), back)
     check(take(back) == "")
 
   test "bzip2 all byte values round trip":
-    let bz = handler(fmtBz2)
     var s = newString(256)
     for i in 0 ..< 256:
       s[i] = chr(i)
     let dst = newOutput()
-    bz.compress(openInputString(s), dst)
+    compressInto(fmtBz2, openInputString(s), dst)
     let back = newOutput()
-    bz.decompress(toInput(dst), back)
+    decompressInto(fmtBz2, toInput(dst), back)
     check(take(back) == s)
 
   test "bzip2 levels produce valid headers":
@@ -297,11 +270,10 @@ suite "codecs":
     check(bzCrcChecksum("123456789") == 0xFC891918'u32)
 
   test "bzip2 decodes python reference fixture":
-    let bz = handler(fmtBz2)
     let inp = openInputFile("tests/testdata/interop.txt.bz2")
     let want = openInputFile("tests/testdata/interop.txt")
     let dst = newOutput()
-    bz.decompress(inp, dst)
+    decompressInto(fmtBz2, inp, dst)
     check(take(dst) == readAll(want))
 
   test "bzip2 multi-block round trip":
@@ -315,19 +287,17 @@ suite "codecs":
     check(bz2Decompress(enc) == "first-second")
 
   test "bzip2 decodes multi-block cli fixture":
-    let bz = handler(fmtBz2)
     let dst = newOutput()
-    bz.decompress(openInputFile("tests/testdata/multi-blocks.bz2"), dst)
+    decompressInto(fmtBz2, openInputFile("tests/testdata/multi-blocks.bz2"), dst)
     let back = take(dst)
     check(back.len == 247200)
     check(back[0 ..< 64] ==
       "The quick brown fox jumps over the lazy dog. Pack my box with fi")
 
   test "bzip2 corrupt input raises":
-    let bz = handler(fmtBz2)
     expect(Bz2Error):
       let dst = newOutput()
-      bz.decompress(openInputString("definitely not bzip2!!"), dst)
+      decompressInto(fmtBz2, openInputString("definitely not bzip2!!"), dst)
 
   test "bzip2 bad block checksum raises":
     let good = bz2Compress("hello world".repeat(10), 9)

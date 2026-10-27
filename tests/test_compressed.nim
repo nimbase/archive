@@ -1,20 +1,9 @@
-import std/[unittest, tables]
+import std/[unittest, tables, options]
 import archive/types
 import archive/io
 import archive/registry
 import archive/files
-import archive
-import archive/formats/tar
-import archive/formats/gz
-import archive/formats/lz4
-import archive/formats/bz2
-import archive/formats/brotli
 
-registerTar()
-registerGz()
-registerLz4()
-registerBz2()
-registerBrotli()
 
 
 proc sampleFiles(ctx: ArchiveContext): seq[FileInfo] =
@@ -63,14 +52,12 @@ suite "compressed archives":
     let dst = newOutput()
     ca.archiveTo(ctx, dst, files)
     let res = identifyFormat("backup.tar.br", toInput(dst))
-    check(res.compressed != nil)
-    check(res.compressed.compression.ext == ".br")
-    check(res.compressed.extraction.ext == ".tar")
+    check(res.compression == some(fmtBrotli))
+    check(res.format == fmtTar)
     let bare = identifyFormat("backup.tar.br", openInputString("x"))
     # Filename alone matches both layers (Go parity: name matches count
     # even when the stream is garbage).
-    check(bare.compressed != nil)
-    check(bare.compressed.compression.ext == ".br")
+    check(bare.compression == some(fmtBrotli))
 
   test "tar.lz4 round trip via CompressedArchive":
     var ctx: ArchiveContext
@@ -80,9 +67,8 @@ suite "compressed archives":
     ca.archiveTo(ctx, dst, files)
     check(outputBytes(dst).len > 0)
     let res = identifyFormat("backup.tar.lz4", toInput(dst))
-    check(res.compressed != nil)
-    check(res.compressed.compression.ext == ".lz4")
-    check(res.compressed.extraction.ext == ".tar")
+    check(res.compression == some(fmtLz4))
+    check(res.format == fmtTar)
     var bodies = initOrderedTable[string, string]()
     ca.extractFrom(ctx, toInput(dst)) do (
         c: ArchiveContext; info: FileInfo):
@@ -99,9 +85,8 @@ suite "compressed archives":
     ca.archiveTo(ctx, dst, files)
     check(outputBytes(dst).len > 0)
     let res = identifyFormat("backup.tar.bz2", toInput(dst))
-    check(res.compressed != nil)
-    check(res.compressed.compression.ext == ".bz2")
-    check(res.compressed.extraction.ext == ".tar")
+    check(res.compression == some(fmtBz2))
+    check(res.format == fmtTar)
     var bodies = initOrderedTable[string, string]()
     ca.extractFrom(ctx, toInput(dst)) do (
         c: ArchiveContext; info: FileInfo):

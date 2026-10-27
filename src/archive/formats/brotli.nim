@@ -11,7 +11,12 @@ from std/os import splitFile
 import nbrotli
 import ../io
 import ../types
-import ../registry
+import ./tar
+import ./zip
+import ./gz
+import ./zlib
+import ./lz4
+import ./bz2
 
 type Brotli* = object
   quality*: int      ## 0..11, stored for future real encoder
@@ -46,24 +51,23 @@ proc isValidBrotliStream*(prefix: Span): bool =
   let res = dec.decodeSome(output, 1024)
   if res == Error:
     return false
+  # Avoid stepping on other formats: if the raw prefix matches a
+  # non-brotli format by stream, do not claim it, even when the first
+  # byte alone looks like brotli. (identify() also probes brotli last,
+  # but standalone matchBrotli needs this too.)
+  var probe = newString(n)
+  copyMem(addr probe[0], prefix.p, n)
+  let probeInp = openInputString(probe)
+  if matchTar("", probeInp).byStream or matchZip("", probeInp).byStream or
+      matchGz("", probeInp).byStream or matchZlib("", probeInp).byStream or
+      matchLz4("", probeInp).byStream or matchBz2("", probeInp).byStream:
+    return false
   if res == NeedsMoreInput and output.len == 0:
     let b = cast[ptr UncheckedArray[byte]](prefix.p)
     if n >= 4:
       let first = b[0]
       return first == 0x1b or first == 0x0b or first == 0x8b
     return false
-  # Avoid stepping on other formats: if the raw prefix matches a
-  # registered non-brotli format by stream, do not claim it.
-  var probe = newString(n)
-  copyMem(addr probe[0], prefix.p, n)
-  let probeInp = openInputString(probe)
-  for h in registeredFormats():
-    if h.format == fmtBrotli:
-      continue
-    if h.doMatch != nil:
-      let mr = h.doMatch("", probeInp)
-      if mr.byStream:
-        return false
   let totalRead = output.len
   if n > 0 and float(totalRead) / float(n) > 1.0:
     return true
@@ -76,7 +80,7 @@ proc isValidBrotliStream*(prefix: Span): bool =
   false
 
 proc matchBrotli*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == formatExt[fmtBrotli]:
+  if splitFile(filename.toLowerAscii()).ext == $fmtBrotli:
     result.byName = true
   if inp != nil:
     if isValidBrotliStream(peek(inp, 1024)):
@@ -126,13 +130,3 @@ proc openBrotliReader*(inp: Input): Input =
   brotliDecompressInto(inp, dst)
   toInput(dst)
 
-proc registerBrotli*(b: Brotli = defaultBrotli()) =
-  let h = newHandler(fmtBrotli)
-  let bb = b
-  h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
-    matchBrotli(filename, inp)
-  h.compress = proc(inp: Input; dst: Output) {.closure.} =
-    brotliCompressInto(inp, dst, bb.windowBits)
-  h.decompress = proc(inp: Input; dst: Output) {.closure.} =
-    brotliDecompressInto(inp, dst)
-  registerFormat(h)

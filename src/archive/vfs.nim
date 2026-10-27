@@ -5,7 +5,7 @@
 ## DeepFS, plus TopDir* helpers and PathIsArchive lexing.
 ## Everything reads through zero-copy Inputs; ArchiveFS indexes once.
 
-import std/[tables, strutils, algorithm]
+import std/[tables, strutils, algorithm, options]
 from std/os import dirExists, fileExists, symlinkExists, walkDir,
   getFileInfo, lastPathPart, DirSep, `/`, pcDir, pcFile,
   pcLinkToDir, pcLinkToFile
@@ -26,13 +26,13 @@ type
     case kind*: FsKind
     of fkFile:
       filePath*: string
-      fileComp*: FormatHandler  ## optional decompressor
+      fileComp*: Option[Format]  ## optional decompressor
     of fkDir:
       dirPath*: string
     of fkArchive:
       archData*: Input       ## owned (mmap or string); zero-copy source
-      archFormat*: FormatHandler
-      archComp*: FormatHandler ## when identified as CompressedArchive
+      archFormat*: Format
+      archComp*: Option[Format] ## some when format is compressed externally
       prefix*: string
       actx*: ArchiveContext
       contents*: Table[string, FileMeta]
@@ -82,10 +82,10 @@ proc openFileFs*(fsys: Fs; name: string): Input =
     raise newException(ArchiveError, "open " & name & ": not found")
   checkFsName(if name == fsys.filePath: "." else: name, "open")
   let inp = openInputFile(fsys.filePath)
-  if fsys.fileComp == nil:
+  if fsys.fileComp.isNone:
     return inp
   let dst = newOutput()
-  fsys.fileComp.decompress(inp, dst)
+  decompressInto(fsys.fileComp.get, inp, dst)
   toInput(dst)
 
 proc statFileFs*(fsys: Fs): FileMeta =
@@ -191,15 +191,15 @@ proc indexArchive(fsys: Fs) =
       if not fsys.contents.hasKey(cur):
         fsys.contents[cur] = imp.meta
       cur = parent
-  if comp != nil:
+  if comp.isSome:
     let tmp = newOutput()
-    comp.decompress(fsys.archData, tmp)
+    decompressInto(comp.get, fsys.archData, tmp)
     let inner = toInput(tmp)
-    fmt.extract(fsys.actx, inner, handler)
+    extractFormat(fmt, fsys.actx, inner, handler)
   else:
     let saved = inputPos(fsys.archData)
     try:
-      fmt.extract(fsys.actx, fsys.archData, handler)
+      extractFormat(fmt, fsys.actx, fsys.archData, handler)
     finally:
       seek(fsys.archData, saved)
   fsys.indexed = true
@@ -240,17 +240,19 @@ proc openArchive*(fsys: Fs; name: string): tuple[inp: Input;
   var foundMeta: FileMeta
   proc handler(ctx: ArchiveContext; info: FileInfo) =
     if cleanArchiveName(info.nameInArchive) == full:
-      found = info.open()
+      # gcsafe by confinement: opener runs synchronously in this thread.
+      {.gcsafe.}:
+        found = info.open()
       foundMeta = info.meta
       raise newException(SkipAll, "found")
   fsys.archData.seek(0)
   try:
-    if comp != nil:
+    if comp.isSome:
       let tmp = newOutput()
-      comp.decompress(fsys.archData, tmp)
-      fmt.extract(fsys.actx, toInput(tmp), handler)
+      decompressInto(comp.get, fsys.archData, tmp)
+      extractFormat(fmt, fsys.actx, toInput(tmp), handler)
     else:
-      fmt.extract(fsys.actx, fsys.archData, handler)
+      extractFormat(fmt, fsys.actx, fsys.archData, handler)
   except SkipAll:
     discard
   if found == nil:
@@ -289,17 +291,15 @@ proc fileSystem*(ctx: ArchiveContext; filename: string;
         return Fs(kind: fkFile, filePath: filename)
       except CatchableError as e:
         raise e
-    if res.compressed != nil:
+    if res.compression.isSome:
       return Fs(kind: fkArchive, archData: openInputFile(filename),
-        archFormat: res.compressed.extraction,
-        archComp: res.compressed.compression, actx: ctx)
-    elif res.format != nil:
-      let h = res.format
-      if h.isArchival() or h.isExtraction():
-        return Fs(kind: fkArchive, archData: openInputFile(filename),
-          archFormat: h, actx: ctx)
-      elif h.isCompression():
-        return Fs(kind: fkFile, filePath: filename, fileComp: h)
+        archFormat: res.format, archComp: res.compression, actx: ctx)
+    elif res.format.isArchival() or res.format.isExtraction():
+      return Fs(kind: fkArchive, archData: openInputFile(filename),
+        archFormat: res.format, archComp: none(Format), actx: ctx)
+    elif res.format.isCompression():
+      return Fs(kind: fkFile, filePath: filename,
+        fileComp: some(res.format))
     raise newException(ArchiveError,
       "unable to create file system rooted at " & filename)
   else:
@@ -309,17 +309,15 @@ proc fileSystem*(ctx: ArchiveContext; filename: string;
       except NoMatchError:
         raise newException(ArchiveError,
           "input without archive match needs a filename-backed FileFS")
-    if res.compressed != nil:
+    if res.compression.isSome:
       seek(inp, 0)
       return Fs(kind: fkArchive, archData: inp,
-        archFormat: res.compressed.extraction,
-        archComp: res.compressed.compression, actx: ctx)
-    elif res.format != nil:
-      let h = res.format
-      if h.isArchival() or h.isExtraction():
-        seek(inp, 0)
-        return Fs(kind: fkArchive, archData: inp, archFormat: h, actx: ctx)
-      elif h.isCompression():
+        archFormat: res.format, archComp: res.compression, actx: ctx)
+    elif res.format.isArchival() or res.format.isExtraction():
+      seek(inp, 0)
+      return Fs(kind: fkArchive, archData: inp, archFormat: res.format,
+        archComp: none(Format), actx: ctx)
+    elif res.format.isCompression():
         raise newException(ArchiveError,
           "compressed input without filename cannot form FileFS in v1")
     raise newException(ArchiveError, "unable to create file system")

@@ -34,11 +34,15 @@ src/archive.nim            # gated stub: importing it is a compile error;
                              # import the specific module you need instead
                              # (full re-export only under -d:build_docs)
 src/archive/
-  types.nim                # FileInfo, FileMeta, MatchResult, ArchiveError, SkipDir/SkipAll
+  types.nim                # FileInfo, FileMeta, MatchResult, ArchiveError, SkipDir/SkipAll,
+                           # Format + MediaType string enums ($fmt is the
+                           # extension), kindsOf/mediaTypeOf exhaustive cases
   simd.nim                 # AVX2/SSE4.2 kernels + silicon self-test (feature "nimsimd")
   io.nim                   # Input (mmap/string zero-copy cursor), Output (reusable buffer), Span
-  registry.nim             # Format enum + canonical ext/mediaType/kinds tables,
-                           # newHandler/handler/handlerFor/formatForExt, Identify
+  registry.nim             # stateless static dispatch on Format: matchFormat,
+                           # compressInto/decompressInto, archiveFormat/
+                           # extractFormat, identify/identifyFormat,
+                           # CompressedArchive pair ops, formatForExt
   files.nim                # filesFromDisk, filesFromFs, name mapping, symlink guard
   archive.nim (root)       # entry point + high-level one-shots: compress/
                            # decompress (+File), archiveData/archiveToFile/
@@ -83,12 +87,14 @@ tests/
 - Cancellation: no `context.Context`. Check an optional `cancelled: ptr bool`
   at loop heads; abort with `ArchiveError` if set. Keep signatures simple.
 - Errors: Nim exceptions (`ArchiveError`, `NoMatchError`), not Go-style tuples.
-- Registry: `Table[string, FormatHandler]` keyed by lowercased extension without
-  dot (custom formats stay possible via `fmtCustom`). Built-ins are looked up
-  by `Format` enum (`handler(fmtBz2)`); ext/mediaType/kinds come from canonical
-  tables via `newHandler`, so literals cannot drift between matchers and the
-  registry (`registerFormat` enforces the match). `handlerFor`/`formatForExt`
-  remain for filename-driven code.
+- No registry, no globals, no registration: `Format` is a string-valued
+  enum (`$fmt` is the extension), `MediaType` likewise; capabilities and
+  MIME types are exhaustive `case` procs in types.nim (compiler-checked,
+  nothing shared). registry.nim only holds static dispatch + identify.
+  Everything is safe to call from any thread; indirect calls through
+  `FileHandler`/`FileInfo.open` closures carry `{.gcsafe.}:` confinement
+  blocks, and zip's `compressedExts` is a `const` pinned by a `static`
+  assert. Parallel compress/archive/extract covered by tests/test_threads.nim.
 - `FileInfo`: object with `nameInArchive`, `linkTarget`, `size`, `mode`,
   `modTime`, `isDir`, `header: ref object` passthrough,
   `open: proc(): Input` (zero-copy for mapped entries).

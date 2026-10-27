@@ -8,7 +8,6 @@ import std/[strutils, times]
 from std/os import lastPathPart
 import ../io
 import ../types
-import ../registry
 
 const tarBlockSize* = 512
 
@@ -264,7 +263,11 @@ proc writeFileToArchive*(t: Tar; dst: Output; f: FileInfo) =
     return
   if hdr.size == 0:
     return
-  let fr = try: f.open()
+  let fr =
+    try:
+      # gcsafe by confinement: opener runs synchronously in this thread.
+      {.gcsafe.}:
+        f.open()
     except CatchableError as e:
       raise newException(ArchiveError,
         "file " & f.nameInArchive & ": open: " & e.msg)
@@ -396,7 +399,9 @@ proc extractTar*(t: Tar; ctx: ArchiveContext; inp: Input;
     let info = FileInfo(meta: meta, nameInArchive: effName,
         linkTarget: effLink, open: viewOpener(data, inp))
     try:
-      handle(ctx, info)
+      # gcsafe by confinement: handle runs synchronously in this thread.
+      {.gcsafe.}:
+        handle(ctx, info)
     except SkipAll:
       break
     except SkipDir:
@@ -459,15 +464,3 @@ proc insertTar*(t: Tar; ctx: ArchiveContext; inp: Input; dst: Output;
     ctx.checkCancelled()
     writeFileToArchive(t, dst, f)
 
-proc registerTar*(t: Tar = Tar()) =
-  let h = newHandler(fmtTar)
-  let tt = t
-  h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
-    matchTar(filename, inp)
-  h.archive = proc(ctx: ArchiveContext; dst: Output;
-      files: seq[FileInfo]) {.closure.} =
-    archiveTar(tt, ctx, dst, files)
-  h.extract = proc(ctx: ArchiveContext; inp: Input;
-      handle: FileHandler) {.closure.} =
-    extractTar(tt, ctx, inp, handle)
-  registerFormat(h)

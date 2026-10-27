@@ -9,7 +9,6 @@ from std/os import splitFile
 import ../bz2f
 import ../io
 import ../types
-import ../registry
 
 export bz2f
 
@@ -20,7 +19,7 @@ proc extension*(b: Bz2): string = ".bz2"
 proc mediaType*(b: Bz2): string = "application/x-bzip2"
 
 proc matchBz2*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == formatExt[fmtBz2]:
+  if splitFile(filename.toLowerAscii()).ext == $fmtBz2:
     result.byName = true
   if inp != nil:
     let s = peek(inp, 3)
@@ -38,13 +37,3 @@ proc openBz2Reader*(inp: Input): Input =
     raise newException(ArchiveError, "bzip2 decompress: " & e.msg)
   toInput(dst)
 
-proc registerBz2*(b: Bz2 = Bz2()) =
-  let h = newHandler(fmtBz2)
-  let bb = b
-  h.doMatch = proc(filename: string; inp: Input): MatchResult {.closure.} =
-    matchBz2(filename, inp)
-  h.compress = proc(inp: Input; dst: Output) {.closure.} =
-    bz2f.bz2CompressInto(inp, dst, bb.compressionLevel)
-  h.decompress = proc(inp: Input; dst: Output) {.closure.} =
-    bz2DecompressInto(inp, dst)
-  registerFormat(h)
