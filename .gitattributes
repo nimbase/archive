@@ -1,0 +1,7 @@
+* text=auto
+*.nim text eol=lf
+*.nims text eol=lf
+*.nimble text eol=lf
+*.md text eol=lf
+tests/testdata/* binary
+tests/testdata/** binary

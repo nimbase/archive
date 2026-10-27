@@ -1,4 +1,4 @@
-import std/[unittest]
+import std/[unittest, os]
 import archive/types
 import archive/io
 import archive/registry
@@ -52,10 +52,11 @@ suite "vfs":
     let dst = newOutput()
     ca.archiveTo(ctx, dst, files)
     let blob = take(dst)
-    let f = open("/tmp/nimarchive_test.tar.gz", fmWrite)
+    let tmpPath = joinPath(getTempDir(), "nimarchive_test.tar.gz")
+    let f = open(tmpPath, fmWrite)
     f.write(blob)
     f.close()
-    let fsys = fileSystem(ctx, "/tmp/nimarchive_test.tar.gz", nil)
+    let fsys = fileSystem(ctx, tmpPath, nil)
     check(fsys.kind == fkArchive)
     let entries = readDirFs(fsys, ".")
     check(entries.len == 1)
