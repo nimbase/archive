@@ -25,8 +25,8 @@ type Tar* = object
   hasUid*: bool
   hasGid*: bool
 
-proc extension*(t: Tar): string = ".tar"
-proc mediaType*(t: Tar): string = "application/x-tar"
+proc extension*(t: Tar): ArchiveFormat = afTar
+proc mediaType*(t: Tar): MediaType = mtTar
 
 # ---------- low-level header codec (span based, zero-copy) ----------
 
@@ -41,6 +41,8 @@ proc spanStr(s: Span; off, n: int): string =
     result[i] = char(b[off + i])
 
 proc parseOctalSpan(s: Span; off, n: int): int64 =
+  if n <= 0:
+    return 0
   var i = off
   let stop = off + n
   let b = cast[ptr UncheckedArray[byte]](s.p)
@@ -48,11 +50,22 @@ proc parseOctalSpan(s: Span; off, n: int): int64 =
   while i < stop and (b[i] == 0 or b[i] == byte(' ')):
     inc i
   if i < stop and (b[i] and 0x80'u8) != 0:
-    # base-256 binary form
-    var v: int64 = 0
+    # base-256 binary form. Saturate instead of overflowing: matchers
+    # run on arbitrary bytes (e.g. zip headers probed as tar), and an
+    # overflowing field can never validate downstream — saturation
+    # degrades to non-match instead of crashing identify.
+    var v: uint64 = 0
     for j in off ..< stop:
-      v = v * 256 + b[j].int64
-    return v - (int64(128) shl (8 * (n - 1)))
+      if v > high(uint64) shr 8:
+        return high(int64)
+      v = (v shl 8) or b[j].uint64
+    let topBit =
+      if 8 * n - 1 >= 64: 0'u64 # wider than any valid field; saturate
+      else: 1'u64 shl (8 * n - 1)
+    v = v and not topBit
+    if v > uint64(high(int64)):
+      return high(int64)
+    return cast[int64](v)
   var v: int64 = 0
   while i < stop and b[i] >= byte('0') and b[i] <= byte('7'):
     v = v * 8 + (b[i].int - ord('0'))
@@ -285,8 +298,9 @@ proc writeFileToArchive*(t: Tar; dst: Output; f: FileInfo) =
 
 proc archiveTar*(t: Tar; ctx: ArchiveContext; dst: Output;
     files: seq[FileInfo]) =
-  for f in files:
+  for i, f in files:
     ctx.checkCancelled()
+    ctx.reportProgress(f.nameInArchive, i, files.len, f.size)
     try:
       writeFileToArchive(t, dst, f)
     except CatchableError as e:
@@ -331,6 +345,7 @@ proc extractTar*(t: Tar; ctx: ArchiveContext; inp: Input;
   var skipDirs: seq[string] = @[]
   var paxPath = ""
   var paxLinkpath = ""
+  var entryIdx = 0
   while remaining(inp) >= tarBlockSize:
     ctx.checkCancelled()
     let blk = readSpan(inp, tarBlockSize)
@@ -398,6 +413,8 @@ proc extractTar*(t: Tar; ctx: ArchiveContext; inp: Input;
         isSymlink: hdr.typeflag == '2', isRegular: hdr.typeflag == '0')
     let info = FileInfo(meta: meta, nameInArchive: effName,
         linkTarget: effLink, open: viewOpener(data, inp))
+    ctx.reportProgress(info.nameInArchive, entryIdx, -1, info.size)
+    inc entryIdx
     try:
       # gcsafe by confinement: handle runs synchronously in this thread.
       {.gcsafe.}:

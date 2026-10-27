@@ -38,7 +38,7 @@ suite "vfs":
     let files = filesFromEntries(ctx, FromFSOptions(),
       [FsEntry(path: "note.txt", meta: FileMeta(name: "note.txt", size: 4,
         isRegular: true), data: "note")], ".", "")
-    let ca = compressedArchive(fmtTar, fmtGz)
+    let ca = CompressedArchive(archival: afTar, compression: cfGz)
     let dst = newOutput()
     ca.archiveTo(ctx, dst, files)
     let blob = take(dst)

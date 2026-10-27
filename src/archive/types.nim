@@ -48,27 +48,25 @@ type
     byName*: bool
     byStream*: bool
 
-  FormatKind* = enum
-    fkCompression
-    fkArchival
-    fkExtraction
-
-  Format* = enum
-    ## Closed set of built-in formats. The enum carries its own wire
-    ## strings: `$fmt` is the canonical extension, so no lookup table
-    ## exists at runtime — dispatch is static (`case fmt of`) and every
-    ## use is thread-safe by construction.
+  CompressionFormat* = enum
+    ## Compression-only formats. The enum carries its own wire string:
+    ## `$fmt` is the canonical extension. Compression and archival
+    ## formats are distinct types, so mixing them up (e.g. passing an
+    ## archive to `decompress`) fails at compile time, not at runtime.
     ## Append-only: new formats go at the end to keep ord values stable.
-    fmtTar = ".tar"
-    fmtZip = ".zip"
-    fmtGz = ".gz"
-    fmtZlib = ".zz"   ## zlib framing
-    fmtLz4 = ".lz4"
-    fmtBz2 = ".bz2"
-    fmtBrotli = ".br"
+    cfGz = ".gz"
+    cfZlib = ".zz"   ## zlib framing
+    cfLz4 = ".lz4"
+    cfBz2 = ".bz2"
+    cfBrotli = ".br"
+
+  ArchiveFormat* = enum
+    ## Archival formats (each also extracts): same string-enum pattern.
+    afTar = ".tar"
+    afZip = ".zip"
 
   MediaType* = enum
-    ## Canonical MIME types, same string-enum pattern as Format.
+    ## Canonical MIME types, same string-enum pattern as the formats.
     mtTar = "application/x-tar"
     mtZip = "application/zip"
     mtGz = "application/gzip"
@@ -77,37 +75,45 @@ type
     mtBz2 = "application/x-bzip2"
     mtBrotli = "application/x-br"
 
-proc mediaTypeOf*(fmt: Format): MediaType =
+proc mediaTypeOf*(fmt: CompressionFormat): MediaType =
   ## Exhaustive case (not a table): the compiler rejects a missing
   ## format, and there is no runtime state to share between threads.
   case fmt
-  of fmtTar: mtTar
-  of fmtZip: mtZip
-  of fmtGz: mtGz
-  of fmtZlib: mtZlib
-  of fmtLz4: mtLz4
-  of fmtBz2: mtBz2
-  of fmtBrotli: mtBrotli
+  of cfGz: mtGz
+  of cfZlib: mtZlib
+  of cfLz4: mtLz4
+  of cfBz2: mtBz2
+  of cfBrotli: mtBrotli
 
-proc kindsOf*(fmt: Format): set[FormatKind] =
-  ## Capability set per format, same exhaustive-case pattern.
+proc mediaTypeOf*(fmt: ArchiveFormat): MediaType =
+  ## Same, for archival formats (overload resolves on static type).
   case fmt
-  of fmtTar, fmtZip: {fkArchival, fkExtraction}
-  of fmtGz, fmtZlib, fmtLz4, fmtBz2, fmtBrotli: {fkCompression}
-
-proc isCompression*(fmt: Format): bool {.inline.} =
-  fkCompression in kindsOf(fmt)
-
-proc isArchival*(fmt: Format): bool {.inline.} =
-  fkArchival in kindsOf(fmt)
-
-proc isExtraction*(fmt: Format): bool {.inline.} =
-  fkExtraction in kindsOf(fmt)
+  of afTar: mtTar
+  of afZip: mtZip
 
 type
   ArchiveContext* = object
-    ## Minimal cancellation token replacing Go's context.Context.
+    ## Per-call configuration replacing Go's context.Context. Passed by
+    ## value everywhere; no shared state, so every proc taking one is
+    ## safe to call from any thread.
     cancelled*: ptr bool
+      ## Optional abort flag, checked at loop heads. Set it from another
+      ## thread or from inside `progress` to stop early.
+    progress*: ProgressCallback
+      ## Optional per-entry progress hook, nil by default (no overhead).
+      ## Fires synchronously in the caller's thread as each entry starts;
+      ## capturing locals is safe since it never escapes. Abort by
+      ## setting `cancelled` from inside.
+
+  ProgressInfo* = object
+    ## One progress tick: the entry about to be processed.
+    path*: string  ## archive path of the entry
+    index*: int    ## 0-based sequence number of this entry
+    total*: int    ## total entries, or -1 when unknown upfront (extract)
+    size*: int64   ## entry size in bytes, or -1 when unknown
+
+  ProgressCallback* = proc(info: ProgressInfo) {.closure.}
+    ## Receives one `ProgressInfo` per entry. See `ArchiveContext`.
 
   FileHandler* = proc(ctx: ArchiveContext; info: FileInfo) {.closure.}
     ## Called for each entry while extracting/walking. Raise SkipDir to
@@ -149,6 +155,17 @@ proc cancelled*(ctx: ArchiveContext): bool {.inline.} =
 proc checkCancelled*(ctx: ArchiveContext) =
   if ctx.cancelled():
     raise newException(ArchiveError, "context cancelled")
+
+proc reportProgress*(ctx: ArchiveContext; path: string; index, total: int;
+    size: int64) {.inline.} =
+  ## Fires `ctx.progress` unless nil. The indirect call is confined to
+  ## this statement (synchronous, never stored), which keeps the whole
+  ## call chain gcsafe for threaded use — same pattern as the
+  ## `handle(...)`/`open()` call sites.
+  if ctx.progress != nil:
+    {.gcsafe.}:
+      ctx.progress(ProgressInfo(path: path, index: index, total: total,
+        size: size))
 
 proc stringOpener*(data: string): proc(): Input {.closure.} =
   ## Factory returning an opener closure over its own copy of data.

@@ -1,5 +1,5 @@
-import std/[unittest, options]
-from std/os import getTempDir, joinPath, removeFile
+import std/[unittest, options, sequtils]
+from std/os import getTempDir, joinPath, removeFile, removeDir
 import archive/types
 import archive/files
 import archive
@@ -19,7 +19,7 @@ proc payload(seed, n: int): string =
 proc workCompress(seed: int) {.thread.} =
   var ok = true
   let data = payload(seed, 20000)
-  for fmt in [fmtGz, fmtZlib, fmtLz4, fmtBz2]:
+  for fmt in [cfGz, cfZlib, cfLz4, cfBz2]:
     if decompress(fmt, compress(fmt, data, level = 1)) != data:
       ok = false
   doneChan.send(ok)
@@ -35,10 +35,19 @@ proc workArchive(seed: int) {.thread.} =
     ], ".", "")
     let path = joinPath(getTempDir(), "threads_" & $seed & ".tar.gz")
     try:
-      archiveToFile(fmtTar, files, path, ctx, compression = some(fmtGz))
-      let back = extractAll(path, ctx)
+      archiveToFile(afTar, files, path, ctx, compression = some(cfGz))
+      let back = toSeq(extractAll(path, ctx))
       if back.len != 1 or back[0].data != payload(seed, 20000):
         ok = false
+      let outdir = joinPath(getTempDir(), "threads_dir_" & $seed)
+      try:
+        extractFile(path, outdir)
+        if readFile(joinPath(outdir, "w" & $seed & ".txt")) !=
+            payload(seed, 20000):
+          ok = false
+      finally:
+        try: removeDir(outdir)
+        except CatchableError: discard
     finally:
       try: removeFile(path)
       except CatchableError: discard

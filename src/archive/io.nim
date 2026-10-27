@@ -8,6 +8,19 @@
 ## only while its parent Input/Output lives.
 
 import std/memfiles
+import ./crc32
+
+const StreamChunkSize* = 65536
+  ## Fixed-size working chunk for streaming extraction. All to-disk
+  ## paths reuse buffers of this size; never scales with entry size.
+const StreamWindowSize* = 32768
+  ## DEFLATE sliding window (RFC 1951). Retained across flushes so
+  ## matches referencing up to 32KB back stay valid.
+const StreamBufCap* = StreamChunkSize + StreamWindowSize
+  ## Max buffered bytes during streaming inflate (96KB).
+const MaxScratchCap* = 1 shl 20
+  ## Sensible maximum pool size (1MB). Reusable scratch buffers that
+  ## grow beyond this are trimmed on reset to release excess.
 
 type
   MapHandle* = ref object
@@ -118,12 +131,147 @@ proc reset*(dst: Output) =
   ## Reuse the buffer without freeing capacity.
   dst.len = 0
 
+proc resetBounded*(dst: Output, maxCap = MaxScratchCap) =
+  ## Reuse the buffer, releasing excess when it grew oversized.
+  ## Call between entries so a single huge entry cannot pin a huge
+  ## buffer for the rest of the extraction (pool stays bounded).
+  dst.len = 0
+  if dst.buf.len > maxCap:
+    dst.buf = ""
+    # Next ensureCap reallocates on demand, bounded by actual use.
+
+proc outputCap*(dst: Output): int =
+  ## Current buffer capacity (bytes retained for reuse).
+  dst.buf.len
+
+proc ensureFixedCap*(dst: Output, cap: int) =
+  ## Ensure at least `cap` bytes of capacity for streaming reuse.
+  ## Called once per extraction; streaming paths flush before exceeding
+  ## it, so capacity never grows beyond `cap` afterwards.
+  if dst.buf.len < cap:
+    dst.buf.setLen(cap)
+    # Output tracks used in dst.len, capacity in buf.len. setLen
+    # preserves existing bytes; used count stays in dst.len.
+
+when defined(linux) or defined(macosx):
+  proc c_madvise(a1: pointer, a2: int, a3: cint): cint {.
+    importc: "madvise", header: "<sys/mman.h>", gcsafe.}
+
+proc releaseSpanPages*(s: Span) =
+  ## Best-effort release of file-backed pages after streaming an entry.
+  ## Keeps RSS bounded to working buffers + metadata, not total archive.
+  ## `madvise(DONTNEED)` drops clean mapped pages; subsequent access
+  ## would re-fault from disk, but streamed ranges are never re-read.
+  ## No-op on failure or unsupported platforms; never raises, gcsafe.
+  when defined(linux) or defined(macosx):
+    if s.len <= 0 or s.p == nil:
+      return
+    const PageSize = 4096
+    const MadvDontNeed = 4.cint
+    let startAddr = cast[int](s.p)
+    let alignedStart = startAddr and not (PageSize - 1)
+    let endAddr = startAddr + s.len
+    let alignedEnd = (endAddr + PageSize - 1) and not (PageSize - 1)
+    let total = alignedEnd - alignedStart
+    if total <= 0:
+      return
+    try:
+      discard c_madvise(cast[pointer](alignedStart), total, MadvDontNeed)
+    except CatchableError:
+      discard
+
+const ReleaseGranularity* = 1 shl 20
+  ## Input pages are released in 1MB chunks during streaming so even a
+  ## single huge entry stays bounded (working set ~1MB + 96KB scratch).
+
+proc flushKeepWindow*(dst: Output, f: File, keep: int,
+    crc: var uint32, total: var int) =
+  ## Write all but the last `keep` buffered bytes to `f`, updating the
+  ## running (inverted) `crc` and `total`, then compact the retained
+  ## window to the front. Keeps peak buffered at StreamBufCap.
+  ## `crc` starts as 0xFFFFFFFF; caller xors at the end.
+  let toWrite = dst.len - keep
+  if toWrite <= 0:
+    return
+  crc = crc32Update(crc, addr dst.buf[0], toWrite)
+  var off = 0
+  while off < toWrite:
+    let n = writeBuffer(f,
+      cast[pointer](cast[int](unsafeAddr dst.buf[0]) + off), toWrite - off)
+    if n <= 0:
+      raise newException(IoError, "short write")
+    off += n
+  total += toWrite
+  if keep > 0:
+    copyMem(addr dst.buf[0], addr dst.buf[toWrite], keep)
+  dst.len = keep
+
+proc flushAllToFile*(dst: Output, f: File, crc: var uint32, total: var int) =
+  ## Final flush: write everything buffered, no window retained.
+  flushKeepWindow(dst, f, 0, crc, total)
+
+proc outputBaseAddr*(dst: Output): pointer =
+  ## Base pointer of the reusable buffer for explicit checksum updates.
+  ## Lets checksum-agnostic flushes (Adler, xxHash) scan flushed bytes
+  ## before compaction while keeping `buf` itself private.
+  if dst.buf.len == 0:
+    nil
+  else:
+    unsafeAddr dst.buf[0]
+
+proc flushKeepWindowNoCrc*(dst: Output, f: File, keep: int): int =
+  ## Checksum-agnostic flush: write all but the last `keep` bytes,
+  ## compact the window, return bytes written. Caller updates its own
+  ## running checksum over `[base, base+result)` before/after.
+  let toWrite = dst.len - keep
+  if toWrite <= 0:
+    return 0
+  var off = 0
+  while off < toWrite:
+    let n = writeBuffer(f,
+      cast[pointer](cast[int](unsafeAddr dst.buf[0]) + off), toWrite - off)
+    if n <= 0:
+      raise newException(IoError, "short write")
+    off += n
+  if keep > 0:
+    copyMem(addr dst.buf[0], addr dst.buf[toWrite], keep)
+  dst.len = keep
+  toWrite
+
+proc flushAllNoCrc*(dst: Output, f: File): int =
+  ## Final checksum-agnostic flush; returns bytes written.
+  flushKeepWindowNoCrc(dst, f, 0)
+
+proc writeSpanToFile*(s: Span, f: File, crc: var uint32, total: var int) =
+  ## Zero-copy stored path: CRC + write directly from the mapped span,
+  ## no intermediate heap copy. Chunked in 1MB pieces with page release
+  ## so even a huge stored entry never pins more than the working set;
+  ## peak stays bounded, not proportional to entry size.
+  if s.len == 0:
+    return
+  var off = 0
+  while off < s.len:
+    let chunk = min(s.len - off, ReleaseGranularity)
+    let p = cast[pointer](cast[int](s.p) + off)
+    crc = crc32Update(crc, p, chunk)
+    var woff = 0
+    while woff < chunk:
+      let n = writeBuffer(f,
+        cast[pointer](cast[int](p) + woff), chunk - woff)
+      if n <= 0:
+        raise newException(IoError, "short write")
+      woff += n
+    total += chunk
+    releaseSpanPages(Span(p: p, len: chunk))
+    off += chunk
+
 proc toInput*(dst: Output): Input =
   ## Zero-copy read view over an Output's used bytes.
   Input(keep: dst, base: baseOf(dst.buf), len: dst.len, pos: 0)
 
 proc take*(dst: Output): string =
-  ## Move the used bytes dst as an exact-size string, reusing capacity.
+  ## Move the used bytes out of `dst` as an exact-size string, reusing
+  ## capacity for the next fill. Resets length to zero.
   result = newString(dst.len)
   if dst.len > 0:
     copyMem(addr result[0], addr dst.buf[0], dst.len)
@@ -188,6 +336,28 @@ proc spanAt*(inp: Input; off, n: int): Span =
     Span(p: cast[pointer](cast[int](inp.base) + off), len: n)
 
 proc basePointer*(inp: Input): pointer = inp.base
+
+proc copyStreamToFile*(inp: Input; dest: string) =
+  ## Streams an Input to a file in 64KB chunks (zero-copy views, no
+  ## intermediate whole-content string). Used by archive extraction to
+  ## keep peak memory proportional to one chunk, not the entry.
+  var f: File
+  if not open(f, dest, fmWrite):
+    raise newException(IOError, "cannot open for writing: " & dest)
+  try:
+    while remaining(inp) > 0:
+      let chunk = readSpan(inp, min(remaining(inp), 65536))
+      if chunk.len == 0:
+        break
+      var off = 0
+      while off < chunk.len:
+        let n = writeBuffer(f,
+          cast[pointer](cast[int](chunk.p) + off), chunk.len - off)
+        if n <= 0:
+          raise newException(IOError, "short write: " & dest)
+        off += n
+  finally:
+    close(f)
 
 # ---------- output writes ----------
 

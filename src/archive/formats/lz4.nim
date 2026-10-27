@@ -15,11 +15,11 @@ export lz4f
 type Lz4* = object
   compressionLevel*: int ## accepted for API parity (fast path always)
 
-proc extension*(l: Lz4): string = ".lz4"
-proc mediaType*(l: Lz4): string = "application/x-lz4"
+proc extension*(l: Lz4): CompressionFormat = cfLz4
+proc mediaType*(l: Lz4): MediaType = mtLz4
 
 proc matchLz4*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == $fmtLz4:
+  if splitFile(filename.toLowerAscii()).ext == $cfLz4:
     result.byName = true
   if inp != nil:
     let s = peek(inp, 4)

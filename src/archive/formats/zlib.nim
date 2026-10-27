@@ -15,11 +15,11 @@ export zlibf
 type Zlib* = object
   compressionLevel*: int ## 0 means DefaultCompression (like Go)
 
-proc extension*(z: Zlib): string = ".zz"
-proc mediaType*(z: Zlib): string = "application/zlib"
+proc extension*(z: Zlib): CompressionFormat = cfZlib
+proc mediaType*(z: Zlib): MediaType = mtZlib
 
 proc matchZlib*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == $fmtZlib:
+  if splitFile(filename.toLowerAscii()).ext == $cfZlib:
     result.byName = true
   if inp != nil:
     let s = peek(inp, 2)

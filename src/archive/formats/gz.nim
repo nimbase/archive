@@ -19,11 +19,11 @@ type Gz* = object
 
 const gzMagic* = [0x1f'u8, 0x8b'u8]
 
-proc extension*(g: Gz): string = ".gz"
-proc mediaType*(g: Gz): string = "application/gzip"
+proc extension*(g: Gz): CompressionFormat = cfGz
+proc mediaType*(g: Gz): MediaType = mtGz
 
 proc matchGz*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == $fmtGz:
+  if splitFile(filename.toLowerAscii()).ext == $cfGz:
     result.byName = true
   if inp != nil:
     let s = peek(inp, gzMagic.len)

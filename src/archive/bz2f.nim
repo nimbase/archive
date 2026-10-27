@@ -10,6 +10,7 @@
 
 import std/[algorithm]
 import ./io
+from std/os import removeFile
 
 type Bz2Error* = object of CatchableError
 
@@ -288,10 +289,12 @@ proc mtfEncodeIdx*(dict: var array[256, byte]; dictLen: int; val: byte): int =
       return i
   raise newException(Bz2Error, "bzip2: symbol outside alphabet")
 
-proc mtfDecodeSyms*(syms: openArray[int]; dict: openArray[byte];
-    blkSize: int): seq[byte] =
-  ## MTF+RLE2 decode with block-size bound. syms use 0=RUNA, 1=RUNB,
-  ## 2.. as MTF index+1.
+proc mtfDecodeSymsReuse*(syms: openArray[int]; dict: openArray[byte];
+    blkSize: int; outVals: var seq[byte]) =
+  ## MTF+RLE2 decode into a reusable buffer (setLen(0) first, capacity
+  ## retained across blocks so repeated blocks never reallocate).
+  ## Same semantics as mtfDecodeSyms; see it for the format details.
+  outVals.setLen(0)
   var d: array[256, byte]
   for i, v in dict:
     d[i] = v
@@ -304,11 +307,11 @@ proc mtfDecodeSyms*(syms: openArray[int]; dict: openArray[byte];
       continue
     if lastCnt > 0:
       let cnt = ((1'u32 shl lastCnt) or lastRun).int - 1
-      if result.len + cnt > blkSize or lastCnt > 24:
+      if outVals.len + cnt > blkSize or lastCnt > 24:
         raise newException(Bz2Error,
           "bzip2: run-length decoding exceeded block size")
       for _ in 0 ..< cnt:
-        result.add(d[0])
+        outVals.add(d[0])
       lastCnt = 0
       lastRun = 0
     let idx = sym - 1
@@ -318,17 +321,23 @@ proc mtfDecodeSyms*(syms: openArray[int]; dict: openArray[byte];
     if idx > 0:
       copyMem(addr d[1], addr d[0], idx)
       d[0] = val
-    if result.len >= blkSize:
+    if outVals.len >= blkSize:
       raise newException(Bz2Error,
         "bzip2: run-length decoding exceeded block size")
-    result.add(val)
+    outVals.add(val)
   if lastCnt > 0:
     let cnt = ((1'u32 shl lastCnt) or lastRun).int - 1
-    if result.len + cnt > blkSize or lastCnt > 24:
+    if outVals.len + cnt > blkSize or lastCnt > 24:
       raise newException(Bz2Error,
         "bzip2: run-length decoding exceeded block size")
     for _ in 0 ..< cnt:
-      result.add(d[0])
+      outVals.add(d[0])
+
+proc mtfDecodeSyms*(syms: openArray[int]; dict: openArray[byte];
+    blkSize: int): seq[byte] =
+  ## MTF+RLE2 decode with block-size bound. syms use 0=RUNA, 1=RUNB,
+  ## 2.. as MTF index+1.
+  mtfDecodeSymsReuse(syms, dict, blkSize, result)
 
 proc mtfEncodeVals*(vals: openArray[byte]; dict: openArray[byte];
     blkSize: int): seq[int] =
@@ -506,8 +515,10 @@ proc bwtEncode*(buf: openArray[byte]): tuple[outp: seq[byte], origin: int] =
       result.outp[j] = t[n + ii - 1]
       inc j
 
-proc bwtDecode*(buf: var seq[byte]; origin: int) =
-  ## LF-mapping inversion, in place.
+proc bwtDecodeReuse*(buf: var seq[byte]; origin: int;
+    perm: var seq[uint32]; outp: var seq[byte]) =
+  ## LF-mapping inversion with caller-provided working buffers (reused
+  ## across blocks; capacities retained). Same semantics as bwtDecode.
   let n = buf.len
   if n == 0:
     return
@@ -521,17 +532,23 @@ proc bwtDecode*(buf: var seq[byte]; origin: int) =
     let c = cumm[i]
     cumm[i] = sum
     sum += c
-  var perm = newSeq[uint32](n)
+  perm.setLen(n)
   for i, b in buf:
     perm[cumm[b]] = i.uint32
     inc cumm[b]
-  var outp = newSeq[byte](n)
+  outp.setLen(n)
   var i = perm[origin]
   for j in 0 ..< n:
     outp[j] = buf[i]
     i = perm[i]
   for j in 0 ..< n:
     buf[j] = outp[j]
+
+proc bwtDecode*(buf: var seq[byte]; origin: int) =
+  ## LF-mapping inversion, in place.
+  var perm: seq[uint32]
+  var outp: seq[byte]
+  bwtDecodeReuse(buf, origin, perm, outp)
 
 # ---------- block encode ----------
 
@@ -839,3 +856,286 @@ proc bz2Decompress*(data: string): string =
   let dst = newOutput()
   bz2DecompressInto(inp, dst)
   take(dst)
+
+type FileBzReader = object
+  ## Byte... bit-backed buffered file reader (MSB-first, like BzBits).
+  ## Owns a fixed 64KB buffer; `bitPos` tracks consumed bits, `eof`
+  ## set when file EOF reached. No globals; state explicit per call.
+  f: File
+  buf: string
+  bufLen: int
+  bitPos: int
+  eof: bool
+
+proc bzRefill(rdr: var FileBzReader) =
+  let bi = rdr.bitPos div 8
+  if bi < rdr.bufLen:
+    let unread = rdr.bufLen - bi
+    if bi > 0:
+      moveMem(addr rdr.buf[0], addr rdr.buf[bi], unread)
+    rdr.bufLen = unread
+    rdr.bitPos = rdr.bitPos - bi * 8
+  else:
+    rdr.bufLen = 0
+    rdr.bitPos = 0
+  if not rdr.eof:
+    let free = rdr.buf.len - rdr.bufLen
+    if free > 0:
+      let n = readBuffer(rdr.f, addr rdr.buf[rdr.bufLen], free)
+      if n <= 0:
+        rdr.eof = true
+      else:
+        rdr.bufLen += n
+
+proc bzEnsureBits(rdr: var FileBzReader; n: int) =
+  while (rdr.bufLen * 8 - rdr.bitPos) < n:
+    let beforeLen = rdr.bufLen
+    let beforeEof = rdr.eof
+    bzRefill(rdr)
+    if (rdr.bufLen * 8 - rdr.bitPos) < n:
+      if rdr.eof:
+        raise newException(Bz2Error, "bzip2: truncated input")
+      if rdr.bufLen == beforeLen and rdr.eof == beforeEof:
+        raise newException(Bz2Error, "bzip2: truncated input")
+
+proc bzGetBit(rdr: var FileBzReader): int =
+  bzEnsureBits(rdr, 1)
+  let p = rdr.bitPos
+  result = (cast[ptr UncheckedArray[byte]](unsafeAddr rdr.buf[0])[p shr 3].uint32 shr
+    (7 - (p and 7))).int and 1
+  inc rdr.bitPos
+
+proc bzGetBE(rdr: var FileBzReader; n: int): uint64 =
+  ## Big-endian number: first bit is MSB (matches BzBits.getBE).
+  for _ in 0 ..< n:
+    result = (result shl 1) or bzGetBit(rdr).uint64
+
+proc bzGetRaw(rdr: var FileBzReader; n: int): uint =
+  ## LSB-first assembly (matches BzBits.getRaw).
+  for i in 0 ..< n:
+    result = result or (bzGetBit(rdr).uint shl i)
+
+proc bzGetUnary(rdr: var FileBzReader; limit: int): int =
+  while bzGetBit(rdr) == 1:
+    inc result
+    if result > limit:
+      raise newException(Bz2Error, "bzip2: invalid unary code")
+
+proc bzDecodeSym(d: HuffDec; rdr: var FileBzReader): int =
+  var code = 0
+  var first = 0
+  var index = 0
+  for length in 1 .. d.maxLen:
+    code = (code shl 1) or bzGetBit(rdr)
+    if code - first < d.counts[length]:
+      return d.symbols[index + (code - first)]
+    index += d.counts[length]
+    first = (first + d.counts[length]) shl 1
+  raise newException(Bz2Error, "bzip2: invalid huffman code")
+
+type BzBlockScratch* = object
+  ## Reused per-block working buffers for file streaming decode.
+  ## Capacities grow to the largest block seen (≤900KB block → syms
+  ## ≤7.2MB ints, vals/perm/outp ≤ ~4.5MB) and are retained: no per-block
+  ## allocation churn, so the ZCT never stacks multiple blocks' garbage.
+  ## Capped by the format's max block size, never by file size.
+  syms*: seq[int]
+  vals*: seq[byte]
+  perm*: seq[uint32]
+  outp*: seq[byte]
+
+proc decodeOneBlockFile(rdr: var FileBzReader; scratch: Output; lvl: int;
+    endCRC: var uint32; gotFooter: var bool; bs: var BzBlockScratch) =
+  ## File-backed mirror of decodeOneBlock: decodes one block into the
+  ## bounded per-block `scratch` (≤900KB + slack, caller resets per
+  ## block), verifies the block CRC, folds into `endCRC`. No full
+  ## stream holding; callers flush `scratch` to disk after each block.
+  let magic = bzGetBE(rdr, 48)
+  if magic == bzEndMagic:
+    let stored = bzGetBE(rdr, 32).uint32
+    if stored != endCRC:
+      raise newException(Bz2Error, "bzip2: mismatching stream checksum")
+    endCRC = 0
+    # ReadPads: align, ignore value.
+    rdr.bitPos = (rdr.bitPos + 7) and not 7
+    gotFooter = true
+    return
+  if magic != bzBlkMagic:
+    raise newException(Bz2Error, "bzip2: invalid block or footer magic")
+  let blkCRC = bzGetBE(rdr, 32).uint32
+  if bzGetBE(rdr, 1) != 0:
+    raise newException(Bz2Error,
+      "bzip2: block randomization is not supported")
+  let origin = bzGetBE(rdr, 24).int
+  var dict = newSeq[byte]()
+  let hi = bzGetRaw(rdr, 16).int
+  for g in 0 ..< 16:
+    if ((hi shr g) and 1) != 0:
+      let lo = bzGetRaw(rdr, 16).int
+      for j in 0 ..< 16:
+        if ((lo shr j) and 1) != 0:
+          dict.add(byte(g * 16 + j))
+  var numSyms = dict.len + 2
+  if numSyms < 3:
+    raise newException(Bz2Error, "bzip2: not enough prefix symbols")
+  let numTrees = bzGetBE(rdr, 3).int
+  if numTrees < bzMinTrees or numTrees > bzMaxTrees:
+    raise newException(Bz2Error, "bzip2: invalid number of prefix trees")
+  let numSels = bzGetBE(rdr, 15).int
+  var treeSels = newSeq[int](numSels)
+  for i in 0 ..< numSels:
+    let s = bzGetUnary(rdr, bzMaxTrees)
+    if s >= numTrees:
+      raise newException(Bz2Error, "bzip2: invalid prefix tree selector")
+    treeSels[i] = s
+  var mtfD = newSeq[byte](numTrees)
+  for i in 0 ..< numTrees:
+    mtfD[i] = i.byte
+  for i in 0 ..< numSels:
+    let idx = treeSels[i]
+    if idx < 0 or idx >= numTrees:
+      raise newException(Bz2Error, "bzip2: selector MTF out of range")
+    let v = mtfD[idx]
+    if idx > 0:
+      for j in countdown(idx, 1):
+        mtfD[j] = mtfD[j - 1]
+      mtfD[0] = v
+    treeSels[i] = v.int
+  var decs = newSeq[HuffDec](numTrees)
+  for t in 0 ..< numTrees:
+    var clen = bzGetBE(rdr, 5).int
+    if clen < 1 or clen > bzMaxBits:
+      raise newException(Bz2Error, "bzip2: invalid prefix bit-length")
+    var lens = newSeq[int](numSyms)
+    for s in 0 ..< numSyms:
+      while true:
+        if bzGetBE(rdr, 1) == 0:
+          break
+        if bzGetBE(rdr, 1) == 0:
+          inc clen
+        else:
+          dec clen
+      if clen < 1 or clen > bzMaxBits:
+        raise newException(Bz2Error, "bzip2: invalid prefix bit-length")
+      lens[s] = clen
+    decs[t] = buildDecode(lens)
+  bs.syms.setLen(0)
+  var blkLen = 0
+  var selIdx = 0
+  let blkCap = lvl * bzBlockSize
+  while true:
+    if blkLen == 0:
+      blkLen = bzBlockSyms
+      if selIdx >= numSels:
+        raise newException(Bz2Error,
+          "bzip2: not enough prefix tree selectors")
+      inc selIdx
+    dec blkLen
+    let sym = bzDecodeSym(decs[treeSels[selIdx - 1]], rdr)
+    if sym == numSyms - 1:
+      break # EOB
+    if sym >= numSyms:
+      raise newException(Bz2Error, "bzip2: invalid prefix symbol")
+    if bs.syms.len >= blkCap:
+      raise newException(Bz2Error,
+        "bzip2: number of prefix symbols exceeds block size")
+    bs.syms.add(sym)
+  mtfDecodeSymsReuse(bs.syms, dict, blkCap, bs.vals)
+  bwtDecodeReuse(bs.vals, origin, bs.perm, bs.outp)
+  var crc = 0xFFFFFFFF'u32
+  rle1DecodeInto(bs.vals, scratch, crc)
+  if (crc xor 0xFFFFFFFF'u32) != blkCRC:
+    raise newException(Bz2Error, "bzip2: mismatching block checksum")
+  endCRC = ((endCRC shl 1) or (endCRC shr 31)) xor blkCRC
+
+proc bz2DecompressFile*(srcPath, dstPath: string) =
+  ## Streaming file-to-file decompress with bounded memory: 64KB input
+  ## buffer + ≤900KB per-block scratch (reused, capped at 1MB), flushed
+  ## to disk after each block. No full compressed or uncompressed
+  ## holding. Preserves Bz2Error checks (per-block and stream CRCs).
+  ## Partial output deleted on failure.
+  var rf: File
+  if not open(rf, srcPath, fmRead):
+    raise newException(Bz2Error, "bzip2: cannot open for reading: " & srcPath)
+  var wf: File
+  if not open(wf, dstPath, fmWrite):
+    close(rf)
+    raise newException(Bz2Error, "bzip2: cannot open for writing: " & dstPath)
+  var ok = false
+  try:
+    var rdr = FileBzReader(f: rf, buf: newString(StreamChunkSize),
+      bufLen: 0, bitPos: 0, eof: false)
+    let scratch = newOutput(MaxScratchCap)
+    var bs: BzBlockScratch
+    var streams = 0
+    while true:
+      # Need at least 32 bits to decide: EOF vs next stream magic.
+      var haveBits = false
+      try:
+        bzEnsureBits(rdr, 32)
+        haveBits = true
+      except Bz2Error:
+        haveBits = false
+      if not haveBits:
+        if streams == 0:
+          raise newException(Bz2Error, "bzip2: truncated stream header")
+        break
+      # Peek 16 bits without consuming for the magic check.
+      let bi = rdr.bitPos div 8
+      let bb = cast[ptr UncheckedArray[byte]](unsafeAddr rdr.buf[0])
+      # Ensure the 2 peeked bytes are buffered (they are: >=32 bits).
+      let magic16 = (bb[bi].uint64 shl 8) or bb[bi + 1].uint64
+      if magic16 != bzHdrMagic.uint64:
+        if streams == 0:
+          raise newException(Bz2Error, "bzip2: invalid stream magic")
+        break
+      # Consume "BZh" + version + level.
+      discard bzGetBE(rdr, 16)
+      let ver = bzGetBE(rdr, 8)
+      if ver == uint64('0'):
+        raise newException(Bz2Error, "bzip2: bzip1 format is not supported")
+      if ver != uint64('h'):
+        raise newException(Bz2Error, "bzip2: invalid version")
+      let lvl = bzGetBE(rdr, 8).int - '0'.ord
+      if lvl < 1 or lvl > 9:
+        raise newException(Bz2Error, "bzip2: invalid block size")
+      # Pre-size block working sets once per stream (capacities retained
+      # across blocks/streams, bounded by the format's 900KB max block):
+      # avoids first-block geometric-growth transients.
+      let blkCapNow = lvl * bzBlockSize
+      if bs.syms.len < blkCapNow:
+        bs.syms.setLen(blkCapNow)
+        bs.syms.setLen(0)
+      if bs.vals.len < blkCapNow:
+        bs.vals.setLen(blkCapNow)
+        bs.vals.setLen(0)
+      if bs.perm.len < blkCapNow:
+        bs.perm.setLen(blkCapNow)
+        bs.perm.setLen(0)
+      if bs.outp.len < blkCapNow:
+        bs.outp.setLen(blkCapNow)
+        bs.outp.setLen(0)
+      var endCRC = 0'u32
+      while true:
+        resetBounded(scratch)
+        var gotFooter = false
+        decodeOneBlockFile(rdr, scratch, lvl, endCRC, gotFooter, bs)
+        if gotFooter:
+          break
+        # Flush the decoded block; no window needed (no cross-block refs).
+        let ob = outputBytes(scratch)
+        var off = 0
+        while off < ob.len:
+          let n = writeBuffer(wf,
+            cast[pointer](cast[int](ob.p) + off), ob.len - off)
+          if n <= 0:
+            raise newException(Bz2Error, "bzip2: short write")
+          off += n
+      inc streams
+    ok = true
+  finally:
+    close(rf)
+    close(wf)
+    if not ok:
+      try: removeFile(dstPath)
+      except CatchableError: discard

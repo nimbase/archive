@@ -15,11 +15,11 @@ export bz2f
 type Bz2* = object
   compressionLevel*: int ## 0 means DefaultCompression (6); 1..9 select up to 100k..900k RLE1 bytes per block
 
-proc extension*(b: Bz2): string = ".bz2"
-proc mediaType*(b: Bz2): string = "application/x-bzip2"
+proc extension*(b: Bz2): CompressionFormat = cfBz2
+proc mediaType*(b: Bz2): MediaType = mtBz2
 
 proc matchBz2*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == $fmtBz2:
+  if splitFile(filename.toLowerAscii()).ext == $cfBz2:
     result.byName = true
   if inp != nil:
     let s = peek(inp, 3)

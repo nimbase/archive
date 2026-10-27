@@ -20,11 +20,11 @@ type Zip* = object
 
 const zipSigs = ["PK\x03\x04", "PK\x05\x06", "PK\x07\x08"]
 
-proc extension*(z: Zip): string = ".zip"
-proc mediaType*(z: Zip): string = "application/zip"
+proc extension*(z: Zip): ArchiveFormat = afZip
+proc mediaType*(z: Zip): MediaType = mtZip
 
 proc matchZip*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == $fmtZip:
+  if splitFile(filename.toLowerAscii()).ext == $afZip:
     result.byName = true
   if inp != nil:
     let s = peek(inp, 4)
@@ -46,8 +46,9 @@ const compressedExts = ["7z", "avi", "br", "bz2", "cab", "docx", "gif",
   ## ".zz" stays out, preserving historical store/deflate decisions.
 
 static:
-  for f in [fmtZip, fmtGz, fmtBz2, fmtLz4, fmtBrotli]:
+  for f in [cfGz, cfBz2, cfLz4, cfBrotli]:
     doAssert(($f)[1 .. ^1] in compressedExts)
+  doAssert("zip" in compressedExts)
 
 proc isCompressedExt(name: string): bool =
   splitFile(name.toLowerAscii()).ext.strip(chars = {'.'}) in compressedExts
@@ -83,8 +84,9 @@ proc archiveZip*(z: Zip; ctx: ArchiveContext; dst: Output;
     files: seq[FileInfo]) =
   var entries: seq[ZipEntry] = @[]
   var keeps: seq[Input] = @[] # retain borrowed spans through writeZip
-  for f in files:
+  for i, f in files:
     ctx.checkCancelled()
+    ctx.reportProgress(f.nameInArchive, i, files.len, f.size)
     var arcName = f.nameInArchive
     if arcName == "":
       arcName = f.name
@@ -134,19 +136,22 @@ proc extractZip*(z: Zip; ctx: ArchiveContext; inp: Input;
   except CatchableError as e:
     raise newException(ArchiveError, "zip open: " & e.msg)
   var skipDirs: seq[string] = @[]
+  var entryIdx = 0
   for e in reader.files:
     ctx.checkCancelled()
     if fileIsIncludedLocal(skipDirs, e.name):
       continue
     let isLink = e.isSymlink
     var meta = FileMeta(name: lastPathPart(e.name.strip(chars = {'/'})),
-        size: entryBytes(e).len.int64, mode: e.mode, modTime: e.modTime,
+        size: e.expectLen.int64, mode: e.mode, modTime: e.modTime,
         isDir: e.isDir, isSymlink: isLink, isRegular: not e.isDir and
         not isLink)
-    let eb = entryBytes(e)
     let info = FileInfo(meta: meta, nameInArchive: e.name,
-        linkTarget: e.linkTarget,
-        open: viewOpener(eb, (if e.keep != nil: e.keep else: inp)))
+      linkTarget: (if isLink and not e.isDir:
+        readAll(entryContent(e)) else: ""),
+      open: entryOpener(e))
+    ctx.reportProgress(info.nameInArchive, entryIdx, -1, info.size)
+    inc entryIdx
     try:
       # gcsafe by confinement: handle runs synchronously in this thread.
       {.gcsafe.}:

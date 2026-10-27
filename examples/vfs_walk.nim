@@ -3,7 +3,7 @@
 ## Run from this directory:
 ##   `clue build examples/vfs_walk.nim --out:/tmp/vfs_walk && (cd examples && /tmp/vfs_walk)`
 
-import archive/types      # ArchiveContext
+import archive
 import archive/vfs        # fileSystem, walkArchive, readDirFs
 
 var ctx: ArchiveContext

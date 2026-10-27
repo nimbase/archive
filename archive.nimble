@@ -2,7 +2,7 @@
 
 version       = "0.1.0"
 author        = "George Lemon"
-description   = "Unified Nim library for archives and compression, ported from mholt/archives"
+description   = "Unified Nim library for archives and compression: Supporting tar, zip, gz, rar, zstd, lzip zz, lz4, bz2, brotli"
 license       = "MIT"
 srcDir        = "src"
 

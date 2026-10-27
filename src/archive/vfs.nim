@@ -26,13 +26,13 @@ type
     case kind*: FsKind
     of fkFile:
       filePath*: string
-      fileComp*: Option[Format]  ## optional decompressor
+      fileComp*: Option[CompressionFormat]  ## optional decompressor
     of fkDir:
       dirPath*: string
     of fkArchive:
       archData*: Input       ## owned (mmap or string); zero-copy source
-      archFormat*: Format
-      archComp*: Option[Format] ## some when format is compressed externally
+      archFormat*: ArchiveFormat
+      archComp*: Option[CompressionFormat] ## some when archived compressed
       prefix*: string
       actx*: ArchiveContext
       contents*: Table[string, FileMeta]
@@ -291,15 +291,12 @@ proc fileSystem*(ctx: ArchiveContext; filename: string;
         return Fs(kind: fkFile, filePath: filename)
       except CatchableError as e:
         raise e
-    if res.compression.isSome:
+    if res.archival.isSome:
       return Fs(kind: fkArchive, archData: openInputFile(filename),
-        archFormat: res.format, archComp: res.compression, actx: ctx)
-    elif res.format.isArchival() or res.format.isExtraction():
-      return Fs(kind: fkArchive, archData: openInputFile(filename),
-        archFormat: res.format, archComp: none(Format), actx: ctx)
-    elif res.format.isCompression():
+        archFormat: res.archival.get, archComp: res.compression, actx: ctx)
+    elif res.compression.isSome:
       return Fs(kind: fkFile, filePath: filename,
-        fileComp: some(res.format))
+        fileComp: res.compression)
     raise newException(ArchiveError,
       "unable to create file system rooted at " & filename)
   else:
@@ -309,15 +306,11 @@ proc fileSystem*(ctx: ArchiveContext; filename: string;
       except NoMatchError:
         raise newException(ArchiveError,
           "input without archive match needs a filename-backed FileFS")
-    if res.compression.isSome:
+    if res.archival.isSome:
       seek(inp, 0)
       return Fs(kind: fkArchive, archData: inp,
-        archFormat: res.format, archComp: res.compression, actx: ctx)
-    elif res.format.isArchival() or res.format.isExtraction():
-      seek(inp, 0)
-      return Fs(kind: fkArchive, archData: inp, archFormat: res.format,
-        archComp: none(Format), actx: ctx)
-    elif res.format.isCompression():
+        archFormat: res.archival.get, archComp: res.compression, actx: ctx)
+    elif res.compression.isSome:
         raise newException(ArchiveError,
           "compressed input without filename cannot form FileFS in v1")
     raise newException(ArchiveError, "unable to create file system")

@@ -7,6 +7,7 @@
 
 import ./io
 import ./flate
+from std/os import removeFile
 
 type ZlibError* = object of CatchableError
 
@@ -138,3 +139,58 @@ proc zlibDecompress*(data: string): string =
   let dst = newOutput()
   zlibDecompressInto(inp, dst)
   take(dst)
+
+proc adlerUpdateNimcall(crc: uint32, p: pointer, len: int): uint32 {.nimcall.} =
+  ## Exact-signature wrapper so the generic file inflate can take it as
+  ## a proc value without overload ambiguity.
+  adler32Update(crc, p, len)
+
+proc zlibDecompressFile*(srcPath, dstPath: string) =
+  ## Streaming file-to-file decompress with bounded memory: 64KB input
+  ## buffer in the reader + ~96KB output window, reused. No full
+  ## compressed or uncompressed holding. Preserves ZlibError checks
+  ## (header, Adler-32). Partial output deleted on failure.
+  var rf: File
+  if not open(rf, srcPath, fmRead):
+    raise newException(ZlibError, "zlib: cannot open for reading: " & srcPath)
+  var wf: File
+  if not open(wf, dstPath, fmWrite):
+    close(rf)
+    raise newException(ZlibError, "zlib: cannot open for writing: " & dstPath)
+  var ok = false
+  try:
+    var rdr = initFileInflateReader(rf)
+    let scratch = newOutput(StreamBufCap)
+    # 2-byte header.
+    var h0, h1: byte
+    try:
+      h0 = fileGetByte(rdr)
+      h1 = fileGetByte(rdr)
+    except FlateError:
+      raise newException(ZlibError, "zlib: truncated header")
+    if not isValidZlibHeader(h0, h1):
+      raise newException(ZlibError, "zlib: invalid header")
+    # Body: single deflate member with running Adler-32 (init 1, no xor).
+    var res: tuple[bytes: int, crc: uint32]
+    try:
+      res = inflateFileMemberGeneric(rdr, wf, scratch, adlerUpdateNimcall, 1'u32)
+    except FlateError as e:
+      raise newException(ZlibError, "zlib: corrupt deflate: " & e.msg)
+    # Trailer: 4-byte BE Adler-32 (may already be buffered).
+    # Starts at the next byte boundary after the deflate bit stream.
+    fileAlignToByte(rdr)
+    var want: uint32 = 0
+    try:
+      for _ in 0 ..< 4:
+        want = (want shl 8) or fileGetByte(rdr).uint32
+    except FlateError:
+      raise newException(ZlibError, "zlib: truncated checksum")
+    if res.crc != want:
+      raise newException(ZlibError, "zlib: checksum mismatch")
+    ok = true
+  finally:
+    close(rf)
+    close(wf)
+    if not ok:
+      try: removeFile(dstPath)
+      except CatchableError: discard

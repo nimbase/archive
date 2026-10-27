@@ -78,7 +78,9 @@ let entries = filesFromEntries(ctx, FromFSOptions(), [
 archiveToFile(afZip, entries, "out.zip", ctx)
 archiveToFile(afTar, entries, "out.tar.gz", ctx,
   compression = some(cfGz))
-# the one-shots above also work without ctx: archiveToFile(afZip, entries, "out.zip")
+
+# the one-shots above also work without ctx:
+archiveToFile(afZip, entries, "out.zip")
 ```
 
 Inspect an archive, then extract only what you need:

@@ -24,8 +24,8 @@ type Brotli* = object
 
 proc defaultBrotli*(): Brotli = Brotli(quality: 11, windowBits: 16)
 
-proc extension*(b: Brotli): string = ".br"
-proc mediaType*(b: Brotli): string = "application/x-br"
+proc extension*(b: Brotli): CompressionFormat = cfBrotli
+proc mediaType*(b: Brotli): MediaType = mtBrotli
 
 proc isAsciiPrintable(data: openArray[byte]): bool =
   if data.len == 0:
@@ -80,7 +80,7 @@ proc isValidBrotliStream*(prefix: Span): bool =
   false
 
 proc matchBrotli*(filename: string; inp: Input): MatchResult =
-  if splitFile(filename.toLowerAscii()).ext == $fmtBrotli:
+  if splitFile(filename.toLowerAscii()).ext == $cfBrotli:
     result.byName = true
   if inp != nil:
     if isValidBrotliStream(peek(inp, 1024)):

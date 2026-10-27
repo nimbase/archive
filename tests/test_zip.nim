@@ -1,4 +1,4 @@
-import std/[unittest, tables]
+import std/[unittest, tables, strutils]
 import archive/types
 import archive/io
 import archive/files
@@ -67,6 +67,22 @@ suite "zip":
       if info.isRegular():
         bodies[info.nameInArchive] = readAll(info.open())
     check(bodies["interop.txt"] == readAll(want))
+
+  test "reads data-descriptor fixture (streaming writers)":
+    # produced by a non-seekable zipfile stream: local sizes/CRC are
+    # zeroed with a trailing descriptor, so only the central directory
+    # carries true values. Mirrors macOS Archive Utility output.
+    discard zipOpts()  # opts value; dispatch is static
+    let inp = openInputFile("tests/testdata/datadesc.zip")
+    var ctx: ArchiveContext
+    var bodies = initOrderedTable[string, string]()
+    extractZip(zipOpts(), ctx, inp) do (c: ArchiveContext; info: FileInfo):
+      if info.isRegular():
+        bodies[info.nameInArchive] = readAll(info.open())
+    check(bodies["hello.txt"] == "Hello, data descriptors! ".repeat(40))
+    check(bodies["dir/nested.bin"].len == 5000)
+    check(bodies["dir/nested.bin"][0] == '\0')
+    check(bodies["dir/nested.bin"][1] == chr(37))
 
   test "insert replaces entries":
     var ctx: ArchiveContext

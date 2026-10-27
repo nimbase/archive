@@ -18,7 +18,7 @@ suite "compressed archives":
   test "tar.gz round trip via CompressedArchive":
     var ctx: ArchiveContext
     let files = sampleFiles(ctx)
-    let ca = compressedArchive(fmtTar, fmtGz)
+    let ca = CompressedArchive(archival: afTar, compression: cfGz)
     let dst = newOutput()
     ca.archiveTo(ctx, dst, files)
     check(outputBytes(dst).len > 0)
@@ -33,7 +33,7 @@ suite "compressed archives":
   test "tar.br round trip via CompressedArchive":
     var ctx: ArchiveContext
     let files = sampleFiles(ctx)
-    let ca = compressedArchive(fmtTar, fmtBrotli)
+    let ca = CompressedArchive(archival: afTar, compression: cfBrotli)
     let dst = newOutput()
     ca.archiveTo(ctx, dst, files)
     check(outputBytes(dst).len > 0)
@@ -48,27 +48,27 @@ suite "compressed archives":
   test "identify tar.br by filename and stream":
     var ctx: ArchiveContext
     let files = sampleFiles(ctx)
-    let ca = compressedArchive(fmtTar, fmtBrotli)
+    let ca = CompressedArchive(archival: afTar, compression: cfBrotli)
     let dst = newOutput()
     ca.archiveTo(ctx, dst, files)
     let res = identifyFormat("backup.tar.br", toInput(dst))
-    check(res.compression == some(fmtBrotli))
-    check(res.format == fmtTar)
+    check(res.compression == some(cfBrotli))
+    check(res.archival == some(afTar))
     let bare = identifyFormat("backup.tar.br", openInputString("x"))
     # Filename alone matches both layers (Go parity: name matches count
     # even when the stream is garbage).
-    check(bare.compression == some(fmtBrotli))
+    check(bare.compression == some(cfBrotli))
 
   test "tar.lz4 round trip via CompressedArchive":
     var ctx: ArchiveContext
     let files = sampleFiles(ctx)
-    let ca = compressedArchive(fmtTar, fmtLz4)
+    let ca = CompressedArchive(archival: afTar, compression: cfLz4)
     let dst = newOutput()
     ca.archiveTo(ctx, dst, files)
     check(outputBytes(dst).len > 0)
     let res = identifyFormat("backup.tar.lz4", toInput(dst))
-    check(res.compression == some(fmtLz4))
-    check(res.format == fmtTar)
+    check(res.compression == some(cfLz4))
+    check(res.archival == some(afTar))
     var bodies = initOrderedTable[string, string]()
     ca.extractFrom(ctx, toInput(dst)) do (
         c: ArchiveContext; info: FileInfo):
@@ -80,13 +80,13 @@ suite "compressed archives":
   test "tar.bz2 round trip via CompressedArchive":
     var ctx: ArchiveContext
     let files = sampleFiles(ctx)
-    let ca = compressedArchive(fmtTar, fmtBz2)
+    let ca = CompressedArchive(archival: afTar, compression: cfBz2)
     let dst = newOutput()
     ca.archiveTo(ctx, dst, files)
     check(outputBytes(dst).len > 0)
     let res = identifyFormat("backup.tar.bz2", toInput(dst))
-    check(res.compression == some(fmtBz2))
-    check(res.format == fmtTar)
+    check(res.compression == some(cfBz2))
+    check(res.archival == some(afTar))
     var bodies = initOrderedTable[string, string]()
     ca.extractFrom(ctx, toInput(dst)) do (
         c: ArchiveContext; info: FileInfo):

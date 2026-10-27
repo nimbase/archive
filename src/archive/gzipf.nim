@@ -6,6 +6,8 @@
 import ./io
 import ./flate
 import ./crc32
+import std/strutils
+from std/os import removeFile
 
 type GzipError* = object of CatchableError
 
@@ -127,6 +129,133 @@ proc gzipDecompress*(data: string; multistream = true): string =
   let dst = newOutput()
   gzipDecompressInto(inp, dst, multistream)
   take(dst)
+
+proc gzipDecompressFile*(srcPath, dstPath: string; multistream = true) =
+  ## Streaming file-to-file decompress with bounded memory: 64KB input
+  ## buffer + ~96KB output window, reused across members. No full
+  ## compressed or uncompressed holding. Preserves GzipError checks.
+  ## Partial output deleted on failure (no file on error, like writeFile).
+  var rf: File
+  if not open(rf, srcPath, fmRead):
+    raise newException(GzipError, "gzip: cannot open for reading: " & srcPath)
+  var wf: File
+  if not open(wf, dstPath, fmWrite):
+    close(rf)
+    raise newException(GzipError, "gzip: cannot open for writing: " & dstPath)
+  var ok = false
+  try:
+    var rdr = initFileInflateReader(rf)
+    let scratch = newOutput(StreamBufCap)
+    var members = 0
+    while true:
+      # Detect clean EOF (no buffered data and file EOF) before member.
+      if rdr.eof and (rdr.bufLen * 8 - rdr.bitPos) == 0:
+        if members == 0:
+          raise newException(GzipError, "gzip: truncated input")
+        break
+      # Peek magic (2 bytes) with truncation mapping.
+      var m0, m1: byte
+      try:
+        # Ensure at least 2 bytes for magic check without consuming
+        # trailing garbage: read ahead, but if insufficient and members>0,
+        # break (ignore trailing) to mirror mmap version.
+        fileEnsureBits(rdr, 16)
+        let bi = rdr.bitPos div 8
+        m0 = cast[ptr UncheckedArray[byte]](unsafeAddr rdr.buf[0])[bi]
+        m1 = cast[ptr UncheckedArray[byte]](unsafeAddr rdr.buf[0])[bi + 1]
+      except FlateError:
+        if members == 0:
+          raise newException(GzipError, "gzip: truncated input")
+        break
+      if m0 != gzMagic0 or m1 != gzMagic1:
+        if members == 0:
+          raise newException(GzipError,
+            "gzip: failed identification values check")
+        break
+      # Consume magic.
+      try:
+        discard fileGetBits(rdr, 16)
+        if fileGetBits(rdr, 8) != gzDeflate.int:
+          raise newException(GzipError, "gzip: unsupported compression method")
+        let flg = fileGetBits(rdr, 8)
+        if (flg and 0xE0) != 0:
+          raise newException(GzipError, "gzip: reserved flag bits set")
+        # MTIME(4) XFL(1) OS(1)
+        for _ in 0 ..< 6:
+          discard fileGetBits(rdr, 8)
+        if (flg and 0x04) != 0: # FEXTRA
+          let xl0 = fileGetBits(rdr, 8)
+          let xl1 = fileGetBits(rdr, 8)
+          fileSkipBytes(rdr, xl0 + (xl1 shl 8))
+        if (flg and 0x08) != 0: # FNAME, null-terminated, lenient on EOF
+          while true:
+            var b: byte
+            try:
+              b = fileGetByte(rdr)
+            except FlateError:
+              break
+            if b == 0:
+              break
+            if rdr.eof and (rdr.bufLen * 8 - rdr.bitPos) == 0:
+              break
+        if (flg and 0x10) != 0: # FCOMMENT, same leniency
+          while true:
+            var b: byte
+            try:
+              b = fileGetByte(rdr)
+            except FlateError:
+              break
+            if b == 0:
+              break
+            if rdr.eof and (rdr.bufLen * 8 - rdr.bitPos) == 0:
+              break
+        if (flg and 0x02) != 0: # FHCRC
+          fileSkipBytes(rdr, 2)
+      except FlateError as e:
+        # Map bit-reader truncation during header to GzipError.
+        # Preserve specific GzipError messages already raised above;
+        # only map raw FlateError (truncated input).
+        if e.msg.startsWith("flate:"):
+          raise newException(GzipError, "gzip: truncated header")
+        raise
+      except GzipError:
+        raise
+      except CatchableError as e:
+        raise newException(GzipError, "gzip: truncated header: " & e.msg)
+      # Body: one deflate member streaming to file.
+      var res: tuple[bytes: int, crc: uint32]
+      try:
+        res = inflateFileMember(rdr, wf, scratch)
+      except FlateError as e:
+        raise newException(GzipError, "gzip: corrupt deflate: " & e.msg)
+      # Trailer: 8 bytes LE (crc + isize), may already be buffered.
+      # Starts at the next byte boundary after the deflate bit stream.
+      fileAlignToByte(rdr)
+      var wantCrc: uint32 = 0
+      var wantSize: uint32 = 0
+      try:
+        for i in 0 ..< 4:
+          wantCrc = wantCrc or (fileGetBits(rdr, 8).uint32 shl (8 * i))
+        for i in 0 ..< 4:
+          wantSize = wantSize or (fileGetBits(rdr, 8).uint32 shl (8 * i))
+      except FlateError:
+        raise newException(GzipError, "gzip: truncated trailer")
+      if res.crc != wantCrc:
+        raise newException(GzipError, "gzip: checksum mismatch")
+      if res.bytes.uint32 != wantSize:
+        raise newException(GzipError, "gzip: size mismatch")
+      inc members
+      if not multistream:
+        break
+      # Loop continues: next member header uses same buffer state
+      # (leftover read-ahead preserved, no pushback loss).
+    ok = true
+  finally:
+    close(rf)
+    close(wf)
+    if not ok:
+      try: removeFile(dstPath)
+      except CatchableError: discard
 
 proc gzipMagic*(inp: Input): bool =
   ## Peek check for the 1f 8b magic (bounds-safe).

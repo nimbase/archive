@@ -4,8 +4,6 @@
 import std/[options, strutils]
 from std/os import getTempDir, joinPath, createDir
 import archive
-import archive/registry   # Format enum
-import archive/types      # ArchiveContext
 
 # build a small demo tree in the temp dir
 let demo = joinPath(getTempDir(), "archive_demo")
@@ -16,7 +14,7 @@ writeFile(joinPath(demo, "run.sh"), "#!/bin/sh\necho hi\n")
 var ctx: ArchiveContext
 let blob = joinPath(getTempDir(), "demo.tar.gz")
 # files are memory-mapped lazily: nothing is read up front
-archiveDir(fmtTar, demo, blob, "backup", compression = some(fmtGz))
+archiveDir(afTar, demo, blob, "backup", compression = some(cfGz))
 echo "wrote ", blob
 
 # extractAll returns (archive path, content) pairs for regular files

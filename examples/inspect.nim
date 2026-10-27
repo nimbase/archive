@@ -5,8 +5,6 @@
 import std/strutils
 from std/os import getTempDir, joinPath
 import archive
-import archive/registry   # Format enum
-import archive/types      # ArchiveContext, FileInfo, FileMeta, ...
 import archive/files      # filesFromEntries, FsEntry
 import archive/io         # readAll, openInputString, ...
 
@@ -21,7 +19,7 @@ let entries = filesFromEntries(ctx, FromFSOptions(), [
 ], ".", "")
 
 let path = joinPath(getTempDir(), "inspect_demo.zip")
-archiveToFile(fmtZip, entries, path, ctx)
+archiveToFile(afZip, entries, path, ctx)
 echo "wrote ", path
 
 # peek at entry paths without decompressing contents
