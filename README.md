@@ -13,13 +13,21 @@
   <img src="https://github.com/nimbase/archive/workflows/test/badge.svg" alt="Github Actions">  <img src="https://github.com/nimbase/archive/workflows/docs/badge.svg" alt="Github Actions">
 </p>
 
+> [!NOTE]
+> This is an LLM-accelerated Nim package ported from
+> [mholt/archives](https://github.com/mholt/archives) (Go). It has diverged
+> substantially from the original: own DEFLATE/gzip/zip/tar codecs in pure
+> Nim with no C bindings, split `CompressionFormat`/`ArchiveFormat` enums,
+> no global registry, and a zero-copy I/O core. As elsewhere in nimbase, it
+> is written with heavy LLM assistance — APIs may still change, and
+> contributions (bug reports, test vectors, benchmarks) are welcome.
 
 ## Features
 - Archive and compress across tar, zip, gzip, zlib (.zz), lz4, bzip2 and brotli with one uniform API
 - Split `CompressionFormat`/`ArchiveFormat` string enums plus a `MediaType` enum: misuse fails at compile time, no runtime registry
 - High-level one-shots: `compress`/`decompress` (strings, files, buffers), `archiveDir`/`archiveData`, auto-identifying `extractFile`/`extractAll`/`listEntries`
 - Own DEFLATE/gzip/zip/tar/crc32, no C bindings, brotli via [pkg/nbrotli](https://github.com/nimbase/nbrotli)
-- Zero-copy I/O core: memory-mapped inputs, caller-reused output buffers, borrowed spans; no `streams` anywhere
+- Zero-copy I/O core powered by `std/memfiles`: memory-mapped inputs, caller-reused output buffers, borrowed spans — memory-efficient with bounded working sets, no `streams` anywhere
 - Format detection by filename and magic bytes without consuming input, plus tar.gz-style two-layer composition
 - Virtual filesystem with uniform reads over dirs, files, archives and compressed archives
 - Per-entry progress callbacks plus a cancellable context, threaded through every operation
