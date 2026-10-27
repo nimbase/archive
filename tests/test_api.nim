@@ -106,8 +106,8 @@ suite "high-level api":
     let tpath = joinPath(getTempDir(), "api_paths.tar")
     writeFile(tpath, blob)
     let names = listEntries(tpath, ctx)
-    check(joinPath(dir, "a.txt") in names)
-    check(joinPath(dir, "sub", "b.txt") in names)
+    check(joinPath(dir, "a.txt").replace('\\', '/') in names)
+    check(joinPath(dir, "sub", "b.txt").replace('\\', '/') in names)
     # explicit pairs rename entries on the way in, plus compression
     let renamed = archivePaths(afTar,
       @[(joinPath(dir, "a.txt"), "root/renamed.txt")], ctx,
