@@ -272,6 +272,57 @@ proc walkArchive*(fsys: Fs;
     let m = fsys.contents[k]
     visit(k, DirEntry(name: lastPathPart(k), isDir: m.isDir, meta: m))
 
+iterator walkFs*(fsys: Fs; root = "."): tuple[path: string; entry: DirEntry] =
+  ## Recursive walk over any filesystem kind (plain dir, archive,
+  ## compressed archive, single file), yielding fs-relative `/`-separated
+  ## paths in sorted pre-order. `root` selects the subtree to walk
+  ## ("." = whole fs); a `root` naming a file yields just that file.
+  ## Yielded paths feed `openArchive` / `dirFullPath` directly. Symlinks
+  ## are listed but never followed, so walks always terminate.
+  checkFsName(root, "walk")
+  if fsys.kind == fkFile:
+    let m = statFileFs(fsys)
+    let nm = lastPathPart(fsys.filePath)
+    yield (nm, DirEntry(name: nm, isDir: false, meta: m))
+  else:
+    var single = false
+    var singleEntry = DirEntry()
+    if fsys.kind == fkDir:
+      let full = dirFullPath(fsys, root)
+      if fileExists(full) and not dirExists(full):
+        let m = statPath(full)
+        singleEntry = DirEntry(name: lastPathPart(root), isDir: false,
+          meta: m)
+        single = true
+    else:
+      if not fsys.indexed:
+        indexArchive(fsys)
+      let full = joinPrefix(fsys.prefix, root)
+      if full != "." and fsys.contents.hasKey(full) and
+          not fsys.contents[full].isDir:
+        singleEntry = DirEntry(name: lastPathPart(root), isDir: false,
+          meta: fsys.contents[full])
+        single = true
+    if single:
+      yield (root, singleEntry)
+    else:
+      # Pending-entry stack: pop, yield, then push children reversed so
+      # descent is immediate — strict pre-order, sorted within each dir.
+      var stack: seq[tuple[path: string; entry: DirEntry]] = @[]
+      template pushEntries(dir: string) =
+        var listed = readDirFs(fsys, dir)
+        listed.sort(proc(a, b: DirEntry): int = cmp(a.name, b.name))
+        for i in countdown(listed.high, 0):
+          let ep =
+            if dir == ".": listed[i].name else: dir & "/" & listed[i].name
+          stack.add((ep, listed[i]))
+      pushEntries(root)
+      while stack.len > 0:
+        let (p, e) = stack.pop()
+        yield (p, e)
+        if e.isDir:
+          pushEntries(p)
+
 # ---------- FileSystem dispatch (port of fs.go FileSystem) ----------
 
 proc fileSystem*(ctx: ArchiveContext; filename: string;
@@ -314,6 +365,19 @@ proc fileSystem*(ctx: ArchiveContext; filename: string;
         raise newException(ArchiveError,
           "compressed input without filename cannot form FileFS in v1")
     raise newException(ArchiveError, "unable to create file system")
+
+iterator walkFs*(path: string;
+    root = "."): tuple[path: string; entry: DirEntry] =
+  ## Convenience: open `path` as a filesystem (plain dir, archive,
+  ## compressed archive, single file — detected by name and magic bytes)
+  ## with an internal context and walk it recursively. Only metadata is
+  ## yielded, so nothing borrowed escapes the walk.
+  ## `for path, e in walkFs("archive.tar")` is `fileSystem` + `walkFs`
+  ## in one call.
+  var ctx: ArchiveContext
+  let fsys = fileSystem(ctx, path, nil)
+  for p, e in walkFs(fsys, root):
+    yield (p, e)
 
 # ---------- DeepFS ----------
 

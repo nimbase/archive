@@ -35,7 +35,7 @@ proc workArchive(seed: int) {.thread.} =
     ], ".", "")
     let path = joinPath(getTempDir(), "threads_" & $seed & ".tar.gz")
     try:
-      archiveToFile(afTar, files, path, ctx, compression = some(cfGz))
+      archiveFile(afTar, files, path, ctx, compression = some(cfGz))
       let back = toSeq(extractAll(path, ctx))
       if back.len != 1 or back[0].data != payload(seed, 20000):
         ok = false

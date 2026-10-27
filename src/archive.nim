@@ -14,6 +14,7 @@ import ./archive/types
 import ./archive/io
 import ./archive/registry
 import ./archive/files
+import ./archive/vfs
 import ./archive/zipfile
 
 export registry
@@ -67,7 +68,7 @@ proc archiveData*(archival: ArchiveFormat; files: seq[FileInfo];
     archiveFormat(archival, ctx, dst, files)
   take(dst)
 
-proc archiveToFile*(archival: ArchiveFormat; files: seq[FileInfo]; path: string;
+proc archiveFile*(archival: ArchiveFormat; files: seq[FileInfo]; path: string;
     ctx = ArchiveContext(); compression = none(CompressionFormat)) =
   ## Archive a file list straight to a path.
   writeFile(path, archiveData(archival, files, ctx, compression))
@@ -79,7 +80,7 @@ proc archiveDir*(archival: ArchiveFormat; srcDir, dstPath: string;
   ## lazily; nothing is read up front).
   let files = filesFromDisk(ctx,
     FromDiskOptions(followSymlinks: followSymlinks), [(srcDir, rootInArchive)])
-  archiveToFile(archival, files, dstPath, ctx, compression)
+  archiveFile(archival, files, dstPath, ctx, compression)
 
 proc archivePaths*(archival: ArchiveFormat;
     paths: openArray[(string, string)];
@@ -330,14 +331,20 @@ iterator extractAll*(path: string): ArchiveEntry =
   for e in extractAll(path, ctx):
     yield e
 
-proc listEntries*(path: string; ctx: ArchiveContext): seq[string] =
-  ## List every entry path in an archive without reading contents.
-  var acc: seq[string] = @[]
-  extractFile(path, proc(c: ArchiveContext; info: FileInfo) =
-    acc.add(info.nameInArchive), ctx)
-  acc
+proc listEntries*(fsys: Fs; root = "."): seq[string] =
+  ## List entry paths under `root` ("." = whole fs) without reading
+  ## contents. Same walk as `walkFs`, collected: names are cleaned
+  ## fs-relative paths (leading `/` stripped, implicit parent dirs
+  ## included), directly usable with `openArchive`.
+  for p, _ in walkFs(fsys, root):
+    result.add(p)
 
-proc listEntries*(path: string): seq[string] =
+proc listEntries*(path: string; ctx: ArchiveContext;
+    root = "."): seq[string] =
+  ## List every entry path in an archive without reading contents.
+  listEntries(fileSystem(ctx, path, nil), root)
+
+proc listEntries*(path: string; root = "."): seq[string] =
   ## Same, with an internal context.
   var ctx: ArchiveContext
-  listEntries(path, ctx)
+  listEntries(path, ctx, root)

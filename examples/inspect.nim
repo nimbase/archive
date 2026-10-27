@@ -19,7 +19,7 @@ let entries = filesFromEntries(ctx, FromFSOptions(), [
 ], ".", "")
 
 let path = joinPath(getTempDir(), "inspect_demo.zip")
-archiveToFile(afZip, entries, path, ctx)
+archiveFile(afZip, entries, path, ctx)
 echo "wrote ", path
 
 # peek at entry paths without decompressing contents

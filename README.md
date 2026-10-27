@@ -73,6 +73,7 @@ Archive in-memory files straight to disk, as zip or compressed tar:
 
 ```nim
 import archive/files   # filesFromEntries, FsEntry: describe files in code
+
 # entries pair an on-disk path with its path inside the archive;
 # here both live in memory via the data field
 var ctx: ArchiveContext
@@ -82,22 +83,25 @@ let entries = filesFromEntries(ctx, FromFSOptions(), [
   FsEntry(path: "sub/b.txt", meta: FileMeta(name: "b.txt", size: 5,
     isRegular: true), data: "world"),
 ], ".", "")
+
 # plain zip, then tar compressed with gzip (some(cfGz))
-archiveToFile(afZip, entries, "out.zip", ctx)
-archiveToFile(afTar, entries, "out.tar.gz", ctx,
+archiveFile(afZip, entries, "out.zip", ctx)
+archiveFile(afTar, entries, "out.tar.gz", ctx,
   compression = some(cfGz))
 
 # the one-shots above also work without ctx:
-archiveToFile(afZip, entries, "out.zip")
+archiveFile(afZip, entries, "out.zip")
 ```
 
 Inspect an archive, then extract only what you need:
 
 ```nim
 import archive/io   # Input/Output plumbing for entry bodies
+
 # peek at entry paths without decompressing file contents
 for name in listEntries("out.tar.gz"):
   echo name
+
 # auto-identifies the format; the callback runs once per entry,
 # so filter inside it and read bodies lazily via info.open()
 extractFile("out.tar.gz", proc(c: ArchiveContext; info: FileInfo) =
@@ -110,18 +114,6 @@ recreates symlinks, rejects entries escaping the destination):
 
 ```nim
 extractFile("out.tar.gz", "restored")
-```
-
-Walk a directory, archive, or compressed archive through one interface:
-
-```nim
-import archive/vfs   # fileSystem, walkArchive, readDirFs, openArchive
-# same call works for a dir path, "a.zip", or "b.tar.gz": archives
-# (and compression layers) are detected by name and magic bytes
-let fsys = fileSystem(ctx, "out.tar.gz", nil)
-# visits every entry in sorted order, dirs included
-walkArchive(fsys) do (path: string; e: DirEntry):
-  echo (if e.isDir: "dir  " else: "file ") & path
 ```
 
 Same work with reusable buffers instead of fresh strings:
@@ -144,21 +136,11 @@ assert take(back) == "hello ".repeat(100)
 ```
 
 Browse an archive through the virtual filesystem:
-
 ```nim
-import archive/vfs
-var ctx: ArchiveContext
+import archive/vfs  
 
-# DirFS for a plain directory, ArchiveFS for an archive path
-let fsys = fileSystem(ctx, "archive.tar", nil)
-
-# flat listing of one directory level inside the fs
-for e in readDirFs(fsys, "."):
-  echo e.name
-
-# zero-copy open: inp borrows the mapped archive span, no copy
-let r = openArchive(fsys, "readme.txt")
-echo readAll(r.inp)
+for path, e in walkFs("out.tar.gz"):
+  echo (if e.isDir: "dir  " else: "file ") & path
 ```
 
 ## Roadmap

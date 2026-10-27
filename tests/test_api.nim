@@ -106,8 +106,12 @@ suite "high-level api":
     let tpath = joinPath(getTempDir(), "api_paths.tar")
     writeFile(tpath, blob)
     let names = listEntries(tpath, ctx)
-    check(joinPath(dir, "a.txt").replace('\\', '/') in names)
-    check(joinPath(dir, "sub", "b.txt").replace('\\', '/') in names)
+    # listed names are cleaned fs paths (leading slash stripped,
+    # implicit parent dirs included), usable with openArchive as-is
+    check(joinPath(dir, "a.txt").replace('\\', '/').strip(
+      chars = {'/'}, leading = true, trailing = false) in names)
+    check(joinPath(dir, "sub", "b.txt").replace('\\', '/').strip(
+      chars = {'/'}, leading = true, trailing = false) in names)
     # explicit pairs rename entries on the way in, plus compression
     let renamed = archivePaths(afTar,
       @[(joinPath(dir, "a.txt"), "root/renamed.txt")], ctx,
@@ -115,7 +119,7 @@ suite "high-level api":
     check(renamed[0 .. 1] == "\x1f\x8b")
     let rpath = joinPath(getTempDir(), "api_paths_renamed.tar.gz")
     writeFile(rpath, renamed)
-    check(listEntries(rpath, ctx) == @["root/renamed.txt"])
+    check(listEntries(rpath, ctx) == @["root", "root/renamed.txt"])
 
   test "archivePaths missing path raises":
     var ctx: ArchiveContext
@@ -184,7 +188,7 @@ suite "high-level api":
         isRegular: true), data: "note"),
     ], ".", "")
     let path = joinPath(getTempDir(), "api_extract.tar")
-    archiveToFile(afTar, files, path, ctx)
+    archiveFile(afTar, files, path, ctx)
     var bodies = initOrderedTable[string, string]()
     extractFile(path, proc(c: ArchiveContext; info: FileInfo) =
       if info.isRegular():
@@ -202,7 +206,7 @@ suite "high-level api":
         isRegular: true), data: "world"),
     ], ".", "")
     let src = joinPath(getTempDir(), "api_todir.tar")
-    archiveToFile(afTar, files, src, ctx)
+    archiveFile(afTar, files, src, ctx)
     let dst = joinPath(getTempDir(), "api_todir_out")
     removeDir(dst)
     extractFile(src, dst)
@@ -224,7 +228,7 @@ suite "high-level api":
       isRegular: true), nameInArchive: "../evil.txt",
       open: stringOpener("x"))
     let src = joinPath(getTempDir(), "api_evil.tar")
-    archiveToFile(afTar, @[evil], src, ctx)
+    archiveFile(afTar, @[evil], src, ctx)
     expect(ArchiveError):
       extractFile(src, joinPath(getTempDir(), "api_evil_out"))
 
@@ -238,7 +242,7 @@ suite "high-level api":
           isSymlink: true), data: "", linkTarget: "real.txt"),
       ], ".", "")
       let src = joinPath(getTempDir(), "api_link.tar")
-      archiveToFile(afTar, files, src, ctx)
+      archiveFile(afTar, files, src, ctx)
       let dst = joinPath(getTempDir(), "api_link_out")
       removeDir(dst)
       extractFile(src, dst)
