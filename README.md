@@ -175,7 +175,14 @@ echo readAll(r.inp)
 - [ ] rar / 7z read-only (likely needs C bindings or new ports)
 
 
-This is a port of [mholt/archives](https://github.com/mholt/archives) (Go)
+> [!NOTE]
+> This is an LLM-accelerated Nim package ported from
+> [mholt/archives](https://github.com/mholt/archives) (Go). It has diverged
+> substantially from the original: own DEFLATE/gzip/zip/tar codecs in pure
+> Nim with no C bindings, split `CompressionFormat`/`ArchiveFormat` enums,
+> no global registry, and a zero-copy I/O core. As elsewhere in nimbase, it
+> is written with heavy LLM assistance — APIs may still change, and
+> contributions (bug reports, test vectors, benchmarks) are welcome.
 
 ### ❤ Contributions & Support
 - 🐛 Found a bug? [Create a new Issue](https://github.com/nimbase/archive/issues)

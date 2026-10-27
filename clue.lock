@@ -1,1 +1,0 @@
-{"version":1,"root":"archive","nimbleHash":"1164269005865988571","features":["dev"],"nimVersion":"2.2.10","packages":[{"name":"nbrotli","version":"","constraint":">= 0.1.0","features":[],"path":"/Users/georgelemon/Development/nimbase/ports/nbrotli/src","develop":true,"url":"","ref":""}]}
