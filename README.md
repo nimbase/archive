@@ -161,6 +161,13 @@ echo readAll(r.inp)
 - [x] `Identify` by name and magic bytes, `CompressedArchive` composition (tar.gz, tar.bz2, ...)
 - [x] Virtual filesystem (DirFS, ArchiveFS, DeepFS, path helpers)
 - [x] SIMD acceleration behind the `nimsimd` feature with silicon self-test
+- [ ] Encrypted archives via `pkg/nimcypher` (XChaCha20-Poly1305 AEAD,
+  envelope around the whole blob, format-agnostic like `CompressedArchive`):
+  `EncryptedArchive` composition (archive → compress → encrypt on write,
+  decrypt → decompress → extract on read), password keys via Argon2
+  (`deriveKeyFromPassword` + stored salt) plus a raw-key API, streaming
+  AEAD (`aeadStreamWrite`/`aeadStreamRead`) so file-to-file paths stay
+  bounded-memory, own framing magic + salt + nonce header
 - [ ] xz (.xz, LZMA2 framing + range coder)
 - [ ] zstd (.zst)
 - [ ] snappy/s2 (.sz/.s2, own port)
