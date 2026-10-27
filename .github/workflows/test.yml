@@ -1,5 +1,9 @@
 name: test
-on: [push, pull_request]
+on:
+  push:
+    paths-ignore: [LICENSE, README.*, examples]
+  pull_request:
+    paths-ignore: [LICENSE, README.*, examples]
 jobs:
   test:
     uses: nimbase/setup-nim-action/.github/workflows/test_clue.yml@main
