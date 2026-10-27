@@ -1,0 +1,7 @@
+nimTitle	gzipf	archive/gzipf.html	module archive/gzipf		0
+nim	GzipError	archive/gzipf.html#GzipError	object GzipError		10
+nim	gzipCompressInto	archive/gzipf.html#gzipCompressInto,Input,Output,int	proc gzipCompressInto(inp: Input; output: Output; level = 6)		17
+nim	gzipCompress	archive/gzipf.html#gzipCompress,string,int	proc gzipCompress(data: string; level = 6): string		42
+nim	gzipDecompressInto	archive/gzipf.html#gzipDecompressInto,Input,Output	proc gzipDecompressInto(inp: Input; output: Output; multistream = true)		49
+nim	gzipDecompress	archive/gzipf.html#gzipDecompress,string	proc gzipDecompress(data: string; multistream = true): string		124
+nim	gzipMagic	archive/gzipf.html#gzipMagic,Input	proc gzipMagic(inp: Input): bool		131

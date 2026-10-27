@@ -1,0 +1,12 @@
+nimTitle	lz4f	archive/lz4f.html	module archive/lz4f		0
+nim	Lz4Error	archive/lz4f.html#Lz4Error	object Lz4Error		14
+nim	lz4Magic	archive/lz4f.html#lz4Magic	const lz4Magic		17
+nim	xxh32	archive/lz4f.html#xxh32,pointer,int,uint32	proc xxh32(p: pointer; length: int; seed = 0'u32): uint32		28
+nim	xxh32	archive/lz4f.html#xxh32,string,uint32	proc xxh32(data: string; seed = 0'u32): uint32		71
+nim	lz4DecompressBlock	archive/lz4f.html#lz4DecompressBlock,Span,Output	proc lz4DecompressBlock(blk: Span; dst: Output)		92
+nim	lz4CompressBlock	archive/lz4f.html#lz4CompressBlock,pointer,int,Output	proc lz4CompressBlock(src: pointer; len: int; dst: Output)		144
+nim	lz4CompressInto	archive/lz4f.html#lz4CompressInto,Input,Output,int	proc lz4CompressInto(inp: Input; dst: Output; level = 0)		227
+nim	lz4Compress	archive/lz4f.html#lz4Compress,string,int	proc lz4Compress(data: string; level = 0): string		266
+nim	lz4DecompressInto	archive/lz4f.html#lz4DecompressInto,Input,Output	proc lz4DecompressInto(inp: Input; dst: Output)		273
+nim	lz4Decompress	archive/lz4f.html#lz4Decompress,string	proc lz4Decompress(data: string): string		372
+nimgrp	xxh32	archive/lz4f.html#xxh32-procs-all	proc		28

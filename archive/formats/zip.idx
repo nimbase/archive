@@ -1,0 +1,9 @@
+nimTitle	zip	archive/formats/zip.html	module archive/formats/zip		0
+nim	Zip	archive/formats/zip.html#Zip	object Zip		17
+nim	extension	archive/formats/zip.html#extension,Zip	proc extension(z: Zip): string		24
+nim	mediaType	archive/formats/zip.html#mediaType,Zip	proc mediaType(z: Zip): string		25
+nim	matchZip	archive/formats/zip.html#matchZip,string,Input	proc matchZip(filename: string; inp: Input): MatchResult		27
+nim	archiveZip	archive/formats/zip.html#archiveZip,Zip,ArchiveContext,Output,seq[FileInfo]	proc archiveZip(z: Zip; ctx: ArchiveContext; dst: Output; files: seq[FileInfo])		81
+nim	extractZip	archive/formats/zip.html#extractZip,Zip,ArchiveContext,Input,FileHandler	proc extractZip(z: Zip; ctx: ArchiveContext; inp: Input; handle: FileHandler)		125
+nim	insertZip	archive/formats/zip.html#insertZip,Zip,ArchiveContext,Input,Output,seq[FileInfo]	proc insertZip(z: Zip; ctx: ArchiveContext; inp: Input; dst: Output;\n          files: seq[FileInfo])		159
+nim	registerZip	archive/formats/zip.html#registerZip,Zip	proc registerZip(z: Zip = Zip())		206

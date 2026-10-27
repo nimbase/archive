@@ -1,0 +1,8 @@
+nimTitle	crc32	archive/crc32.html	module archive/crc32		0
+nim	crc32Update	archive/crc32.html#crc32Update,uint32,pointer,int	proc crc32Update(crc: uint32; p: pointer; length: int): uint32		29
+nim	crc32Update	archive/crc32.html#crc32Update,uint32,openArray[byte]	proc crc32Update(crc: uint32; data: openArray[byte]): uint32		40
+nim	crc32Update	archive/crc32.html#crc32Update,uint32,string	proc crc32Update(crc: uint32; data: string): uint32		46
+nim	crc32Checksum	archive/crc32.html#crc32Checksum,openArray[byte]	proc crc32Checksum(data: openArray[byte]): uint32		52
+nim	crc32Checksum	archive/crc32.html#crc32Checksum,string	proc crc32Checksum(data: string): uint32		55
+nimgrp	crc32update	archive/crc32.html#crc32Update-procs-all	proc		29
+nimgrp	crc32checksum	archive/crc32.html#crc32Checksum-procs-all	proc		52

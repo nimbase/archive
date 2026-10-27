@@ -1,0 +1,7 @@
+nimTitle	bz2	archive/formats/bz2.html	module archive/formats/bz2		0
+nim	Bz2	archive/formats/bz2.html#Bz2	object Bz2		16
+nim	extension	archive/formats/bz2.html#extension,Bz2	proc extension(b: Bz2): string		19
+nim	mediaType	archive/formats/bz2.html#mediaType,Bz2	proc mediaType(b: Bz2): string		20
+nim	matchBz2	archive/formats/bz2.html#matchBz2,string,Input	proc matchBz2(filename: string; inp: Input): MatchResult		22
+nim	openBz2Reader	archive/formats/bz2.html#openBz2Reader,Input	proc openBz2Reader(inp: Input): Input		32
+nim	registerBz2	archive/formats/bz2.html#registerBz2,Bz2	proc registerBz2(b: Bz2 = Bz2())		41

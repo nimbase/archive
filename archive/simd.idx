@@ -1,0 +1,8 @@
+nimTitle	simd	archive/simd.html	module archive/simd		0
+nim	simdOn	archive/simd.html#simdOn	const simdOn		11
+nim	hasAvx2	archive/simd.html#hasAvx2	const hasAvx2		20
+nim	simdValidated	archive/simd.html#simdValidated	proc simdValidated(): bool		45
+nim	copyMemSimd	archive/simd.html#copyMemSimd,pointer,pointer,int	proc copyMemSimd(dst, src: pointer; len: int)		55
+nim	copyMatchSimd	archive/simd.html#copyMatchSimd,pointer,pointer,int,int	proc copyMatchSimd(dst, src: pointer; len, dist: int)		90
+nim	matchLenSimd	archive/simd.html#matchLenSimd,pointer,pointer,int	proc matchLenSimd(a, b: pointer; maxLen: int): int		107
+nim	crc32Hw	archive/simd.html#crc32Hw,uint32,pointer,int	proc crc32Hw(crc: uint32; p: pointer; len: int): uint32		135

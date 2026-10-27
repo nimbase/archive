@@ -1,0 +1,32 @@
+nimTitle	types	archive/types.html	module archive/types		0
+nim	ArchiveError	archive/types.html#ArchiveError	object ArchiveError		13
+nim	NoMatchError	archive/types.html#NoMatchError	object NoMatchError		14
+nim	SkipDir	archive/types.html#SkipDir	object SkipDir		15
+nim	SkipAll	archive/types.html#SkipAll	object SkipAll		16
+nim	FileMode	archive/types.html#FileMode	type FileMode		18
+nim	FileMeta	archive/types.html#FileMeta	object FileMeta		22
+nim	FileInfo	archive/types.html#FileInfo	object FileInfo		32
+nim	MatchResult	archive/types.html#MatchResult	object MatchResult		47
+nim	ArchiveContext	archive/types.html#ArchiveContext	object ArchiveContext		51
+nim	FileHandler	archive/types.html#FileHandler	type FileHandler		55
+nim	FromDiskOptions	archive/types.html#FromDiskOptions	object FromDiskOptions		59
+nim	FromFSOptions	archive/types.html#FromFSOptions	object FromFSOptions		63
+nim	ArchiveAsyncJob	archive/types.html#ArchiveAsyncJob	object ArchiveAsyncJob		67
+nim	ModeDir	archive/types.html#ModeDir	const ModeDir		74
+nim	ModeSymlink	archive/types.html#ModeSymlink	const ModeSymlink		75
+nim	ModePermMask	archive/types.html#ModePermMask	const ModePermMask		76
+nim	matched	archive/types.html#matched,MatchResult	proc matched(mr: MatchResult): bool		78
+nim	isDir	archive/types.html#isDir,FileInfo	proc isDir(f: FileInfo): bool		81
+nim	isSymlink	archive/types.html#isSymlink,FileInfo	proc isSymlink(f: FileInfo): bool		82
+nim	isRegular	archive/types.html#isRegular,FileInfo	proc isRegular(f: FileInfo): bool		83
+nim	size	archive/types.html#size,FileInfo	proc size(f: FileInfo): int64		84
+nim	name	archive/types.html#name,FileInfo	proc name(f: FileInfo): string		85
+nim	mode	archive/types.html#mode,FileInfo	proc mode(f: FileInfo): int		86
+nim	modTime	archive/types.html#modTime,FileInfo	proc modTime(f: FileInfo): Time		87
+nim	cancelled	archive/types.html#cancelled,ArchiveContext	proc cancelled(ctx: ArchiveContext): bool		89
+nim	checkCancelled	archive/types.html#checkCancelled,ArchiveContext	proc checkCancelled(ctx: ArchiveContext)		92
+nim	stringOpener	archive/types.html#stringOpener,string	proc stringOpener(data: string): proc (): Input {.closure.}		96
+nim	fileOpener	archive/types.html#fileOpener,string	proc fileOpener(path: string): proc (): Input {.closure.}		106
+nim	viewOpener	archive/types.html#viewOpener,Span,RootRef	proc viewOpener(s: Span; keep: RootRef): proc (): Input {.closure.}		112
+nim	fileMetaFromStat	archive/types.html#fileMetaFromStat,string,FileInfo	proc fileMetaFromStat(path: string; info: FileInfo): FileMeta		117
+nim	noAttrMeta	archive/types.html#noAttrMeta,FileMeta	proc noAttrMeta(m: FileMeta): FileMeta		121

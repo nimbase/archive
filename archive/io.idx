@@ -1,0 +1,42 @@
+nimTitle	io	archive/io.html	module archive/io		0
+nim	MapHandle	archive/io.html#MapHandle	type MapHandle		13
+nim	Input	archive/io.html#Input	type Input		19
+nim	Output	archive/io.html#Output	type Output		30
+nim	Span	archive/io.html#Span	object Span		35
+nim	IoError	archive/io.html#IoError	object IoError		41
+nim	closeMap	archive/io.html#closeMap,MapHandle	proc closeMap(h: MapHandle)		45
+nim	openMap	archive/io.html#openMap,string	proc openMap(path: string): MapHandle		53
+nim	close	archive/io.html#close,Input	proc close(inp: Input)		60
+nim	openInputFile	archive/io.html#openInputFile,string	proc openInputFile(path: string): Input		79
+nim	openInputString	archive/io.html#openInputString,string	proc openInputString(s: string): Input		89
+nim	openInputCopy	archive/io.html#openInputCopy,pointer,int	proc openInputCopy(p: pointer; length: int): Input		93
+nim	openInputBytes	archive/io.html#openInputBytes,openArray[byte]	proc openInputBytes(data: openArray[byte]): Input		100
+nim	openInputView	archive/io.html#openInputView,Span,RootRef	proc openInputView(s: Span; keep: RootRef): Input		106
+nim	newOutput	archive/io.html#newOutput,int	proc newOutput(cap = 0): Output		111
+nim	reset	archive/io.html#reset,Output	proc reset(dst: Output)		117
+nim	toInput	archive/io.html#toInput,Output	proc toInput(dst: Output): Input		121
+nim	take	archive/io.html#take,Output	proc take(dst: Output): string		125
+nim	inputLen	archive/io.html#inputLen,Input	proc inputLen(inp: Input): int		134
+nim	inputPos	archive/io.html#inputPos,Input	proc inputPos(inp: Input): int		135
+nim	remaining	archive/io.html#remaining,Input	proc remaining(inp: Input): int		136
+nim	seek	archive/io.html#seek,Input,int	proc seek(inp: Input; pos: int)		138
+nim	skip	archive/io.html#skip,Input,int	proc skip(inp: Input; n: int)		143
+nim	peek	archive/io.html#peek,Input,int	proc peek(inp: Input; n: int): Span		146
+nim	readSpan	archive/io.html#readSpan,Input,int	proc readSpan(inp: Input; n: int): Span		155
+nim	readByte	archive/io.html#readByte,Input	proc readByte(inp: Input): byte		160
+nim	readBytes	archive/io.html#readBytes,Input,int	proc readBytes(inp: Input; n: int): string		166
+nim	readAll	archive/io.html#readAll,Input	proc readAll(inp: Input): string		173
+nim	byteAt	archive/io.html#byteAt,Input,int	proc byteAt(inp: Input; off: int): byte		176
+nim	spanAt	archive/io.html#spanAt,Input,int,int	proc spanAt(inp: Input; off, n: int): Span		181
+nim	basePointer	archive/io.html#basePointer,Input	proc basePointer(inp: Input): pointer		190
+nim	writeBytes	archive/io.html#writeBytes,Output,pointer,int	proc writeBytes(dst: Output; p: pointer; n: int)		203
+nim	writeStr	archive/io.html#writeStr,Output,string	proc writeStr(dst: Output; s: string)		210
+nim	writeByte	archive/io.html#writeByte,Output,	proc writeByte(dst: Output; c: char | byte)		214
+nim	outputBytes	archive/io.html#outputBytes,Output	proc outputBytes(dst: Output): Span		219
+nim	reserve	archive/io.html#reserve,Output,int	proc reserve(dst: Output; additional: int): pointer		226
+nim	advance	archive/io.html#advance,Output,int	proc advance(dst: Output; n: int)		236
+nim	spanLen	archive/io.html#spanLen,Span	proc spanLen(s: Span): int		244
+nim	u16le	archive/io.html#u16le,Span,int	proc u16le(s: Span; off: int): int		246
+nim	u32le	archive/io.html#u32le,Span,int	proc u32le(s: Span; off: int): uint32		250
+nim	spanToString	archive/io.html#spanToString,Span	proc spanToString(s: Span): string		255
+nim	spanEqual	archive/io.html#spanEqual,Span,string	proc spanEqual(a: Span; s: string): bool		260

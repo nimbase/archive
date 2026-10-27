@@ -1,0 +1,18 @@
+nimTitle	archive	archive.html	module archive		0
+nim	registerDefaults	archive.html#registerDefaults	proc registerDefaults()		31
+nim	ArchiveEntry	archive.html#ArchiveEntry	tuple ArchiveEntry		41
+nim	compressInto	archive.html#compressInto,Format,Input,Output,int	proc compressInto(fmt: Format; inp: Input; dst: Output; level = 0)		46
+nim	decompressInto	archive.html#decompressInto,Format,Input,Output	proc decompressInto(fmt: Format; inp: Input; dst: Output)		61
+nim	compress	archive.html#compress,Format,string,int	proc compress(fmt: Format; data: string; level = 0): string		73
+nim	decompress	archive.html#decompress,Format,string	proc decompress(fmt: Format; data: string): string		79
+nim	compressFile	archive.html#compressFile,Format,string,string,int	proc compressFile(fmt: Format; srcPath, dstPath: string; level = 0)		85
+nim	decompressFile	archive.html#decompressFile,Format,string,string	proc decompressFile(fmt: Format; srcPath, dstPath: string)		95
+nim	compressedArchive	archive.html#compressedArchive,Format,Format	proc compressedArchive(archival, compression: Format): CompressedArchive		107
+nim	archiveData	archive.html#archiveData,Format,seq[FileInfo]	proc archiveData(archival: Format; files: seq[FileInfo]; ctx = ArchiveContext();\n            compression = none(Format)): string		121
+nim	archiveToFile	archive.html#archiveToFile,Format,seq[FileInfo],string	proc archiveToFile(archival: Format; files: seq[FileInfo]; path: string;\n              ctx = ArchiveContext(); compression = none(Format))		137
+nim	archiveDir	archive.html#archiveDir,Format,string,string,string	proc archiveDir(archival: Format; srcDir, dstPath: string; rootInArchive = "";\n           ctx = ArchiveContext(); compression = none(Format);\n           followSymlinks = false)		142
+nim	extractIdentified	archive.html#extractIdentified,IdentifyResult,ArchiveContext,Input,FileHandler	proc extractIdentified(res: IdentifyResult; ctx: ArchiveContext; inp: Input;\n                  handle: FileHandler)		153
+nim	identifyPath	archive.html#identifyPath,string	proc identifyPath(path: string): IdentifyResult		167
+nim	extractFile	archive.html#extractFile,string,FileHandler	proc extractFile(path: string; handle: FileHandler; ctx = ArchiveContext())		175
+nim	extractAll	archive.html#extractAll,string	proc extractAll(path: string; ctx = ArchiveContext()): seq[ArchiveEntry]		187
+nim	listEntries	archive.html#listEntries,string	proc listEntries(path: string; ctx = ArchiveContext()): seq[string]		195

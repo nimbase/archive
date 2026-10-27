@@ -1,0 +1,7 @@
+nimTitle	zlib	archive/formats/zlib.html	module archive/formats/zlib		0
+nim	Zlib	archive/formats/zlib.html#Zlib	object Zlib		16
+nim	extension	archive/formats/zlib.html#extension,Zlib	proc extension(z: Zlib): string		19
+nim	mediaType	archive/formats/zlib.html#mediaType,Zlib	proc mediaType(z: Zlib): string		20
+nim	matchZlib	archive/formats/zlib.html#matchZlib,string,Input	proc matchZlib(filename: string; inp: Input): MatchResult		22
+nim	openZlibReader	archive/formats/zlib.html#openZlibReader,Input	proc openZlibReader(inp: Input): Input		32
+nim	registerZlib	archive/formats/zlib.html#registerZlib,Zlib	proc registerZlib(z: Zlib = Zlib())		41

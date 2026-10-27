@@ -1,0 +1,8 @@
+nimTitle	files	archive/files.html	module archive/files		0
+nim	metaForPath	archive/files.html#metaForPath,string	proc metaForPath(path: string): FileMeta		12
+nim	trimTopDir	archive/files.html#trimTopDir,string	proc trimTopDir(dir: string): string		25
+nim	nameOnDiskToNameInArchive	archive/files.html#nameOnDiskToNameInArchive,string,string,string,char	proc nameOnDiskToNameInArchive(nameOnDisk, rootOnDisk, rootInArchive: string;\n                          separator: char): string		42
+nim	followSymlink	archive/files.html#followSymlink,string,int	proc followSymlink(filename: string; maxDepth = 40): tuple[path: string,\n    meta: FileMeta]		65
+nim	filesFromDisk	archive/files.html#filesFromDisk,ArchiveContext,FromDiskOptions,openArray[]	proc filesFromDisk(ctx: ArchiveContext; opts: FromDiskOptions;\n              filenames: openArray[(string, string)]): seq[FileInfo]		85
+nim	FsEntry	archive/files.html#FsEntry	object FsEntry		148
+nim	filesFromEntries	archive/files.html#filesFromEntries,ArchiveContext,FromFSOptions,openArray[FsEntry],string,string	proc filesFromEntries(ctx: ArchiveContext; opts: FromFSOptions;\n                 entries: openArray[FsEntry]; rootOnFs, rootInArchive: string): seq[\n    FileInfo]		154

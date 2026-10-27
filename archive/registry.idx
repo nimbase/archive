@@ -1,0 +1,41 @@
+nimTitle	registry	archive/registry.html	module archive/registry		0
+nim	fmtTar	archive/registry.html#fmtTar	Format.fmtTar		11
+nim	fmtZip	archive/registry.html#fmtZip	Format.fmtZip		11
+nim	fmtGz	archive/registry.html#fmtGz	Format.fmtGz		11
+nim	fmtZlib	archive/registry.html#fmtZlib	Format.fmtZlib		11
+nim	fmtLz4	archive/registry.html#fmtLz4	Format.fmtLz4		11
+nim	fmtBz2	archive/registry.html#fmtBz2	Format.fmtBz2		11
+nim	fmtBrotli	archive/registry.html#fmtBrotli	Format.fmtBrotli		11
+nim	fmtCustom	archive/registry.html#fmtCustom	Format.fmtCustom		11
+nim	Format	archive/registry.html#Format	enum Format		11
+nim	fkCompression	archive/registry.html#fkCompression	FormatKind.fkCompression		24
+nim	fkArchival	archive/registry.html#fkArchival	FormatKind.fkArchival		24
+nim	fkExtraction	archive/registry.html#fkExtraction	FormatKind.fkExtraction		24
+nim	FormatKind	archive/registry.html#FormatKind	enum FormatKind		24
+nim	FormatHandler	archive/registry.html#FormatHandler	type FormatHandler		29
+nim	formatExt	archive/registry.html#formatExt	const formatExt		45
+nim	formatMediaType	archive/registry.html#formatMediaType	const formatMediaType		50
+nim	formatKinds	archive/registry.html#formatKinds	const formatKinds		55
+nim	CompressedArchive	archive/registry.html#CompressedArchive	type CompressedArchive		61
+nim	IdentifyResult	archive/registry.html#IdentifyResult	object IdentifyResult		67
+nim	newHandler	archive/registry.html#newHandler,Format	proc newHandler(fmt: Format): FormatHandler		72
+nim	registerFormat	archive/registry.html#registerFormat,FormatHandler	proc registerFormat(h: FormatHandler)		83
+nim	registeredFormats	archive/registry.html#registeredFormats	proc registeredFormats(): seq[FormatHandler]		100
+nim	handler	archive/registry.html#handler,Format	proc handler(fmt: Format): FormatHandler		104
+nim	formatForExt	archive/registry.html#formatForExt,string	proc formatForExt(ext: string): Format		114
+nim	handlerFor	archive/registry.html#handlerFor,string	proc handlerFor(ext: string): FormatHandler		123
+nim	extension	archive/registry.html#extension,FormatHandler	proc extension(h: FormatHandler): string		128
+nim	mediaTypeOf	archive/registry.html#mediaTypeOf,FormatHandler	proc mediaTypeOf(h: FormatHandler): string		129
+nim	isCompression	archive/registry.html#isCompression,FormatHandler	proc isCompression(h: FormatHandler): bool		130
+nim	isArchival	archive/registry.html#isArchival,FormatHandler	proc isArchival(h: FormatHandler): bool		131
+nim	isExtraction	archive/registry.html#isExtraction,FormatHandler	proc isExtraction(h: FormatHandler): bool		132
+nim	extension	archive/registry.html#extension,CompressedArchive	proc extension(c: CompressedArchive): string		134
+nim	mediaTypeOf	archive/registry.html#mediaTypeOf,CompressedArchive	proc mediaTypeOf(c: CompressedArchive): string		142
+nim	baseName	archive/registry.html#baseName,string	proc baseName(filename: string): string		145
+nim	identify	archive/registry.html#identify,ArchiveContext,string,Input	proc identify(ctx: ArchiveContext; filename: string; inp: Input = nil): IdentifyResult		167
+nim	identifyFormat	archive/registry.html#identifyFormat,string,Input	proc identifyFormat(filename: string; inp: Input = nil): IdentifyResult		227
+nim	archiveTo	archive/registry.html#archiveTo,CompressedArchive,ArchiveContext,Output,seq[FileInfo]	proc archiveTo(c: CompressedArchive; ctx: ArchiveContext; dst: Output;\n          files: seq[FileInfo])		233
+nim	extractFrom	archive/registry.html#extractFrom,CompressedArchive,ArchiveContext,Input,FileHandler	proc extractFrom(c: CompressedArchive; ctx: ArchiveContext; inp: Input;\n            handle: FileHandler)		244
+nim	matchCompressed	archive/registry.html#matchCompressed,CompressedArchive,string,Input	proc matchCompressed(c: CompressedArchive; filename: string; inp: Input): MatchResult		255
+nimgrp	mediatypeof	archive/registry.html#mediaTypeOf-procs-all	proc		129
+nimgrp	extension	archive/registry.html#extension-procs-all	proc		128

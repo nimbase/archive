@@ -1,0 +1,15 @@
+nimTitle	zlibf	archive/zlibf.html	module archive/zlibf		0
+nim	ZlibError	archive/zlibf.html#ZlibError	object ZlibError		11
+nim	isValidZlibHeader	archive/zlibf.html#isValidZlibHeader,byte,byte	proc isValidZlibHeader(first, second: byte): bool		19
+nim	adler32Update	archive/zlibf.html#adler32Update,uint32,pointer,int	proc adler32Update(adler: uint32; p: pointer; length: int): uint32		31
+nim	adler32Update	archive/zlibf.html#adler32Update,uint32,string	proc adler32Update(adler: uint32; data: string): uint32		50
+nim	adler32Update	archive/zlibf.html#adler32Update,uint32,openArray[byte]	proc adler32Update(adler: uint32; data: openArray[byte]): uint32		56
+nim	adler32Checksum	archive/zlibf.html#adler32Checksum,string	proc adler32Checksum(data: string): uint32		62
+nim	adler32Checksum	archive/zlibf.html#adler32Checksum,openArray[byte]	proc adler32Checksum(data: openArray[byte]): uint32		65
+nim	zlibHeaderForLevel	archive/zlibf.html#zlibHeaderForLevel,int	proc zlibHeaderForLevel(level: int): tuple[cmf, flg: byte]		68
+nim	zlibCompressInto	archive/zlibf.html#zlibCompressInto,Input,Output,int	proc zlibCompressInto(inp: Input; dst: Output; level = 6)		78
+nim	zlibCompress	archive/zlibf.html#zlibCompress,string,int	proc zlibCompress(data: string; level = 6): string		92
+nim	zlibDecompressInto	archive/zlibf.html#zlibDecompressInto,Input,Output	proc zlibDecompressInto(inp: Input; dst: Output)		99
+nim	zlibDecompress	archive/zlibf.html#zlibDecompress,string	proc zlibDecompress(data: string): string		135
+nimgrp	adler32checksum	archive/zlibf.html#adler32Checksum-procs-all	proc		62
+nimgrp	adler32update	archive/zlibf.html#adler32Update-procs-all	proc		31

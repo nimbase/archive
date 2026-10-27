@@ -1,0 +1,7 @@
+nimTitle	flate	archive/flate.html	module archive/flate		0
+nim	FlateError	archive/flate.html#FlateError	object FlateError		13
+nim	inflateStreamPtr	archive/flate.html#inflateStreamPtr,pointer,int,int,Output	proc inflateStreamPtr(base: pointer; totalLen, startBit: int; output: Output): int		233
+nim	inflateInto	archive/flate.html#inflateInto,Input,Output	proc inflateInto(inp: Input; output: Output)		240
+nim	inflateAll	archive/flate.html#inflateAll,string	proc inflateAll(data: string): string		248
+nim	deflateInto	archive/flate.html#deflateInto,Input,Output	proc deflateInto(inp: Input; output: Output)		334
+nim	deflateFixed	archive/flate.html#deflateFixed,string	proc deflateFixed(data: string): string		401

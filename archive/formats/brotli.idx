@@ -1,0 +1,11 @@
+nimTitle	brotli	archive/formats/brotli.html	module archive/formats/brotli		0
+nim	Brotli	archive/formats/brotli.html#Brotli	object Brotli		16
+nim	defaultBrotli	archive/formats/brotli.html#defaultBrotli	proc defaultBrotli(): Brotli		20
+nim	extension	archive/formats/brotli.html#extension,Brotli	proc extension(b: Brotli): string		22
+nim	mediaType	archive/formats/brotli.html#mediaType,Brotli	proc mediaType(b: Brotli): string		23
+nim	isValidBrotliStream	archive/formats/brotli.html#isValidBrotliStream,Span	proc isValidBrotliStream(prefix: Span): bool		36
+nim	matchBrotli	archive/formats/brotli.html#matchBrotli,string,Input	proc matchBrotli(filename: string; inp: Input): MatchResult		78
+nim	brotliDecompressInto	archive/formats/brotli.html#brotliDecompressInto,Input,Output	proc brotliDecompressInto(inp: Input; dst: Output)		85
+nim	brotliCompressInto	archive/formats/brotli.html#brotliCompressInto,Input,Output,int	proc brotliCompressInto(inp: Input; dst: Output; wbits = 16)		106
+nim	openBrotliReader	archive/formats/brotli.html#openBrotliReader,Input	proc openBrotliReader(inp: Input): Input		123
+nim	registerBrotli	archive/formats/brotli.html#registerBrotli,Brotli	proc registerBrotli(b: Brotli = defaultBrotli())		129

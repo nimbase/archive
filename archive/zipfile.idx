@@ -1,0 +1,7 @@
+nimTitle	zipfile	archive/zipfile.html	module archive/zipfile		0
+nim	ZipError	archive/zipfile.html#ZipError	object ZipError		14
+nim	ZipEntry	archive/zipfile.html#ZipEntry	object ZipEntry		28
+nim	ZipReader	archive/zipfile.html#ZipReader	object ZipReader		41
+nim	entryBytes	archive/zipfile.html#entryBytes,ZipEntry	proc entryBytes(e: ZipEntry): Span		44
+nim	openZip	archive/zipfile.html#openZip,Input	proc openZip(inp: Input): ZipReader		102
+nim	writeZip	archive/zipfile.html#writeZip,openArray[ZipEntry],Output	proc writeZip(entries: openArray[ZipEntry]; dst: Output)		209

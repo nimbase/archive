@@ -1,0 +1,36 @@
+nimTitle	bz2f	archive/bz2f.html	module archive/bz2f		0
+nim	Bz2Error	archive/bz2f.html#Bz2Error	object Bz2Error		14
+nim	bzCrcUpdate	archive/bz2f.html#bzCrcUpdate,uint32,pointer,int	proc bzCrcUpdate(crc: uint32; p: pointer; length: int): uint32		40
+nim	bzCrcUpdate	archive/bz2f.html#bzCrcUpdate,uint32,string	proc bzCrcUpdate(crc: uint32; data: string): uint32		48
+nim	bzCrcChecksum	archive/bz2f.html#bzCrcChecksum,string	proc bzCrcChecksum(data: string): uint32		52
+nim	BzBits	archive/bz2f.html#BzBits	object BzBits		59
+nim	getBit	archive/bz2f.html#getBit,BzBits	proc getBit(br: var BzBits): int		64
+nim	getBE	archive/bz2f.html#getBE,BzBits,int	proc getBE(br: var BzBits; n: int): uint64		71
+nim	getRaw	archive/bz2f.html#getRaw,BzBits,int	proc getRaw(br: var BzBits; n: int): uint		77
+nim	getUnary	archive/bz2f.html#getUnary,BzBits,int	proc getUnary(br: var BzBits; limit: int): int		83
+nim	BzWriter	archive/bz2f.html#BzWriter	object BzWriter		94
+nim	putBit	archive/bz2f.html#putBit,BzWriter,int	proc putBit(w: var BzWriter; b: int)		99
+nim	putRaw	archive/bz2f.html#putRaw,BzWriter,uint32,int	proc putRaw(w: var BzWriter; v: uint32; n: int)		107
+nim	putBE	archive/bz2f.html#putBE,BzWriter,uint64,int	proc putBE(w: var BzWriter; v: uint64; n: int)		112
+nim	putUnary	archive/bz2f.html#putUnary,BzWriter,int	proc putUnary(w: var BzWriter; v: int)		117
+nim	flushBits	archive/bz2f.html#flushBits,BzWriter	proc flushBits(w: var BzWriter)		122
+nim	HuffSym	archive/bz2f.html#HuffSym	object HuffSym		130
+nim	genLengths	archive/bz2f.html#genLengths,seq[HuffSym],int	proc genLengths(syms: var seq[HuffSym]; maxBits: int)		135
+nim	buildEncode	archive/bz2f.html#buildEncode,openArray[int]	proc buildEncode(lens: openArray[int]): seq[tuple[code: uint32, len: int]]		227
+nim	HuffDec	archive/bz2f.html#HuffDec	object HuffDec		245
+nim	buildDecode	archive/bz2f.html#buildDecode,openArray[int]	proc buildDecode(lens: openArray[int]): HuffDec		250
+nim	decodeSym	archive/bz2f.html#decodeSym,HuffDec,BzBits	proc decodeSym(d: HuffDec; br: var BzBits): int		267
+nim	mtfEncodeIdx	archive/bz2f.html#mtfEncodeIdx,array[,byte],int,byte	proc mtfEncodeIdx(dict: var array[256, byte]; dictLen: int; val: byte): int		281
+nim	mtfDecodeSyms	archive/bz2f.html#mtfDecodeSyms,openArray[int],openArray[byte],int	proc mtfDecodeSyms(syms: openArray[int]; dict: openArray[byte]; blkSize: int): seq[\n    byte]		291
+nim	mtfEncodeVals	archive/bz2f.html#mtfEncodeVals,openArray[byte],openArray[byte],int	proc mtfEncodeVals(vals: openArray[byte]; dict: openArray[byte]; blkSize: int): seq[\n    int]		333
+nim	rle1DecodeInto	archive/bz2f.html#rle1DecodeInto,openArray[byte],Output,uint32	proc rle1DecodeInto(buf: openArray[byte]; dst: Output; crc: var uint32)		362
+nim	Rle1Enc	archive/bz2f.html#Rle1Enc	object Rle1Enc		392
+nim	rle1Init	archive/bz2f.html#rle1Init,int	proc rle1Init(cap: int): Rle1Enc		398
+nim	rle1Put	archive/bz2f.html#rle1Put,Rle1Enc,byte	proc rle1Put(e: var Rle1Enc; b: byte)		402
+nim	bwtEncode	archive/bz2f.html#bwtEncode,openArray[byte]	proc bwtEncode(buf: openArray[byte]): tuple[outp: seq[byte], origin: int]		488
+nim	bwtDecode	archive/bz2f.html#bwtDecode,seq[byte],int	proc bwtDecode(buf: var seq[byte]; origin: int)		509
+nim	bz2CompressInto	archive/bz2f.html#bz2CompressInto,Input,Output,int	proc bz2CompressInto(inp: Input; dst: Output; level = 6)		652
+nim	bz2Compress	archive/bz2f.html#bz2Compress,string,int	proc bz2Compress(data: string; level = 6): string		691
+nim	bz2DecompressInto	archive/bz2f.html#bz2DecompressInto,Input,Output	proc bz2DecompressInto(inp: Input; dst: Output)		798
+nim	bz2Decompress	archive/bz2f.html#bz2Decompress,string	proc bz2Decompress(data: string): string		836
+nimgrp	bzcrcupdate	archive/bz2f.html#bzCrcUpdate-procs-all	proc		40

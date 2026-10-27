@@ -1,0 +1,8 @@
+nimTitle	gz	archive/formats/gz.html	module archive/formats/gz		0
+nim	Gz	archive/formats/gz.html#Gz	object Gz		16
+nim	gzMagic	archive/formats/gz.html#gzMagic	const gzMagic		21
+nim	extension	archive/formats/gz.html#extension,Gz	proc extension(g: Gz): string		23
+nim	mediaType	archive/formats/gz.html#mediaType,Gz	proc mediaType(g: Gz): string		24
+nim	matchGz	archive/formats/gz.html#matchGz,string,Input	proc matchGz(filename: string; inp: Input): MatchResult		26
+nim	openGzReader	archive/formats/gz.html#openGzReader,Input	proc openGzReader(inp: Input; multistream = true): Input		36
+nim	registerGz	archive/formats/gz.html#registerGz,Gz	proc registerGz(g: Gz = Gz())		45

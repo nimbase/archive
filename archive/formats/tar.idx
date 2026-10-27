@@ -1,0 +1,18 @@
+nimTitle	tar	archive/formats/tar.html	module archive/formats/tar		0
+nim	tarBlockSize	archive/formats/tar.html#tarBlockSize	const tarBlockSize		13
+nim	tfAuto	archive/formats/tar.html#tfAuto	TarFormat.tfAuto		15
+nim	tfUstar	archive/formats/tar.html#tfUstar	TarFormat.tfUstar		15
+nim	tfPax	archive/formats/tar.html#tfPax	TarFormat.tfPax		15
+nim	tfGnu	archive/formats/tar.html#tfGnu	TarFormat.tfGnu		15
+nim	TarFormat	archive/formats/tar.html#TarFormat	enum TarFormat		15
+nim	Tar	archive/formats/tar.html#Tar	object Tar		18
+nim	extension	archive/formats/tar.html#extension,Tar	proc extension(t: Tar): string		29
+nim	mediaType	archive/formats/tar.html#mediaType,Tar	proc mediaType(t: Tar): string		30
+nim	TarHeader	archive/formats/tar.html#TarHeader	object TarHeader		107
+nim	writeFileToArchive	archive/formats/tar.html#writeFileToArchive,Tar,Output,FileInfo	proc writeFileToArchive(t: Tar; dst: Output; f: FileInfo)		255
+nim	archiveTar	archive/formats/tar.html#archiveTar,Tar,ArchiveContext,Output,seq[FileInfo]	proc archiveTar(t: Tar; ctx: ArchiveContext; dst: Output; files: seq[FileInfo])		283
+nim	fileIsIncluded	archive/formats/tar.html#fileIsIncluded,seq[string],string	proc fileIsIncluded(skipDirs: seq[string]; filename: string): bool		296
+nim	extractTar	archive/formats/tar.html#extractTar,Tar,ArchiveContext,Input,FileHandler	proc extractTar(t: Tar; ctx: ArchiveContext; inp: Input; handle: FileHandler)		323
+nim	matchTar	archive/formats/tar.html#matchTar,string,Input	proc matchTar(filename: string; inp: Input): MatchResult		409
+nim	insertTar	archive/formats/tar.html#insertTar,Tar,ArchiveContext,Input,Output,seq[FileInfo]	proc insertTar(t: Tar; ctx: ArchiveContext; inp: Input; dst: Output;\n          files: seq[FileInfo])		422
+nim	registerTar	archive/formats/tar.html#registerTar,Tar	proc registerTar(t: Tar = Tar())		462
