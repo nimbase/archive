@@ -1,7 +1,7 @@
 <p align="center">
   Unified Nim library for creating/extracting archives and compress/decompress files<br>
   SIMD-accelerated, zero-copy I/O core, walk virtual file system<br>
-  Supporting `.tar`, `.zip`, `.gz`, `.zz`, `.lz4`, `.bz2`, `.br`
+  Supporting <code>.tar</code>, <code>.zip</code>, <code>.gz</code>, <code>.zz</code>, <code>.lz4</code>, <code>.bz2</code>, <code>.br</code>
 </p>
 
 <p align="center">
