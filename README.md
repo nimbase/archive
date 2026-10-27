@@ -33,8 +33,6 @@ zero-copy `Input`/`Output` plumbing is still there when you need it:
 ```nim
 import std/[options, strutils]
 import archive
-import archive/registry   # Format enum
-import archive/types      # ArchiveContext
 registerDefaults()
 
 # one-shot compression with per-call level (0 = codec default)

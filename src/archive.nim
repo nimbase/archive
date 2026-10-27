@@ -25,6 +25,9 @@ import ./archive/formats/bz2
 import ./archive/formats/lz4
 import ./archive/formats/brotli
 
+
+export registry, types
+
 proc registerDefaults*() =
   ## Register the v1 format set. Safe to call once (duplicates raise).
   registerTar()
