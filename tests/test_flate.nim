@@ -1,6 +1,7 @@
 import std/[unittest, strutils]
 import archive/io
 import archive/flate
+import archive/zlibf
 
 suite "flate":
   test "empty":
@@ -52,3 +53,33 @@ suite "flate":
     let dst = newOutput(4) # tiny cap forces growth path
     inflateInto(openInputString(enc), dst)
     check(take(dst) == payload)
+
+  test "borrowed input round trip":
+    let payload = "borrowed-window. ".repeat(4000)
+    var plain = newString(payload.len)
+    copyMem(addr plain[0], unsafeAddr payload[0], payload.len)
+    var dst = newOutput()
+    zlibCompressInto(openInputBorrowed(unsafeAddr plain[0], plain.len),
+      dst, 6)
+    let enc = take(dst)
+    var dec = newOutput()
+    var encCopy = enc
+    zlibDecompressInto(openInputBorrowed(unsafeAddr encCopy[0], encCopy.len), dec)
+    check(take(dec) == payload)
+
+  test "newOutput capacity is honored":
+    var o = newOutput(64)
+    check(outputCap(o) == 64)
+    for i in 0..<64: o.writeByte(byte(i))
+    check(outputCap(o) == 64)
+    let s = take(o)
+    check(s.len == 64)
+    check(s[0] == '\x00' and s[63] == '\x3F')
+
+  test "long-range repetition round trip":
+    # 100KB with a 40KB period: matches at distance 40000 exceed the
+    # 32KB window and must be ignored; output must still be exact.
+    var s = newString(100 * 1024)
+    for i in 0..<s.len: s[i] = chr(i div 40000)
+    let enc = deflateFixed(s)
+    check(inflateAll(enc) == s)

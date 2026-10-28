@@ -116,6 +116,13 @@ proc openInputBytes*(data: openArray[byte]): Input =
     copyMem(addr s[0], unsafeAddr data[0], data.len)
   openInputString(s)
 
+proc openInputBorrowed*(p: pointer; length: int): Input =
+  ## Input borrowing [p, p+length) without copying or retaining.
+  ## Caller must keep the memory alive for the Input's lifetime;
+  ## safe for one-shot calls that return before the caller exits
+  ## (the borrow never outlives the caller's frame).
+  Input(base: p, len: length, pos: 0)
+
 proc openInputView*(s: Span; keep: RootRef): Input =
   ## Input borrowing a span; `keep` (usually the parent Input/Output)
   ## is retained so the memory outlives this cursor.
@@ -124,8 +131,11 @@ proc openInputView*(s: Span; keep: RootRef): Input =
 proc newOutput*(cap = 0): Output =
   result = Output()
   if cap > 0:
+    # Pre-size capacity WITHOUT truncating the length marker: buf.len
+    # stays `cap` so ensureCap sees the reservation (a setLen(0) here
+    # would hide it and force regrowth by doubling). Used bytes are
+    # tracked separately in dst.len; unwritten bytes are never read.
     result.buf = newString(cap)
-    result.buf.setLen(0)
 
 proc reset*(dst: Output) =
   ## Reuse the buffer without freeing capacity.

@@ -1055,8 +1055,14 @@ proc deflateInto*(inp: Input; output: Output) =
   var head = newSeq[int](hashSize)
   for i in 0 ..< hashSize:
     head[i] = -1
-  var prev = newSeq[int](total)
-  for i in 0 ..< total:
+  # Circular predecessor ring: O(windowSize) instead of O(total).
+  # Slot collisions are safe: stale entries fail the `pos - cand`
+  # window check below, wrong-turn detours are bounded by maxChainLen,
+  # and every emitted match is byte-verified, so output stays valid
+  # (same tradeoff as zlib's own w_size prev table; ratio-only effect).
+  const prevMask = windowSize - 1
+  var prev = newSeq[int](windowSize)
+  for i in 0 ..< windowSize:
     prev[i] = -1
   var pos = 0
   while pos < total:
@@ -1076,9 +1082,9 @@ proc deflateInto*(inp: Input; output: Output) =
           bestDist = pos - cand
           if ln == maxLen:
             break
-        cand = prev[cand]
+        cand = prev[cand and prevMask]
         inc chain
-      prev[pos] = head[h]
+      prev[pos and prevMask] = head[h]
       head[h] = pos
     if bestLen >= minMatchLen:
       let (lc, lextra, lebits) = lengthCode(bestLen)
