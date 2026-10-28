@@ -121,6 +121,19 @@ suite "high-level api":
     writeFile(rpath, renamed)
     check(listEntries(rpath, ctx) == @["root", "root/renamed.txt"])
 
+  test "archivePaths with drive-letter names lists cleanly":
+    # Regression: Windows lastPathPart("C:") == "" (drive-aware splitPath)
+    # while Linux gives "C:". The VFS index used lastPathPart on virtual
+    # archive paths, poisoning dirs["."] with an empty entry name and
+    # crashing listEntries on Windows. Virtual paths use baseNameV now.
+    var ctx: ArchiveContext
+    writeFile(joinPath(getTempDir(), "drv_a.txt"), "alpha")
+    let blob = archivePaths(afTar, @[
+      (joinPath(getTempDir(), "drv_a.txt"), "C:/x/a.txt")], ctx)
+    let tpath = joinPath(getTempDir(), "drv.tar")
+    writeFile(tpath, blob)
+    check(listEntries(tpath, ctx) == @["C:", "C:/x", "C:/x/a.txt"])
+
   test "archivePaths missing path raises":
     var ctx: ArchiveContext
     expect(ArchiveError):

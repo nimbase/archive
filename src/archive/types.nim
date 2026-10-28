@@ -4,7 +4,7 @@
 ## our own io core (Input/Output over memfiles) and model file metadata
 ## explicitly.
 
-import std/[times]
+import std/[times, strutils]
 import ./io
 
 export io
@@ -197,3 +197,11 @@ proc noAttrMeta*(m: FileMeta): FileMeta =
   result = m
   result.modTime = fromUnix(0)
   result.mode = m.mode and (ModeDir or ModeSymlink or ModePermMask)
+
+proc baseNameV*(path: string): string =
+  ## Basename over `/`-separated virtual paths (archive entry names).
+  ## Pure string op, identical on every platform — unlike `lastPathPart`,
+  ## which is drive-aware on Windows (`lastPathPart("C:") == ""` there,
+  ## `"C:"` everywhere else) and must only touch real disk paths.
+  let i = path.rfind('/')
+  if i < 0: path else: path[i + 1 .. ^1]

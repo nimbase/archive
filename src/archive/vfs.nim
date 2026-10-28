@@ -154,7 +154,7 @@ proc indexArchive(fsys: Fs) =
     let dir =
       if '/' in nm: nm[0 ..< nm.rfind('/')]
       else: "."
-    var entry = DirEntry(name: lastPathPart(nm), isDir: info.isDir,
+    var entry = DirEntry(name: baseNameV(nm), isDir: info.isDir,
         meta: info.meta)
     if fsys.dirs.hasKey(dir):
       var found = false
@@ -173,7 +173,7 @@ proc indexArchive(fsys: Fs) =
       let parent =
         if '/' in cur: cur[0 ..< cur.rfind('/')]
         else: "."
-      let base = lastPathPart(cur)
+      let base = baseNameV(cur)
       let imp = DirEntry(name: base, isDir: true,
           meta: FileMeta(name: base, isDir: true, isRegular: false))
       if fsys.dirs.hasKey(parent):
@@ -229,7 +229,7 @@ proc openArchive*(fsys: Fs; name: string): tuple[inp: Input;
       if fsys.dirs.hasKey(full): fsys.dirs[full] else: @[]
     let meta =
       if fsys.contents.hasKey(full): fsys.contents[full]
-      else: FileMeta(name: lastPathPart(full), isDir: true)
+      else: FileMeta(name: baseNameV(full), isDir: true)
     return (nil, meta, entries)
   if not fsys.contents.hasKey(full):
     raise newException(ArchiveError, "open " & name & ": not found")
@@ -270,7 +270,7 @@ proc walkArchive*(fsys: Fs;
   keys.sort()
   for k in keys:
     let m = fsys.contents[k]
-    visit(k, DirEntry(name: lastPathPart(k), isDir: m.isDir, meta: m))
+    visit(k, DirEntry(name: baseNameV(k), isDir: m.isDir, meta: m))
 
 iterator walkFs*(fsys: Fs; root = "."): tuple[path: string; entry: DirEntry] =
   ## Recursive walk over any filesystem kind (plain dir, archive,
@@ -300,7 +300,7 @@ iterator walkFs*(fsys: Fs; root = "."): tuple[path: string; entry: DirEntry] =
       let full = joinPrefix(fsys.prefix, root)
       if full != "." and fsys.contents.hasKey(full) and
           not fsys.contents[full].isDir:
-        singleEntry = DirEntry(name: lastPathPart(root), isDir: false,
+        singleEntry = DirEntry(name: baseNameV(root), isDir: false,
           meta: fsys.contents[full])
         single = true
     if single:

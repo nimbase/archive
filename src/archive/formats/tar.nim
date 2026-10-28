@@ -5,7 +5,6 @@
 ## Writing streams into the caller's reusable Output.
 
 import std/[strutils, times]
-from std/os import lastPathPart
 import ../io
 import ../types
 
@@ -407,7 +406,7 @@ proc extractTar*(t: Tar; ctx: ArchiveContext; inp: Input;
         skip(inp, pad)
     if fileIsIncluded(skipDirs, effName):
       continue
-    var meta = FileMeta(name: lastPathPart(effName.strip(chars = {'/'})),
+    var meta = FileMeta(name: baseNameV(effName.strip(chars = {'/'})),
         size: n.int64, mode: hdr.mode, modTime: hdr.modTime,
         isDir: hdr.typeflag == '5',
         isSymlink: hdr.typeflag == '2', isRegular: hdr.typeflag == '0')
@@ -470,7 +469,7 @@ proc insertTar*(t: Tar; ctx: ArchiveContext; inp: Input; dst: Output;
       if pad > 0:
         skip(inp, pad)
     # re-emit via normal writer path (normalizes framing)
-    var meta = FileMeta(name: lastPathPart(hdr.name.strip(chars = {'/'})),
+    var meta = FileMeta(name: baseNameV(hdr.name.strip(chars = {'/'})),
         size: n.int64, mode: hdr.mode, modTime: hdr.modTime,
         isDir: hdr.typeflag == '5',
         isSymlink: hdr.typeflag == '2', isRegular: hdr.typeflag == '0')

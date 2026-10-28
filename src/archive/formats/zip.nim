@@ -6,7 +6,7 @@
 ## like Go. No seekable-stream requirement: entries parse from memory.
 
 import std/[strutils, tables]
-from std/os import splitFile, lastPathPart
+from std/os import splitFile
 import ../zipfile
 import ../io
 import ../types
@@ -142,7 +142,7 @@ proc extractZip*(z: Zip; ctx: ArchiveContext; inp: Input;
     if fileIsIncludedLocal(skipDirs, e.name):
       continue
     let isLink = e.isSymlink
-    var meta = FileMeta(name: lastPathPart(e.name.strip(chars = {'/'})),
+    var meta = FileMeta(name: baseNameV(e.name.strip(chars = {'/'})),
         size: e.expectLen.int64, mode: e.mode, modTime: e.modTime,
         isDir: e.isDir, isSymlink: isLink, isRegular: not e.isDir and
         not isLink)
