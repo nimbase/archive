@@ -1,7 +1,7 @@
 <p align="center">
   Unified Nim library for creating/extracting archives and compress/decompress files<br>
   SIMD-accelerated, zero-copy I/O core, walk virtual file system<br>
-  Supporting <code>.tar</code>, <code>.zip</code>, <code>.rar</code> (5.0/7.0 STORE), <code>.gz</code>, <code>.zz</code>, <code>.lz4</code>, <code>.bz2</code>, <code>.br</code>
+  Supporting <code>.tar</code>, <code>.zip</code>, <code>.rar</code> (5.0/7.0), <code>.gz</code>, <code>.zz</code>, <code>.lz4</code>, <code>.bz2</code>, <code>.br</code>
 </p>
 
 <p align="center">
@@ -23,7 +23,7 @@
 > contributions (bug reports, test vectors, benchmarks) are welcome.
 
 ## Features
-- Archive and compress across tar, zip, rar (5.0/7.0 STORE-only v1), gzip, zlib (.zz), lz4, bzip2 and brotli with one uniform API
+- Archive and compress across tar, zip, rar (5.0/7.0 decode; STORE-only write v1), gzip, zlib (.zz), lz4, bzip2 and brotli with one uniform API
 - Split `CompressionFormat`/`ArchiveFormat` string enums plus a `MediaType` enum: misuse fails at compile time, no runtime registry
 - High-level one-shots: `compress`/`decompress` (strings, files, buffers), `archiveDir`/`archiveData`, auto-identifying `extractFile`/`extractAll`/`listEntries`
 - Own DEFLATE/gzip/zip/tar/crc32, no C bindings, brotli via [pkg/nbrotli](https://github.com/nimbase/nbrotli)
@@ -170,7 +170,9 @@ for path, e in walkFs("out.tar.gz"):
 - [ ] zstd (.zst)
 - [ ] snappy/s2 (.sz/.s2, own port)
 - [ ] lzip (.lz), minlz (.mz)
-- [x] rar 5.0/7.0 container (STORE-only v1: write stored entries, read stored fully, list compressed; Unpack50/70 decode next)
+- [x] rar 5.0/7.0 container + Unpack50/70 LZ decode (stored + m1..m5,
+  solid groups, DELTA/E8/E8E9/ARM filters; header encryption,
+  multivolume and write-side compression next)
 - [ ] 7z read/write (needs new port; public-domain LZMA SDK reference)
 
 ### ❤ Contributions & Support

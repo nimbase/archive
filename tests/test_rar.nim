@@ -5,6 +5,7 @@ import archive/io
 import archive/files
 import archive/crc32
 import archive/formats/rar
+import archive/formats/rarcodec
 import archive/vfs
 import archive
 
@@ -133,7 +134,7 @@ suite "rar5 store":
           c: ArchiveContext; info: FileInfo):
         discard
 
-  test "unsupported method lists but fails on open":
+  test "unknown method lists but fails on open":
     var ctx: ArchiveContext
     let files = filesFromEntries(ctx, FromFSOptions(), [
       FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: 3,
@@ -142,13 +143,14 @@ suite "rar5 store":
     let dst = newOutput()
     archiveRar(Rar(), ctx, dst, files)
     var blob = take(dst)
-    # Patch CompInfo method 0 -> 1 (m1). Value 128 needs a 2-byte vint
-    # (0x80 0x01), so splice it in and grow the header size by one.
+    # Patch CompInfo method 0 -> 7 (out of range). Value 7 << 7 = 896
+    # needs a 2-byte vint (0x80 0x07), so splice it in and grow the
+    # header size by one.
     let at = blob.find("a.txt")
     check at > 6
     let compPos = at - 3
     check ord(blob[compPos]) == 0
-    blob = blob[0 ..< compPos] & "\x80\x01" & blob[compPos + 1 .. ^1]
+    blob = blob[0 ..< compPos] & "\x80\x07" & blob[compPos + 1 .. ^1]
     check ord(blob[20]) < 127 # hsize stays 1 byte
     blob[20] = chr(ord(blob[20]) + 1)
     # Recompute the file header CRC (header at offset 16: CRC + hsize + body).
@@ -185,7 +187,7 @@ suite "rar5 store":
           discard readAll(info.open())
     except ArchiveError as e:
       opened = true
-      check "unsupported compression method" in e.msg
+      check "unknown compression method" in e.msg
     check opened
 
   test "unpacked cap enforced on open":
@@ -203,3 +205,119 @@ suite "rar5 store":
           c: ArchiveContext; info: FileInfo):
         if info.isRegular():
           discard readAll(info.open())
+
+suite "rar5 filters":
+  # Forward transforms transliterated independently from the forward
+  # pseudocode (different text than the reverse the codec implements);
+  # round-trip validates the pairing, including wrap edges. Real
+  # WinRAR DELTA fixtures are covered by the archive-level comparison.
+
+  # le32 helpers (rarcodec keeps its own private copies).
+  proc le32At(s: string; at: int): uint32 =
+    ord(s[at]).uint32 or (ord(s[at + 1]).uint32 shl 8) or
+      (ord(s[at + 2]).uint32 shl 16) or (ord(s[at + 3]).uint32 shl 24)
+
+  proc putLe32At(s: var string; at: int; v: uint32) =
+    s[at] = chr(int(v and 0xFF))
+    s[at + 1] = chr(int((v shr 8) and 0xFF))
+    s[at + 2] = chr(int((v shr 16) and 0xFF))
+    s[at + 3] = chr(int((v shr 24) and 0xFF))
+
+  proc fwdE8(buf: string; fileOff: uint64; e9: bool): string =
+    const FS = 0x1000000'u32
+    result = buf
+    var pos = 0
+    while pos + 5 <= result.len:
+      let b = ord(result[pos])
+      if (if e9: (b and 0xFE) == 0xE8 else: b == 0xE8):
+        let disp = le32At(result, pos + 1)
+        let off = uint32((fileOff + uint64(pos) + 1) and (FS - 1))
+        let a = disp + off
+        if a < FS:
+          putLe32At(result, pos + 1, a)
+        else:
+          let bb = disp - FS
+          if bb > 0xFFFFFFFF'u32 - off:
+            putLe32At(result, pos + 1, bb)
+        pos += 5
+      else:
+        inc pos
+
+  proc fwdArm(buf: string; fileOff: uint64): string =
+    result = buf
+    var pos = 0
+    while pos + 4 <= result.len:
+      if ord(result[pos + 3]) == 0xEB:
+        let insn = le32At(result, pos)
+        let off = (pos.uint64 + fileOff) shr 2
+        let low24 = (insn and 0x00FFFFFF'u32) + uint32(off and 0xFFFFFF'u64)
+        putLe32At(result, pos, (low24 and 0x00FFFFFF'u32) or 0xEB000000'u32)
+      pos += 4
+
+  proc fwdDelta(buf: string; channels: int): string =
+    result = newString(buf.len)
+    var sp = 0
+    for c in 0 ..< channels:
+      var prev = 0
+      var i = c
+      while i < buf.len:
+        result[sp] = chr((prev - ord(buf[i])) and 0xFF)
+        prev = ord(buf[i])
+        inc sp
+        i += channels
+
+  # le32At/putLe32At are defined above for the forward transforms.
+
+  test "e8/e8e9 forward-reverse round trip":
+    var raw = newString(4096)
+    for i in 0 ..< 4096:
+      raw[i] = chr((i * 37 + 11) and 0xFF)
+    # sprinkle CALL/JMP sites incl. wrap-edge displacements
+    for at in [0, 1, 7, 100, 1000, 4090]:
+      raw[at] = chr(0xE8)
+      putLe32At(raw, at + 1, [0'u32, 1, 0xFFFFFF, 0x1000000, 0xFFFFFF00'u32,
+        0xFFFFFFFF'u32][at mod 6])
+    raw[2000] = chr(0xE9)
+    putLe32At(raw, 2001, 0x123456)
+    for e9 in [false, true]:
+      for off in [0'u64, 7, 0xFFFFFF, 0x1000005]:
+        let enc = fwdE8(raw, off, e9)
+        var dec = enc
+        applyE8(dec, 0, dec.len, off, e9)
+        check dec == raw
+
+  test "arm forward-reverse round trip":
+    var raw = newString(1024)
+    for i in 0 ..< 1024:
+      raw[i] = chr((i * 13 + 5) and 0xFF)
+    for at in countup(0, 1020, 4):
+      raw[at + 3] = chr(0xEB)
+      putLe32At(raw, at, (uint32(at * 7919) and 0x00FFFFFF'u32) or
+        0xEB000000'u32)
+    raw[5] = chr(0xEB) # misaligned EB untouched by both directions
+    for off in [0'u64, 4, 0x100, 0x1_0000_0005'u64]:
+      let enc = fwdArm(raw, off)
+      var dec = enc
+      applyArm(dec, 0, dec.len, off)
+      check dec == raw
+    # region-relative stride: an absolutely-unaligned region still
+    # steps +4 from its own start (encoder must emit it that way).
+    let sub = raw[1 .. ^1]
+    let subEnc = fwdArm(sub, 1)
+    var subDec = subEnc
+    applyArm(subDec, 0, subDec.len, 1)
+    check subDec == sub
+
+  test "delta forward-reverse round trip":
+    for ch in [1, 2, 3, 4, 6, 32]:
+      var raw = newString(4 * ch * 64 + ch - 1)
+      for i in 0 ..< raw.len:
+        raw[i] = chr((i * 17 + ch) and 0xFF)
+      let enc = fwdDelta(raw, ch)
+      var dec = enc
+      applyDelta(dec, 0, dec.len, ch)
+      check dec == raw
+    # empty and single byte
+    var e0 = ""
+    applyDelta(e0, 0, 0, 4)
+    check e0 == ""

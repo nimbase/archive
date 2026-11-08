@@ -1,6 +1,7 @@
-## RAR 5.0/7.0 archives (STORE-only v1) via a clean-room container codec.
-## Compressed entries (m1..m5) list correctly but fail on content with a
-## clear error until the Unpack50/70 decoders land. Run from this directory:
+## RAR 5.0/7.0 archives: clean-room container + Unpack50/70 LZ decoder.
+## Writes stored (method 0) entries; reads stored and compressed
+## (m1..m5, solid groups, DELTA/E8/E8E9/ARM filters). Run from this
+## directory:
 ##   `clue build examples/rar.nim --out:/tmp/rar && (cd examples && /tmp/rar)`
 
 import archive

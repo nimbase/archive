@@ -1,21 +1,24 @@
-## RAR5/7.0 archival format, clean-room implementation (STORE-only v1).
+## RAR5/7.0 archival format, clean-room implementation.
 ##
-## Covers the RAR 5.0 container (also used by RAR 7.0) with stored
-## (method 0) entries: vint codec, block walk, header CRC, file/service
-## headers, extra-area skipping, symlink redirection records. Compressed
-## methods (m1..m5, Unpack50/70) list correctly but fail on content with
-## a clear error — decoding them is the next phase.
+## Covers the RAR 5.0 container (also used by RAR 7.0): vint codec,
+## block walk, header CRC, file/service headers, extra-area skipping,
+## symlink redirection records, plus Unpack50/70 LZ+Huffman decoding
+## (methods m1..m5) via rarcodec. Header encryption, multivolume and
+## recovery records stay refused with clear errors.
 ##
-## Memory: header parsing is bounded (2MB header cap); entry bodies are
+## Memory: header parsing is bounded (2MB header cap); STORE bodies are
 ## borrowed spans, never copied. Dict/unpacked caps from ArchiveContext
 ## are enforced when an entry is opened, so listing stays cheap.
+## Compressed entries decode into caller-capped outputs retained for the
+## extraction call (solid groups decode forward once, in walk order).
 ## Thread safety: no globals, all state on the stack or per-call.
 
-import std/[strutils, times]
+import std/[strutils, times, tables]
 from std/os import splitFile
 import ../io
 import ../types
 import ../crc32
+import ./rarcodec
 
 type Rar* = object
   ## RAR5/7.0 archive. No settings in v1 (STORE-only writer).
@@ -249,7 +252,149 @@ type RarEntry* = object
   dataLen*: int
   dataCrc*: uint32
   hasCrc*: bool
+  hasBlake*: bool
+    ## File Hash extra record (BLAKE2sp) present. v1 decodes without
+    ## hash verification for BLAKE2sp-only entries (no BLAKE2sp in the
+    ## dependency set); CRC32-carrying entries are always verified.
   encrypted*: bool
+
+# ---------- compressed entries: solid-group decode cache ----------
+
+type RarMember = object
+  ## Compressed regular file metadata for forward decode.
+  idx*: int
+  compInfo*: uint64
+  dataOff*: int
+  dataLen*: int
+  unpacked*: uint64
+  unpackedKnown*: bool
+  hasCrc*: bool
+  dataCrc*: uint32
+  hasBlake*: bool
+  dictSize*: uint64
+  algo70*: bool ## true = Unpack70 distance alphabet
+  meth*: int
+  grp*: int
+
+type RarGroupCache* = ref object
+  ## Per-extraction decode cache. Owns decoded outputs (openers borrow
+  ## from it) and one solid-group decoder state. No globals: allocated
+  ## per extractRar call, safe to use from any thread.
+  state*: UnpackState
+  groupId*: int
+  hasGroup*: bool
+  groupDict*: uint64
+  groupAlgo70*: bool
+  members*: Table[int, seq[RarMember]] ## groupId -> walk-order members
+  upto*: Table[int, int]               ## groupId -> members decoded so far
+  decoded*: Table[int, string]         ## entry idx -> decoded bytes
+
+type RarChecked = object
+  ## Validated compression parameters (walk-safe to compute, enforced
+  ## on open so listing never allocates).
+  meth*: int
+  dictSize*: uint64
+  algo70*: bool
+
+proc checkRarMethod*(compInfo: uint64; unpacked: uint64;
+    ctx: ArchiveContext): RarChecked =
+  ## Validate version/dictionary fields. Raises RarCodecError on unknown
+  ## versions, reserved combinations, the 64 GiB gate, or cap breaches.
+  ## Method range itself is checked by the caller.
+  let ver = compVersion(compInfo)
+  if ver notin [0, 1]:
+    raise newException(RarCodecError,
+      "rar: unknown compression version " & $ver)
+  let compat = (compInfo shr 20) and 1
+  if ver == 0 and compat == 1:
+    raise newException(RarCodecError, "rar: unknown compression version")
+  result.meth = compMethod(compInfo)
+  result.algo70 = ver == 1 and compat == 0
+  if ver == 0:
+    if ((compInfo shr 10) and 0x1F) > 15:
+      raise newException(RarCodecError, "rar: unknown compression version")
+  result.dictSize = rarDictSize(compInfo)
+  if result.dictSize > rarDictGate:
+    raise newException(RarCodecError,
+      "rar: unknown method (dictionary beyond 64 GiB gate)")
+  if ctx.maxRarDictBytes != 0 and result.dictSize > uint64(ctx.maxRarDictBytes):
+    raise newException(RarCodecError, "rar: dictionary exceeds cap")
+  if ctx.maxRarUnpackedBytes > 0 and
+      unpacked > uint64(ctx.maxRarUnpackedBytes):
+    raise newException(RarCodecError, "rar: unpacked size exceeds cap")
+
+proc verifyRarDecoded*(dec: string; unpacked: uint64; known, hasCrc: bool;
+    dataCrc: uint32; hasBlake: bool) =
+  if known and dec.len.uint64 != unpacked:
+    raise newException(RarCodecError, "rar: size mismatch")
+  if hasCrc and dec.len > 0:
+    let got = crc32Update(0xFFFFFFFF'u32, unsafeAddr dec[0], dec.len) xor
+      0xFFFFFFFF'u32
+    if got != dataCrc:
+      raise newException(RarCodecError, "rar: data crc mismatch")
+
+proc decodeRarMember*(cache: RarGroupCache; ctx: ArchiveContext; src: Input;
+    idx: int): string =
+  ## Decode (or fetch cached) one compressed entry. Solid groups decode
+  ## forward from the last decoded member, caching intermediates; a lone
+  ## entry is just a group of one. State resets at each group start.
+  ## Every decoded member is validated (version/dict/caps/method/CRC);
+  ## entries never opened cost nothing beyond walk metadata.
+  if cache.decoded.hasKey(idx):
+    return cache.decoded[idx]
+  var grp = -1
+  var pos = -1
+  for gid, ms in cache.members:
+    for i, mm in ms:
+      if mm.idx == idx:
+        grp = gid
+        pos = i
+        break
+    if grp >= 0:
+      break
+  if grp < 0:
+    raise newException(RarCodecError, "rar: member not in solid walk")
+  let members = cache.members[grp]
+  if members[pos].dataLen == 0:
+    if members[pos].unpackedKnown and members[pos].unpacked != 0:
+      raise newException(RarCodecError, "rar: truncated file data")
+    cache.decoded[idx] = ""
+    return ""
+  if cache.state == nil or cache.groupId != grp:
+    cache.state = UnpackState()
+    let first = members[0]
+    let fm = checkRarMethod(first.compInfo, first.unpacked, ctx)
+    if fm.meth notin 1 .. 5:
+      raise newException(RarCodecError,
+        "rar: unknown compression method " & $fm.meth)
+    resetUnpack(cache.state, int(fm.dictSize),
+      if fm.algo70: 1 else: 0)
+    cache.groupId = grp
+    cache.upto[grp] = -1
+  let done = cache.upto.getOrDefault(grp, -1)
+  for i in done + 1 .. pos:
+    let mm = members[i]
+    let m = checkRarMethod(mm.compInfo, mm.unpacked, ctx)
+    if m.meth notin 1 .. 5:
+      raise newException(RarCodecError,
+        "rar: unknown compression method " & $m.meth)
+    if int(m.dictSize) != cache.state.dictSize or
+        m.algo70 != (cache.state.algoVer == 1):
+      # Dictionary change forces Solid=false: fresh window.
+      resetUnpack(cache.state, int(m.dictSize),
+        if m.algo70: 1 else: 0)
+    let sp = spanAt(src, mm.dataOff, mm.dataLen)
+    let limit =
+      if mm.unpackedKnown: mm.unpacked
+      elif ctx.maxRarUnpackedBytes > 0: uint64(ctx.maxRarUnpackedBytes)
+      else: 1'u64 shl 62
+    let dec = decodeMember(cache.state, sp.p, sp.len, limit,
+      if m.algo70: 1 else: 0)
+    verifyRarDecoded(dec, mm.unpacked, mm.unpackedKnown, mm.hasCrc,
+      mm.dataCrc, mm.hasBlake)
+    cache.decoded[mm.idx] = dec
+    cache.upto[grp] = i
+  cache.decoded[idx]
 
 proc parseExtra(inp: Input; extraEnd: int; entry: var RarEntry) =
   ## Scan extra records; tolerant trailing junk ends the walk.
@@ -276,6 +421,8 @@ proc parseExtra(inp: Input; extraEnd: int; entry: var RarEntry) =
       break
     if typ == 0x01:
       entry.encrypted = true
+    elif typ == 0x02:
+      entry.hasBlake = true
     elif typ == 0x05:
       # redirection: redirType, flags, nameLen, name
       let save = inputPos(inp)
@@ -310,6 +457,7 @@ proc extractRar*(r: Rar; ctx: ArchiveContext; inp: Input;
   let sig = readSpan(inp, 8)
   if not spanEqual(sig, rar5Magic):
     raise newException(RarError, "rar: bad signature")
+  let groupCache = RarGroupCache()
   var headerCount = 0
   var index = 0
   while true:
@@ -470,48 +618,67 @@ proc extractRar*(r: Rar; ctx: ArchiveContext; inp: Input;
       let e = entry # copy for closure
       let src = inp
       let curCtx = ctx
+      let curIdx = index
+      let cache = groupCache
       var meta = FileMeta(name: baseNameV(nm), size: e.size,
         mode: e.mode, modTime: e.modTime, isDir: false,
         isSymlink: false, isRegular: true)
+      # Compressed: decoded lazily on first open into a closure-owned
+      # buffer (proven to pin the bytes under ORC + pressure, unlike a
+      # bare table fetch whose buffer may be reused by later big
+      # allocations). The shared table still dedups repeat opens and
+      # solid intermediates; all validation lives in decodeRarMember.
+      var owned = ""
+      var done = false
       proc opener(): Input =
-        let meth = compMethod(e.compInfo)
-        let ver = compVersion(e.compInfo)
-        if ver notin [0, 1]:
-          raise newException(RarError,
-            "rar: unknown compression version " & $ver)
-        if meth != 0:
-          # dict gate + cap before any allocation
-          let ds = rarDictSize(e.compInfo)
-          if ds > rarDictGate:
-            raise newException(RarError,
-              "rar: unknown method (dictionary beyond 64 GiB gate)")
-          if curCtx.maxRarDictBytes != 0 and
-              ds > uint64(curCtx.maxRarDictBytes):
-            raise newException(RarError,
-              "rar: dictionary exceeds cap")
+        if compMethod(e.compInfo) == 0:
           if curCtx.maxRarUnpackedBytes != 0 and
               e.size > curCtx.maxRarUnpackedBytes:
-            raise newException(RarError,
-              "rar: unpacked size exceeds cap")
-          raise newException(RarError,
-            "rar: unsupported compression method " & $meth &
-            " (STORE-only v1)")
-        if curCtx.maxRarUnpackedBytes != 0 and
-            e.size > curCtx.maxRarUnpackedBytes:
-          raise newException(RarError, "rar: unpacked size exceeds cap")
-        if e.dataLen != int(e.size):
-          raise newException(RarError, "rar: size mismatch")
-        let sp = spanAt(src, e.dataOff, e.dataLen)
-        if e.hasCrc and e.dataLen > 0:
-          let got =
-            if sp.len == 0: 0'u32
-            else: crc32Update(0xFFFFFFFF'u32, sp.p, sp.len) xor
-              0xFFFFFFFF'u32
-          if got != e.dataCrc:
-            raise newException(RarError, "rar: data crc mismatch")
-        openInputView(sp, src)
+            raise newException(RarError, "rar: unpacked size exceeds cap")
+          if e.dataLen != int(e.size):
+            raise newException(RarError, "rar: size mismatch")
+          let sp = spanAt(src, e.dataOff, e.dataLen)
+          if e.hasCrc and e.dataLen > 0:
+            let got =
+              if sp.len == 0: 0'u32
+              else: crc32Update(0xFFFFFFFF'u32, sp.p, sp.len) xor
+                0xFFFFFFFF'u32
+            if got != e.dataCrc:
+              raise newException(RarError, "rar: data crc mismatch")
+          return openInputView(sp, src)
+        if not done:
+          owned = decodeRarMember(cache, curCtx, src, curIdx)
+          done = true
+        openInputString(owned)
       let fi = FileInfo(meta: meta, nameInArchive: nm, linkTarget: "",
         open: opener)
+      # Record solid-group membership for forward decode (metadata only,
+      # no version/dict validation: the opener reports the real error).
+      # All non-STORE methods record, so unknown methods still list and
+      # fail on open with the accurate error instead of "not in walk".
+      let meth = compMethod(e.compInfo)
+      if meth != 0:
+        let ver = compVersion(e.compInfo)
+        let compat = (e.compInfo shr 20) and 1
+        let algo70 = ver == 1 and compat == 0
+        let ds = rarDictSize(e.compInfo)
+        var grp = cache.groupId
+        if not cache.hasGroup or not compSolid(e.compInfo) or
+            ds != cache.groupDict or algo70 != cache.groupAlgo70:
+          inc cache.groupId
+          grp = cache.groupId
+          cache.hasGroup = true
+        cache.groupDict = ds
+        cache.groupAlgo70 = algo70
+        if not cache.members.hasKey(grp):
+          cache.members[grp] = @[]
+          cache.upto[grp] = -1
+        let known = (fileFlags and 0x0008) == 0
+        cache.members[grp].add(RarMember(idx: curIdx,
+          compInfo: e.compInfo, dataOff: e.dataOff, dataLen: e.dataLen,
+          unpacked: cast[uint64](e.size), unpackedKnown: known,
+          hasCrc: e.hasCrc, dataCrc: e.dataCrc, hasBlake: e.hasBlake,
+          dictSize: ds, algo70: algo70, meth: meth, grp: grp))
       ctx.reportProgress(nm, index, -1, e.size)
       inc index
       {.gcsafe.}:
