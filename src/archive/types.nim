@@ -64,11 +64,13 @@ type
     ## Archival formats (each also extracts): same string-enum pattern.
     afTar = ".tar"
     afZip = ".zip"
+    afRar = ".rar"
 
   MediaType* = enum
     ## Canonical MIME types, same string-enum pattern as the formats.
     mtTar = "application/x-tar"
     mtZip = "application/zip"
+    mtRar = "application/x-rar"
     mtGz = "application/gzip"
     mtZlib = "application/zlib"
     mtLz4 = "application/x-lz4"
@@ -90,6 +92,7 @@ proc mediaTypeOf*(fmt: ArchiveFormat): MediaType =
   case fmt
   of afTar: mtTar
   of afZip: mtZip
+  of afRar: mtRar
 
 type
   ArchiveContext* = object
@@ -104,6 +107,14 @@ type
       ## Fires synchronously in the caller's thread as each entry starts;
       ## capturing locals is safe since it never escapes. Abort by
       ## setting `cancelled` from inside.
+    maxRarDictBytes*: int = 64 * 1024 * 1024
+      ## Cap on a RAR5/7.0 declared dictionary before any window is
+      ## allocated. Archives above this fail with ArchiveError instead
+      ## of allocating. Tunable per call; 0 means no cap (not recommended).
+    maxRarUnpackedBytes*: int64 = 4 * 1024 * 1024 * 1024
+      ## Cap on a single RAR entry's unpacked size. Bounds one-shot
+      ## extraction; streaming to-disk paths enforce it while copying.
+      ## 0 means no cap.
 
   ProgressInfo* = object
     ## One progress tick: the entry about to be processed.

@@ -385,7 +385,7 @@ iterator walkFs*(path: string;
 
 # ---------- DeepFS ----------
 
-const archiveExtensions* = [".zip", ".tar", ".tgz", ".tar.gz", ".tar.bz2",
+const archiveExtensions* = [".zip", ".tar", ".rar", ".tgz", ".tar.gz", ".tar.bz2",
   ".tar.zst", ".tar.lz4", ".tar.xz", ".tar.sz", ".tar.s2", ".tar.lz",
   ".tar.br", ".tar.zz"]
 
