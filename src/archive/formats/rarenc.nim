@@ -783,6 +783,212 @@ proc encodeRarMember*(data: openArray[byte]; meth: int;
   ## Back-compat: Unpack50, no filters.
   encodeRarMemberFiltered(data, meth, dictSize, [], 0)
 
+# ---------- solid groups ----------
+
+const rarSolidGroupCap* = 64 * 1024 * 1024
+  ## Max raw bytes per solid-encode call. Groups are an encoder choice;
+  ## larger inputs are split into multiple independent groups (always
+  ## valid, just less cross-file matching). Bounds the concatenated
+  ## group buffer plus the matcher's chunk tables.
+
+type SolidFileInput* = object
+  data*: string ## already forward-transformed bytes for this file
+  filters*: seq[RarFilterSpec]
+
+type SolidFilePacked* = object
+  packed*: string    ## compressed stream (empty when stored=true)
+  stored*: bool      ## true: caller should STORE this file
+  groupStart*: bool  ## true: solid bit clear (new decoder group)
+
+proc encodeSolidGroup*(files: openArray[SolidFileInput]; meth: int;
+    dictSize = rarEncDict; algoVer = 0): seq[SolidFilePacked] =
+  ## Compress a solid group: shared rep ring, lastLen, adaptive tables
+  ## and dictionary window across files, exactly like the decoder carries
+  ## them (fresh tables per block, filters reset per file). Only the last
+  ## file's final block sets last-block; intermediate files end blocks
+  ## without it and the decoder stops at each file's unpacked limit.
+  ## Per-file STORE fallback: when a file's packed stream would not
+  ## shrink it, mark it stored and reset shared state (the stored file's
+  ## bytes never enter any decoder window, so later files must not
+  ## reference them). Zero-data files are the caller's case (STORE path);
+  ## passing one here raises, like the single-file entry point.
+  if meth notin 1 .. 5:
+    raise newException(RarEncError, "rar: unknown compression method")
+  if algoVer notin [0, 1]:
+    raise newException(RarEncError, "rar: unknown algorithm version")
+  if files.len == 0:
+    return @[]
+  var total = 0
+  for f in files:
+    if f.data.len == 0:
+      raise newException(RarEncError, "rar: cannot compress empty input")
+    for flt in f.filters:
+      if flt.kind notin 0 .. 3:
+        raise newException(RarEncError, "rar: bad filter type")
+      if flt.len <= 0 or flt.len > (1 shl 22):
+        raise newException(RarEncError, "rar: bad filter length")
+      if flt.start < 0 or flt.start + flt.len > f.data.len:
+        raise newException(RarEncError, "rar: filter range invalid")
+      if flt.kind == 0 and (flt.channels < 1 or flt.channels > 32):
+        raise newException(RarEncError, "rar: bad delta channels")
+    # filters within one file must not overlap (checked pairwise: specs
+    # are expected in offset order, as chunkFilters emits them).
+    for i in 1 ..< f.filters.len:
+      if f.filters[i].start < f.filters[i - 1].start +
+          f.filters[i - 1].len:
+        raise newException(RarEncError, "rar: overlapping filters")
+    total += f.data.len
+    if total > rarSolidGroupCap:
+      raise newException(RarEncError, "rar: solid group too large")
+  let distSyms = if algoVer == 1: rarDistSyms70 else: rarDistSyms50
+  let maxChain =
+    case meth
+    of 1: 32
+    of 2: 128
+    of 3: 256
+    of 4: 1024
+    else: 4096
+  let useLazy = meth >= 3
+  # Concatenated transformed stream; block/file boundaries cap tiling.
+  var group = newString(total)
+  var fileStart = newSeq[int](files.len + 1)
+  for i, f in files:
+    fileStart[i + 1] = fileStart[i] + f.data.len
+    if f.data.len > 0:
+      copyMem(addr group[fileStart[i]], unsafeAddr f.data[0], f.data.len)
+  let gp = cast[ptr UncheckedArray[byte]](unsafeAddr group[0])
+  result = newSeq[SolidFilePacked](files.len)
+  var outBufs = newSeq[seq[byte]](files.len)
+  # Shared encoder state (mirrors decoder UnpackState carry).
+  var m = initMatcher(maxChain, dictSize)
+  var reps = [0, 0, 0, 0]
+  var lastLen = 0
+  var prevMain = newSeq[int](rarMainSyms)
+  var prevLen = newSeq[int](rarLenSyms)
+  var prevDist = newSeq[int](distSyms)
+  var chunkStart = -1
+  var groupStart = true # next compressed file clears the solid bit
+  var pos = 0
+  var fileIdx = 0
+  while pos < total:
+    # File region for this block (blocks never span files).
+    while fileIdx + 1 < files.len and pos >= fileStart[fileIdx + 1]:
+      # Finished file fileIdx: STORE fallback check + state reset.
+      if outBufs[fileIdx].len >= files[fileIdx].data.len:
+        result[fileIdx] = SolidFilePacked(stored: true)
+        # Stored bytes enter no decoder window: reset shared state so
+        # later files cannot reference them. Next compressed file starts
+        # a new decoder group (solid bit clear).
+        m = initMatcher(maxChain, dictSize)
+        reps = [0, 0, 0, 0]
+        lastLen = 0
+        prevMain = newSeq[int](rarMainSyms)
+        prevLen = newSeq[int](rarLenSyms)
+        prevDist = newSeq[int](distSyms)
+        chunkStart = -1
+        groupStart = true
+      else:
+        var s = newString(outBufs[fileIdx].len)
+        if s.len > 0:
+          copyMem(addr s[0], unsafeAddr outBufs[fileIdx][0], s.len)
+        result[fileIdx] = SolidFilePacked(packed: s, groupStart: groupStart)
+        groupStart = false
+      inc fileIdx
+    let fEnd = fileStart[fileIdx + 1]
+    if chunkStart < 0 or pos - chunkStart >= rarEncChunk:
+      chunkStart = pos
+      let clen = min(rarEncChunk, total - chunkStart)
+      m.startChunk(chunkStart, clen)
+      var r = max(chunkStart, pos - 4096)
+      while r < pos:
+        m.insertPos(gp, total, r)
+        inc r
+    var (toks, fMain, fLen, fDist) = tokenizeBlock(gp, fEnd, pos, m,
+      useLazy, 9, prevMain, prevLen, prevDist, reps, lastLen, distSyms)
+    # Per-file filter triggers at this file's first block (file-relative
+    # offsets; decoder curPos is 0 there since its result is per-file).
+    if pos == fileStart[fileIdx] and files[fileIdx].filters.len > 0:
+      var filtToks: seq[Token] = @[]
+      for f in files[fileIdx].filters:
+        filtToks.add(Token(kind: tkFilter, filtOff: f.start.uint64,
+          filtLen: f.len.uint64, filtKind: f.kind,
+          filtChannels: if f.kind == 0: f.channels else: 1))
+        inc fMain[256]
+      toks = filtToks & toks
+    let mainLens = huffmanLengths(fMain)
+    let lenLens = huffmanLengths(fLen)
+    let distLens = huffmanLengths(fDist)
+    var aln4 = newSeq[int](rarAlignSyms)
+    for i in 0 ..< rarAlignSyms:
+      aln4[i] = 4
+    let mainC = assignCodes(mainLens)
+    let lenC = assignCodes(lenLens)
+    let distC = assignCodes(distLens)
+    prevMain = mainLens
+    prevLen = lenLens
+    prevDist = distLens
+    var concat: seq[int] = @[]
+    for L in mainLens: concat.add(L)
+    for L in distLens: concat.add(L)
+    for L in aln4: concat.add(L)
+    for L in lenLens: concat.add(L)
+    var lvlSyms: seq[int] = @[]
+    var lvlExtra: seq[tuple[bits, val: int]] = @[]
+    packLengths(concat, lvlSyms, lvlExtra)
+    var lvlFreq = newSeq[int](20)
+    for s in lvlSyms:
+      inc lvlFreq[s]
+    let lvlLensArr = huffmanLengths(lvlFreq)
+    var lvlLens: array[20, int]
+    for i in 0 ..< 20:
+      lvlLens[i] = if i < lvlLensArr.len: lvlLensArr[i] else: 0
+    let lvlC = assignCodes(@lvlLens)
+    var w = BitWriter()
+    encodeLevelTable(lvlLens, w)
+    for i, s in lvlSyms:
+      let c = lvlC[s]
+      w.putBits(c.code.uint64, c.len)
+      if lvlExtra[i].bits > 0:
+        w.putBits(lvlExtra[i].val.uint64, lvlExtra[i].bits)
+    emitBlock(gp, toks, mainC, lenC, distC, w)
+    w.flushByte()
+    let payloadBytes = w.buf.len
+    let nSize =
+      if payloadBytes <= 0xFF: 0
+      elif payloadBytes <= 0xFFFF: 1
+      else: 2
+    if payloadBytes > 0xFFFFFF:
+      raise newException(RarEncError, "rar: block too large")
+    # Last-block only on the final block of the final file.
+    let isLastFile = fileIdx == files.len - 1
+    let isLast = isLastFile and pos + rarEncBlock >= total
+    let flags = ((w.total - 1) and 7) or (nSize shl 3) or
+      (if isLast: 0x40 else: 0) or 0x80
+    var checksum = 0x5A'u8 xor byte(flags)
+    var sizeBytes: array[3, byte]
+    for i in 0 .. nSize:
+      sizeBytes[i] = byte((payloadBytes shr (8 * i)) and 0xFF)
+      checksum = checksum xor sizeBytes[i]
+    outBufs[fileIdx].add(byte(flags))
+    outBufs[fileIdx].add(checksum)
+    for i in 0 .. nSize:
+      outBufs[fileIdx].add(sizeBytes[i])
+    for b in w.buf:
+      outBufs[fileIdx].add(b)
+    pos += rarEncBlock
+    # Cap pos at the file end (tokenizeBlock already tiled input there,
+    # but pos advances by whole blocks; clamp to avoid crossing files).
+    if pos > fEnd:
+      pos = fEnd
+  # Finalize the last file.
+  if outBufs[fileIdx].len >= files[fileIdx].data.len:
+    result[fileIdx] = SolidFilePacked(stored: true)
+  else:
+    var s = newString(outBufs[fileIdx].len)
+    if s.len > 0:
+      copyMem(addr s[0], unsafeAddr outBufs[fileIdx][0], s.len)
+    result[fileIdx] = SolidFilePacked(packed: s, groupStart: groupStart)
+
 proc rarCompInfo*(meth: int; dictSize = rarEncDict): uint64 =
   ## Compression Information vint for encoder-chosen settings (v0,
   ## non-solid). Dict decomposed per §11.11.10 (truncate, never round).

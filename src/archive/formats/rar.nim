@@ -5,9 +5,9 @@
 ## symlink redirection records, Unpack50/70 LZ+Huffman codec (methods
 ## m1..m5, solid groups, DELTA/E8/E8E9/ARM filters), AES-256-CBC per-file
 ## and header encryption via PBKDF2-HMAC-SHA256, and multivolume sets
-## (split-file reassembly; solid multivolume and header-encrypted
-## multivolume stay refused). Recovery records are skipped (service
-## headers); `.rev` volumes are not archives.
+## (split-file reassembly incl. solid groups and header-encrypted sets).
+## Recovery records are skipped (service headers); `.rev` volumes are
+## not archives.
 ##
 ## Memory: header parsing is bounded (2MB header cap); STORE bodies are
 ## borrowed spans, never copied. Dict/unpacked caps from ArchiveContext
@@ -28,8 +28,9 @@ import ./rarcrypt
 type Rar* = object
   ## RAR5/7.0 archive. `method` selects the file codec: 0 = STORE
   ## (default, also used for empty files), 1..5 = Unpack50 LZ with
-  ## increasing match-finder effort. Writer always emits non-solid
-  ## archives with a 1 MiB dictionary.
+  ## increasing match-finder effort. `solid` groups consecutive
+  ## compressible files into shared LZ history; dictionary defaults
+  ## to 1 MiB (see `dictSize`/`algoVer`).
   ##
   ## `password` enables AES-256-CBC per-file encryption on write and
   ## decryption on read; it flows per call (the `Rar` value itself is
@@ -51,6 +52,17 @@ type Rar* = object
     ## E8E9/DELTA/ARM forward transforms per file and keeps the smallest
     ## packing (fallback to filter-free when nothing wins). Default false
     ## preserves existing behavior and speed.
+  solid*: bool
+    ## Solid mode: consecutive compressible files share one LZ dictionary
+    ## window, rep ring and tables (decoder state carries across the
+    ## group). Writer groups runs of compressible regular files (raw
+    ## batches ≤32MB); dirs, symlinks, empties and STORE fallbacks start
+    ## new groups. Peak buffers one batch; the first file of each group
+    ## clears CompInfo bit 6 and MAIN carries archive flag 0x0004.
+  comment*: string
+    ## Archive comment (UTF-8): emitted as a STORE CMT service header
+    ## after MAIN. Max 256KB; larger raises. Read back with
+    ## readRarComment (service headers are otherwise skipped on walk).
   dictSize*: int
     ## Explicit dictionary bytes (0 = default 1 MiB). Must be >=128KB when
     ## set; v0 requires a power of two ≤4GiB, v1 allows fractions and up
@@ -178,11 +190,11 @@ proc resolveWriterDict*(r: Rar): tuple[dictSize: int; algoVer: int] =
         "rar: dictionary needs Unpack70 (set algoVer 1)")
   result = (ds, av)
 
-proc writerCompInfo*(meth, dictSize, algoVer: int): uint64 =
+proc writerCompInfo*(meth, dictSize, algoVer: int; solid = false): uint64 =
   if algoVer == 1:
-    rarCompInfo70(meth, dictSize)
+    rarCompInfo70(meth, dictSize) or (if solid: 0x40'u64 else: 0)
   else:
-    rarCompInfo(meth, dictSize)
+    rarCompInfo(meth, dictSize) or (if solid: 0x40'u64 else: 0)
 
 # ---------- encryption helpers (CRYPT_RAR50) ----------
 
@@ -417,6 +429,25 @@ proc buildRedirExtra(target: string; redirType = 1): string =
 proc unixTime(m: Time): uint32 =
   uint32(toUnix(m))
 
+const rarSolidBatchCap* = 32 * 1024 * 1024
+  ## Writer cap: raw bytes buffered per solid group. Bounds the pending
+  ## batch (raw + transformed + packed transiently). Splitting only costs
+  ## cross-file matches across the split; decoding is unaffected.
+
+const rarCommentMax* = 256 * 1024
+  ## Archive comment size cap (MAXCMTSIZE): unpacked bytes. Larger
+  ## comments raise on write and fail on read (likely corrupt/malicious).
+
+type SolidPendingFile = object
+  ## One compressible file buffered for solid-group encoding.
+  arcName: string
+  mode: int
+  modTime: Time
+  raw: string       ## unpacked bytes (for STORE fallback emit)
+  rawCrc: uint32
+  filters: seq[RarFilterSpec]
+  compInfoBase: uint64 ## meth/dict/algo, no solid bit
+
 proc archiveRar*(r: Rar; ctx: ArchiveContext; dst: Output;
     files: seq[FileInfo]) =
   let useHdrEnc = r.encHeaders
@@ -448,10 +479,117 @@ proc archiveRar*(r: Rar; ctx: ArchiveContext; dst: Output;
         data, dsp, dsz)
     else:
       emitBlock(dst, htype, hflags, typeSpecific, extra, data, dsp, dsz)
-  # main header: type 1, flags 0, archive flags 0
+  let (wDictS, wAlgoS) = resolveWriterDict(r)
+  # Shared per-regular-file emit (STORE or packed stream; compInfoVal
+  # already carries the solid bit when applicable). Handles per-file AES.
+  proc emitRegular(arcName: string; mode: int; modTime: Time;
+      contentLen: int; rawCrc: uint32; compInfoVal: uint64;
+      body: string) =
+    let encrypting = r.password != "" and contentLen > 0
+    var cryptExtra = ""
+    var storedCrc = rawCrc
+    var cryptKey, cryptHashKey: array[32, byte]
+    var cryptSalt, cryptIv: array[16, byte]
+    if encrypting:
+      let lg2 = rarWriterLg2(r)
+      checkWriterLg2(lg2)
+      cryptSalt = rarRandomSalt()
+      cryptIv = rarRandomIv()
+      let keys = deriveRarKeys(r.password, cryptSalt, lg2)
+      cryptKey = keys.key
+      cryptHashKey = keys.hashKey
+      let check12 = rarCheckStored(keys.checkRaw)
+      cryptExtra = buildCryptExtra(cryptSalt, cryptIv, lg2, check12, true)
+      storedCrc = rarHashMacCrc(cryptHashKey, rawCrc)
+    let tsf = newOutput()
+    putVint(tsf, 0x0002'u64 or 0x0004'u64)
+    putVint(tsf, contentLen.uint64)
+    putVint(tsf, mode.uint64)
+    putU32le(tsf, unixTime(modTime))
+    putU32le(tsf, storedCrc)
+    putVint(tsf, compInfoVal)
+    putVint(tsf, 1'u64)
+    putVint(tsf, arcName.len.uint64)
+    writeStr(tsf, arcName)
+    if contentLen == 0:
+      emitHdr(2, 0x0002'u64, take(tsf), "", [], true, 0)
+    elif not encrypting:
+      emitHdr(2, 0x0002'u64, take(tsf), "", body.toOpenArrayByte(0,
+        body.len - 1), true, body.len.uint64)
+    else:
+      var ptBytes = newSeq[byte](body.len)
+      if body.len > 0:
+        copyMem(addr ptBytes[0], unsafeAddr body[0], body.len)
+      let ct = rarAesEncrypt(cryptKey, cryptIv, ptBytes)
+      emitHdr(2, 0x0002'u64, take(tsf), cryptExtra,
+        ct, true, ct.len.uint64)
+  # Singleton (non-solid) encode+emit for one compressible file.
+  proc emitSingleton(raw: string; rawCrc: uint32; arcName: string;
+      mode: int; modTime: Time) =
+    var plainPacked = raw
+    var compInfoVal: uint64 = 0
+    if r.useFilters and raw.len >= 4096:
+      let best = encodeWithFiltersAuto(raw, r.meth, wDictS, wAlgoS)
+      if best.packed.len < raw.len:
+        plainPacked = best.packed
+        compInfoVal = best.compInfo
+    else:
+      let packed = encodeRarMemberFiltered(
+        raw.toOpenArrayByte(0, raw.len - 1), r.meth, wDictS, [], wAlgoS)
+      if packed.len < raw.len:
+        plainPacked = packed
+        compInfoVal = writerCompInfo(r.meth, wDictS, wAlgoS)
+    emitRegular(arcName, mode, modTime, raw.len, rawCrc, compInfoVal,
+      plainPacked)
+  # Solid batching: runs of compressible regular files share one LZ
+  # window/rep ring/tables (see encodeSolidGroup). Zero-data entries
+  # flush the batch but never poison history; STORE fallbacks inside the
+  # group reset shared state with the next file starting a new sub-group.
+  var pend: seq[SolidPendingFile] = @[]
+  var pendRaw = 0
+  proc flushSolid() =
+    if pend.len == 0:
+      return
+    var ginputs: seq[SolidFileInput] = @[]
+    for p in pend:
+      ginputs.add(SolidFileInput(data: transformWithFilters(p.raw,
+        p.filters), filters: p.filters))
+    let gpacked = encodeSolidGroup(ginputs, r.meth, wDictS, wAlgoS)
+    for i, gp in gpacked:
+      let p = pend[i]
+      if gp.stored:
+        emitRegular(p.arcName, p.mode, p.modTime, p.raw.len, p.rawCrc,
+          0, p.raw)
+      else:
+        let ci = p.compInfoBase or
+          (if gp.groupStart: 0'u64 else: 0x40'u64)
+        emitRegular(p.arcName, p.mode, p.modTime, p.raw.len, p.rawCrc,
+          ci, gp.packed)
+    pend = @[]
+    pendRaw = 0
+  # main header: archive flags carry volume/solid bits (advisory; the
+  # per-file solid bit drives grouping, but WinRAR parity wants the
+  # summary flag set whenever the writer runs in solid mode).
   let ts = newOutput()
-  putVint(ts, 0'u64)
+  putVint(ts, if r.solid: 0x0004'u64 else: 0'u64)
   emitHdr(1, 0, take(ts), "", newSeq[byte](0), false, 0)
+  # archive comment (CMT service header, STORE, right after MAIN).
+  if r.comment.len > 0:
+    if r.comment.len > rarCommentMax:
+      raise newException(RarError, "rar: comment too large")
+    let tsc = newOutput()
+    putVint(tsc, 0x0004'u64) # crc only, no mtime
+    putVint(tsc, r.comment.len.uint64)
+    putVint(tsc, 0'u64) # attrs reserved on services
+    putU32le(tsc, crc32Update(0xFFFFFFFF'u32,
+      unsafeAddr r.comment[0], r.comment.len) xor 0xFFFFFFFF'u32)
+    putVint(tsc, 0'u64) # compInfo STORE
+    putVint(tsc, 1'u64) # host OS Unix
+    putVint(tsc, 3'u64)
+    writeStr(tsc, "CMT")
+    emitHdr(3, 0x0002'u64, take(tsc), "",
+      r.comment.toOpenArrayByte(0, r.comment.len - 1), true,
+      r.comment.len.uint64)
   var keeps: seq[Input] = @[]
   for i, f in files:
     ctx.checkCancelled()
@@ -467,6 +605,7 @@ proc archiveRar*(r: Rar; ctx: ArchiveContext; dst: Output;
     if arcName == "" or arcName == ".":
       continue
     if f.meta.isDir:
+      flushSolid()
       while arcName.endsWith("/"):
         arcName = arcName[0 ..< ^1]
       let tsd = newOutput()
@@ -482,6 +621,7 @@ proc archiveRar*(r: Rar; ctx: ArchiveContext; dst: Output;
       writeStr(tsd, arcName)
       emitHdr(2, 0, take(tsd), "", newSeq[byte](0), false, 0)
     elif f.meta.isSymlink:
+      flushSolid()
       let target = f.linkTarget
       let extra = buildRedirExtra(target)
       let tsf = newOutput()
@@ -509,88 +649,48 @@ proc archiveRar*(r: Rar; ctx: ArchiveContext; dst: Output;
         if content.len == 0: 0'u32
         else: crc32Update(0xFFFFFFFF'u32, content.p, content.len) xor
           0xFFFFFFFF'u32
-      # Decide packed plaintext and CompInfo first (encryption wraps it).
-      # Dictionary/algorithm from writer settings; filters when opted in.
-      let (wDict, wAlgo) = resolveWriterDict(r)
-      var plainPacked = newString(0)
-      var compInfoVal: uint64 = 0
-      var useStore = true
-      if r.meth != 0 and content.len > 0:
+      let mode = if f.meta.mode != 0: f.meta.mode else: 0x81A4
+      let solidEligible = r.solid and r.meth != 0 and content.len > 0 and
+        content.len <= rarSolidBatchCap
+      if not solidEligible:
+        # Zero-data entries flush the batch (order) without resetting
+        # shared history: they contribute no bytes. STORE/big files flush
+        # AND break the group (history reset is always valid).
+        flushSolid()
+        if content.len == 0 or r.meth == 0:
+          var raw = newString(content.len)
+          if content.len > 0:
+            copyMem(addr raw[0], content.p, content.len)
+          emitRegular(arcName, mode, f.meta.modTime, content.len, rawCrc,
+            0, raw)
+        elif content.len > rarSolidBatchCap:
+          # Huge file: singleton non-solid encode (group would exceed cap).
+          var raw = newString(content.len)
+          copyMem(addr raw[0], content.p, content.len)
+          emitSingleton(raw, rawCrc, arcName, mode, f.meta.modTime)
+        else:
+          # r.solid == false: legacy per-file path.
+          var raw = newString(content.len)
+          copyMem(addr raw[0], content.p, content.len)
+          emitSingleton(raw, rawCrc, arcName, mode, f.meta.modTime)
+      else:
+        # Solid path: filter-select now (standalone encodes), buffer raw
+        # + specs; the group encode happens at flush.
         var raw = newString(content.len)
         copyMem(addr raw[0], content.p, content.len)
+        var specs: seq[RarFilterSpec] = @[]
+        var compInfoBase = writerCompInfo(r.meth, wDictS, wAlgoS)
         if r.useFilters and content.len >= 4096:
-          let best = encodeWithFiltersAuto(raw, r.meth, wDict, wAlgo)
-          if best.packed.len < raw.len:
-            plainPacked = best.packed
-            compInfoVal = best.compInfo
-            useStore = false
-          else:
-            plainPacked = raw
-            compInfoVal = 0
-            useStore = true
-        else:
-          let packed = encodeRarMemberFiltered(
-            raw.toOpenArrayByte(0, raw.len - 1), r.meth, wDict, [], wAlgo)
-          if packed.len < raw.len:
-            plainPacked = packed
-            compInfoVal = writerCompInfo(r.meth, wDict, wAlgo)
-            useStore = false
-          else:
-            plainPacked = raw
-            compInfoVal = 0
-            useStore = true
-      else:
-        if content.len > 0:
-          var tmp = newString(content.len)
-          copyMem(addr tmp[0], content.p, content.len)
-          plainPacked = tmp
-        compInfoVal = 0
-        useStore = true
-      let encrypting = r.password != "" and content.len > 0
-      var cryptExtra = ""
-      var storedCrc = rawCrc
-      var cryptSalt: array[16, byte]
-      var cryptIv: array[16, byte]
-      var cryptKey: array[32, byte]
-      var cryptHashKey: array[32, byte]
-      if encrypting:
-        let lg2 = rarWriterLg2(r)
-        checkWriterLg2(lg2)
-        cryptSalt = rarRandomSalt()
-        cryptIv = rarRandomIv()
-        let keys = deriveRarKeys(r.password, cryptSalt, lg2)
-        cryptKey = keys.key
-        cryptHashKey = keys.hashKey
-        let check12 = rarCheckStored(keys.checkRaw)
-        cryptExtra = buildCryptExtra(cryptSalt, cryptIv, lg2, check12, true)
-        storedCrc = rarHashMacCrc(cryptHashKey, rawCrc)
-      let tsf = newOutput()
-      putVint(tsf, 0x0002'u64 or 0x0004'u64)
-      putVint(tsf, content.len.uint64)
-      let mode = if f.meta.mode != 0: f.meta.mode else: 0x81A4
-      putVint(tsf, mode.uint64)
-      putU32le(tsf, unixTime(f.meta.modTime))
-      putU32le(tsf, storedCrc)
-      putVint(tsf, compInfoVal)
-      putVint(tsf, 1'u64)
-      putVint(tsf, arcName.len.uint64)
-      writeStr(tsf, arcName)
-      if content.len == 0:
-        emitHdr(2, 0x0002'u64, take(tsf), "", [], true, 0)
-      elif not encrypting:
-        if useStore:
-          emitHdr(2, 0x0002'u64, take(tsf), "", plainPacked.toOpenArrayByte(0,
-            plainPacked.len - 1), true, plainPacked.len.uint64)
-        else:
-          emitHdr(2, 0x0002'u64, take(tsf), "", plainPacked.toOpenArrayByte(0,
-            plainPacked.len - 1), true, plainPacked.len.uint64)
-      else:
-        var ptBytes = newSeq[byte](plainPacked.len)
-        if plainPacked.len > 0:
-          copyMem(addr ptBytes[0], unsafeAddr plainPacked[0], plainPacked.len)
-        let ct = rarAesEncrypt(cryptKey, cryptIv, ptBytes)
-        emitHdr(2, 0x0002'u64, take(tsf), cryptExtra,
-          ct, true, ct.len.uint64)
+          let best = encodeWithFiltersAuto(raw, r.meth, wDictS, wAlgoS)
+          specs = best.filters
+          compInfoBase = best.compInfo
+        if pendRaw + raw.len > rarSolidBatchCap:
+          flushSolid()
+        pend.add(SolidPendingFile(arcName: arcName, mode: mode,
+          modTime: f.meta.modTime, raw: raw, rawCrc: rawCrc,
+          filters: specs, compInfoBase: compInfoBase))
+        pendRaw += raw.len
+  flushSolid()
   # end header: type 5, flags 0, end flags 0
   let te = newOutput()
   putVint(te, 0'u64)
@@ -618,22 +718,84 @@ type RarVolFile = object
 proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
     volumeSize: int64): seq[string] =
   ## Split archive into volumes of `volumeSize` bytes (each volume is a
-  ## complete RAR5 archive with its own MARK/MAIN/ENDARC). Non-solid,
-  ## clear headers only in v1 (header-encrypted multivolume refused).
+  ## complete RAR5 archive with its own MARK/MAIN/ENDARC). Solid groups
+  ## share history across files (same batching rules as archiveRar);
+  ## header encryption uses one archive key with HEAD_CRYPT in volume 1.
   ## Per-file AES is supported (salt/iv shared across a file's parts,
   ## HashMAC only on the last part). Headers never cross a boundary;
   ## file data splits at byte granularity.
   if volumeSize < 1024:
     raise newException(RarError, "rar: volume size too small")
-  if r.encHeaders:
-    raise newException(RarError,
-      "rar: header-encrypted multivolume unsupported in v1")
   if r.meth notin 0 .. 5:
     raise newException(RarError,
       "rar: unknown compression method " & $r.meth)
+  let useHdrEncV = r.encHeaders
+  var archKeyV: array[32, byte]
+  var archSaltV: array[16, byte]
+  var archLg2V = 0
+  if useHdrEncV:
+    if r.password == "":
+      raise newException(RarError, "rar: password required")
+    archLg2V = rarWriterLg2(r)
+    checkWriterLg2(archLg2V)
+    archSaltV = rarRandomSalt()
+    let archKeys = deriveRarKeys(r.password, archSaltV, archLg2V)
+    archKeyV = archKeys.key
+  let (wDictV, wAlgoV) = resolveWriterDict(r)
   # Prepare logical files (same naming/sanitization as single-volume).
   var vols: seq[RarVolFile] = @[]
   var keeps: seq[Input] = @[]
+  proc finishVolFile(arcName: string; mode: int; modTime: Time;
+      unpacked: int; rawCrc: uint32; compInfoVal: uint64;
+      plainPacked: string): RarVolFile =
+    ## Encrypt (per-file salt/iv) and box a prepared file for packing.
+    result = RarVolFile(arcName: arcName, mode: mode, modTime: modTime,
+      compInfo: compInfoVal, unpacked: unpacked, rawCrc: rawCrc)
+    if r.password != "" and unpacked > 0:
+      let lg2 = rarWriterLg2(r)
+      checkWriterLg2(lg2)
+      result.isEncrypted = true
+      result.cryptSalt = rarRandomSalt()
+      result.cryptIv = rarRandomIv()
+      result.cryptLg2 = lg2
+      let keys = deriveRarKeys(r.password, result.cryptSalt, lg2)
+      result.cryptKey = keys.key
+      result.cryptHashKey = keys.hashKey
+      let chk = rarCheckStored(keys.checkRaw)
+      for i in 0 ..< 12:
+        result.cryptCheck12[i] = chk[i]
+      var ptb = newSeq[byte](plainPacked.len)
+      if plainPacked.len > 0:
+        copyMem(addr ptb[0], unsafeAddr plainPacked[0], plainPacked.len)
+      let ct = rarAesEncrypt(result.cryptKey, result.cryptIv, ptb)
+      result.fullData = newString(ct.len)
+      if ct.len > 0:
+        copyMem(addr result.fullData[0], unsafeAddr ct[0], ct.len)
+    else:
+      result.fullData = plainPacked
+  # Solid batching mirrors archiveRar (same group rules).
+  var vpend: seq[SolidPendingFile] = @[]
+  var vpendRaw = 0
+  proc vflushSolid() =
+    if vpend.len == 0:
+      return
+    var ginputs: seq[SolidFileInput] = @[]
+    for p in vpend:
+      ginputs.add(SolidFileInput(data: transformWithFilters(p.raw,
+        p.filters), filters: p.filters))
+    let gpacked = encodeSolidGroup(ginputs, r.meth, wDictV, wAlgoV)
+    for i, gp in gpacked:
+      let p = vpend[i]
+      if gp.stored:
+        vols.add(finishVolFile(p.arcName, p.mode, p.modTime, p.raw.len,
+          p.rawCrc, 0, p.raw))
+      else:
+        let ci = p.compInfoBase or
+          (if gp.groupStart: 0'u64 else: 0x40'u64)
+        vols.add(finishVolFile(p.arcName, p.mode, p.modTime, p.raw.len,
+          p.rawCrc, ci, gp.packed))
+    vpend = @[]
+    vpendRaw = 0
   for f in files:
     ctx.checkCancelled()
     var arcName = f.nameInArchive
@@ -647,6 +809,7 @@ proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
     if arcName == "" or arcName == ".":
       continue
     if f.meta.isDir:
+      vflushSolid()
       var an = arcName
       while an.endsWith("/"):
         an = an[0 ..< ^1]
@@ -654,6 +817,7 @@ proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
         mode: if f.meta.mode != 0: f.meta.mode else: 0x41ED,
         modTime: f.meta.modTime))
     elif f.meta.isSymlink:
+      vflushSolid()
       vols.add(RarVolFile(arcName: arcName, isSymlink: true,
         linkTarget: f.linkTarget,
         mode: 0x81A4, modTime: f.meta.modTime,
@@ -671,71 +835,134 @@ proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
         if content.len == 0: 0'u32
         else: crc32Update(0xFFFFFFFF'u32, content.p, content.len) xor
           0xFFFFFFFF'u32
-      let (wDictV, wAlgoV) = resolveWriterDict(r)
-      var plainPacked = raw
-      var compInfoVal: uint64 = 0
-      if r.meth != 0 and content.len > 0:
+      let mode = if f.meta.mode != 0: f.meta.mode else: 0x81A4
+      let solidEligible = r.solid and r.meth != 0 and content.len > 0 and
+        content.len <= rarSolidBatchCap
+      if not solidEligible:
+        vflushSolid()
+        if content.len == 0 or r.meth == 0:
+          vols.add(finishVolFile(arcName, mode, f.meta.modTime,
+            content.len, rawCrc, 0, raw))
+        elif content.len > rarSolidBatchCap:
+          var plainPacked = raw
+          var compInfoVal: uint64 = 0
+          if r.useFilters and content.len >= 4096:
+            let best = encodeWithFiltersAuto(raw, r.meth, wDictV, wAlgoV)
+            if best.packed.len < raw.len:
+              plainPacked = best.packed
+              compInfoVal = best.compInfo
+          else:
+            let packed = encodeRarMemberFiltered(
+              raw.toOpenArrayByte(0, raw.len - 1), r.meth, wDictV, [],
+              wAlgoV)
+            if packed.len < raw.len:
+              plainPacked = packed
+              compInfoVal = writerCompInfo(r.meth, wDictV, wAlgoV)
+          vols.add(finishVolFile(arcName, mode, f.meta.modTime,
+            content.len, rawCrc, compInfoVal, plainPacked))
+        else:
+          # r.solid == false: legacy per-file path.
+          var plainPacked = raw
+          var compInfoVal: uint64 = 0
+          if r.useFilters and content.len >= 4096:
+            let best = encodeWithFiltersAuto(raw, r.meth, wDictV, wAlgoV)
+            if best.packed.len < raw.len:
+              plainPacked = best.packed
+              compInfoVal = best.compInfo
+          else:
+            let packed = encodeRarMemberFiltered(
+              raw.toOpenArrayByte(0, raw.len - 1), r.meth, wDictV, [],
+              wAlgoV)
+            if packed.len < raw.len:
+              plainPacked = packed
+              compInfoVal = writerCompInfo(r.meth, wDictV, wAlgoV)
+          vols.add(finishVolFile(arcName, mode, f.meta.modTime,
+            content.len, rawCrc, compInfoVal, plainPacked))
+      else:
+        # Solid path: filter-select now, group encode at flush.
+        var specs: seq[RarFilterSpec] = @[]
+        var compInfoBase = writerCompInfo(r.meth, wDictV, wAlgoV)
         if r.useFilters and content.len >= 4096:
           let best = encodeWithFiltersAuto(raw, r.meth, wDictV, wAlgoV)
-          if best.packed.len < raw.len:
-            plainPacked = best.packed
-            compInfoVal = best.compInfo
-        else:
-          let packed = encodeRarMemberFiltered(
-            raw.toOpenArrayByte(0, raw.len - 1), r.meth, wDictV, [], wAlgoV)
-          if packed.len < raw.len:
-            plainPacked = packed
-            compInfoVal = writerCompInfo(r.meth, wDictV, wAlgoV)
-      let encrypting = r.password != "" and content.len > 0
-      var vf = RarVolFile(arcName: arcName,
-        mode: if f.meta.mode != 0: f.meta.mode else: 0x81A4,
-        modTime: f.meta.modTime, compInfo: compInfoVal,
-        unpacked: content.len, rawCrc: rawCrc)
-      if encrypting:
-        let lg2 = rarWriterLg2(r)
-        checkWriterLg2(lg2)
-        vf.isEncrypted = true
-        vf.cryptSalt = rarRandomSalt()
-        vf.cryptIv = rarRandomIv()
-        vf.cryptLg2 = lg2
-        let keys = deriveRarKeys(r.password, vf.cryptSalt, lg2)
-        vf.cryptKey = keys.key
-        vf.cryptHashKey = keys.hashKey
-        let chk = rarCheckStored(keys.checkRaw)
-        for i in 0 ..< 12:
-          vf.cryptCheck12[i] = chk[i]
-        var ptb = newSeq[byte](plainPacked.len)
-        if plainPacked.len > 0:
-          copyMem(addr ptb[0], unsafeAddr plainPacked[0], plainPacked.len)
-        let ct = rarAesEncrypt(vf.cryptKey, vf.cryptIv, ptb)
-        vf.fullData = newString(ct.len)
-        if ct.len > 0:
-          copyMem(addr vf.fullData[0], unsafeAddr ct[0], ct.len)
-      else:
-        vf.fullData = plainPacked
-      vols.add(vf)
-  # Volume packing.
+          specs = best.filters
+          compInfoBase = best.compInfo
+        if vpendRaw + raw.len > rarSolidBatchCap:
+          vflushSolid()
+        vpend.add(SolidPendingFile(arcName: arcName, mode: mode,
+          modTime: f.meta.modTime, raw: raw, rawCrc: rawCrc,
+          filters: specs, compInfoBase: compInfoBase))
+        vpendRaw += raw.len
+  vflushSolid()
+  # Volume packing. With header encryption every header block is
+  # IV16 + AES-CBC (fresh IV per header) under one archive key with
+  # HEAD_CRYPT in volume 1 only; data areas stay as-is.
   var outVols: seq[string] = @[]
   var cur = newOutput()
   var volIdx = 0 # 0-based; volume number field is volIdx for volIdx>=1
-  proc startVolume() =
-    cur = newOutput()
-    writeStr(cur, rar5Magic)
-    let ts = newOutput()
-    if volIdx == 0:
-      putVint(ts, 0x0001'u64) # volume
-      emitBlock(cur, 1, 0, take(ts), "", newSeq[byte](0), false, 0)
+  proc hdrDiskLen(plainLen: int): int =
+    if useHdrEncV: 16 + ((plainLen + 15) div 16) * 16 else: plainLen
+  proc writeVolHdr(hdr: string) =
+    if not useHdrEncV:
+      writeStr(cur, hdr)
     else:
-      putVint(ts, 0x0003'u64) # volume + volume number present
-      putVint(ts, volIdx.uint64) # 1 for second volume, etc.
-      emitBlock(cur, 1, 0, take(ts), "", newSeq[byte](0), false, 0)
+      var pt = newSeq[byte](hdr.len)
+      if hdr.len > 0:
+        copyMem(addr pt[0], unsafeAddr hdr[0], hdr.len)
+      let iv = rarRandomIv()
+      let ct = rarAesEncrypt(archKeyV, iv, pt)
+      writeBytes(cur, unsafeAddr iv[0], 16)
+      if ct.len > 0:
+        writeBytes(cur, unsafeAddr ct[0], ct.len)
   proc endVolume(notLast: bool) =
     let te = newOutput()
     putVint(te, if notLast: 1'u64 else: 0'u64)
-    emitBlock(cur, 5, 0x0004, take(te), "", newSeq[byte](0), false, 0)
+    writeVolHdr(buildHeaderBytes(5, 0x0004, take(te), "", false, 0))
     outVols.add(take(cur))
     inc volIdx
-  const endarcSize = 8 # CRC4 + hsize1 + type1 + hflags1 + endflags1
+  proc startVolume() =
+    cur = newOutput()
+    writeStr(cur, rar5Magic)
+    if volIdx == 0 and useHdrEncV:
+      # HEAD_CRYPT in the clear (version + flags + lg2 + salt + check).
+      let ach = rarCheckStored(deriveRarKeys(r.password, archSaltV,
+        archLg2V).checkRaw)
+      let tc = newOutput()
+      putVint(tc, 0'u64)
+      putVint(tc, 0x0001'u64)
+      writeByte(tc, byte(archLg2V))
+      writeBytes(tc, unsafeAddr archSaltV[0], 16)
+      writeBytes(tc, unsafeAddr ach[0], 12)
+      emitBlock(cur, 4, 0, take(tc), "", newSeq[byte](0), false, 0)
+    let ts = newOutput()
+    if volIdx == 0:
+      putVint(ts, 0x0001'u64 or (if r.solid: 0x0004'u64 else: 0'u64))
+      writeVolHdr(buildHeaderBytes(1, 0, take(ts), "", false, 0))
+    else:
+      putVint(ts, 0x0003'u64 or (if r.solid: 0x0004'u64 else: 0'u64))
+      putVint(ts, volIdx.uint64) # 1 for second volume, etc.
+      writeVolHdr(buildHeaderBytes(1, 0, take(ts), "", false, 0))
+    if volIdx == 0 and r.comment.len > 0:
+      if r.comment.len > rarCommentMax:
+        raise newException(RarError, "rar: comment too large")
+      let tsc = newOutput()
+      putVint(tsc, 0x0004'u64)
+      putVint(tsc, r.comment.len.uint64)
+      putVint(tsc, 0'u64)
+      putU32le(tsc, crc32Update(0xFFFFFFFF'u32,
+        unsafeAddr r.comment[0], r.comment.len) xor 0xFFFFFFFF'u32)
+      putVint(tsc, 0'u64)
+      putVint(tsc, 1'u64)
+      putVint(tsc, 3'u64)
+      writeStr(tsc, "CMT")
+      let chdr = buildHeaderBytes(3, 0x0002'u64, take(tsc), "", true,
+        r.comment.len.uint64)
+      if int64(outputBytes(cur).len + hdrDiskLen(chdr.len) +
+          hdrDiskLen(8)) > volumeSize:
+        endVolume(true)
+        startVolume()
+      writeVolHdr(chdr)
+      writeStr(cur, r.comment)
+  let endarcDisk = hdrDiskLen(8) # CRC4 + hsize1 + type1 + hflags1 + endflags1
   startVolume()
   for vfi in 0 ..< vols.len:
     let vf = vols[vfi]
@@ -751,10 +978,10 @@ proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
       putVint(tsd, vf.arcName.len.uint64)
       writeStr(tsd, vf.arcName)
       let hdr = buildHeaderBytes(2, 0, take(tsd), "", false, 0)
-      if int64(outputBytes(cur).len + hdr.len + endarcSize) > volumeSize:
+      if int64(outputBytes(cur).len + hdrDiskLen(hdr.len) + endarcDisk) > volumeSize:
         endVolume(true)
         startVolume()
-      writeStr(cur, hdr)
+      writeVolHdr(hdr)
     elif vf.isSymlink:
       let extra = buildRedirExtra(vf.linkTarget)
       let tsf = newOutput()
@@ -769,10 +996,10 @@ proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
       writeStr(tsf, vf.arcName)
       let hdr = buildHeaderBytes(2, 0x0001'u64 or 0x0002'u64, take(tsf),
         extra, true, 0)
-      if int64(outputBytes(cur).len + hdr.len + endarcSize) > volumeSize:
+      if int64(outputBytes(cur).len + hdrDiskLen(hdr.len) + endarcDisk) > volumeSize:
         endVolume(true)
         startVolume()
-      writeStr(cur, hdr)
+      writeVolHdr(hdr)
     else:
       # Regular file, possibly split.
       if vf.fullData.len == 0 and vf.unpacked == 0:
@@ -794,10 +1021,10 @@ proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
         writeStr(tsf, vf.arcName)
         let hdr = buildHeaderBytes(2, 0x0002'u64, take(tsf), extra,
           true, 0)
-        if int64(outputBytes(cur).len + hdr.len + endarcSize) > volumeSize:
+        if int64(outputBytes(cur).len + hdrDiskLen(hdr.len) + endarcDisk) > volumeSize:
           endVolume(true)
           startVolume()
-        writeStr(cur, hdr)
+        writeVolHdr(hdr)
       else:
         var off = 0
         var firstFrag = true
@@ -824,7 +1051,7 @@ proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
           # Determine if this is the last fragment (tentative).
           # We need to know remaining space to decide split.
           let curLen = outputBytes(cur).len
-          let avail = int(volumeSize) - curLen - endarcSize
+          let avail = int(volumeSize) - curLen - endarcDisk
           # Build candidate header pieces without DataSize to measure base.
           # Instead, iterate: try fragLen = min(remainingTotal, avail - hdrBase)
           # where hdrBase estimated. Do two passes.
@@ -874,8 +1101,8 @@ proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
             testStored = vf.rawCrc
           let testHdrLast = buildFragHdr(remainingTotal, isFirst, true,
             testStored, testExtra)
-          if int64(curLen + testHdrLast.len + remainingTotal +
-              endarcSize) <= volumeSize and
+          if int64(curLen + hdrDiskLen(testHdrLast.len) + remainingTotal +
+              endarcDisk) <= volumeSize and
               (isFirst or off > 0):
             # Whole remaining fits as final fragment (split-before iff
             # continuation from a previous volume).
@@ -939,14 +1166,14 @@ proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
                   sCrc = c xor 0xFFFFFFFF'u32
               let h = buildFragHdr(fragLen, isFirst,
                 remainingTotal - fragLen == 0, sCrc, eExtra)
-              if curLen + h.len + fragLen + endarcSize <=
+              if curLen + hdrDiskLen(h.len) + fragLen + endarcDisk <=
                   int(volumeSize):
                 fragHdr = h
                 fragStored = sCrc
                 fragExtra = eExtra
                 break
               # Shrink fragLen to fit.
-              fragLen = int(volumeSize) - curLen - h.len - endarcSize
+              fragLen = int(volumeSize) - curLen - hdrDiskLen(h.len) - endarcDisk
               if fragLen <= 0:
                 endVolume(true)
                 startVolume()
@@ -990,7 +1217,7 @@ proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
                   c = crc32Update(c, unsafeAddr vf.fullData[i], 1)
                 sC = c xor 0xFFFFFFFF'u32
             fragHdr = buildFragHdr(fragLen, isFirst, isLast, sC, eE)
-          writeStr(cur, fragHdr)
+          writeVolHdr(fragHdr)
           if fragLen > 0:
             writeStr(cur, vf.fullData[off ..< off + fragLen])
           off += fragLen
@@ -1260,6 +1487,8 @@ proc decodeRarMember*(cache: RarGroupCache; ctx: ArchiveContext; src: Input;
     cache.decoded[mm.idx] = dec
     cache.upto[grp] = i
   cache.decoded[idx]
+
+# ---------- multivolume solid-group decode cache ----------
 
 proc parseExtra(inp: Input; extraEnd: int; entry: var RarEntry) =
   ## Scan extra records; tolerant trailing junk ends the walk.
@@ -1576,7 +1805,7 @@ proc extractRar*(r: Rar; ctx: ArchiveContext; inp: Input;
       # extractRar refuses split parts with a clear error).
       if (hflags and 0x0008) != 0 or (hflags and 0x0010) != 0:
         raise newException(RarError,
-          "rar: multivolume split unsupported in v1")
+          "rar: split volume part; use extractRarVolumes with all volumes")
       if isService:
         # skip data (ACL/STM/CMT/QO/RR): metadata loss documented.
         # Encrypted service payloads are skipped as ciphertext; no
@@ -1834,6 +2063,145 @@ proc extractRar*(r: Rar; ctx: ArchiveContext; inp: Input;
       raise newException(RarError, "rar: walk did not advance")
     discard typeStart
 
+proc readRarComment*(ctx: ArchiveContext; inp: Input;
+    password = ""): string =
+  ## Return the archive comment (CMT service header payload, UTF-8) or
+  ## "" when the archive has none. Walks a single volume; header-encrypted
+  ## archives need `password`. Comments larger than `rarCommentMax` raise
+  ## (likely corrupt or malicious).
+  if remaining(inp) < 8:
+    raise newException(RarError, "rar: truncated signature")
+  let sig = readSpan(inp, 8)
+  if not spanEqual(sig, rar5Magic):
+    raise newException(RarError, "rar: bad signature")
+  var archKey: array[32, byte]
+  var hdrEnc = false
+  var headerCount = 0
+  while true:
+    ctx.checkCancelled()
+    if remaining(inp) == 0:
+      break
+    var allZero = true
+    for i in 0 ..< remaining(inp):
+      if byteAt(inp, inputPos(inp) + i) != 0:
+        allZero = false
+        break
+    if allZero:
+      break
+    var body = ""
+    if hdrEnc:
+      body = readHdrEncPlaintext(inp, archKey)
+    else:
+      if remaining(inp) < 4:
+        raise newException(RarError, "rar: truncated header crc")
+      let storedCrc = readU32le(inp)
+      let hsizePos = inputPos(inp)
+      let hsize = readVint(inp)
+      if hsize > rarMaxHeaderSize.uint64:
+        raise newException(RarError, "rar: header too large")
+      let bs = inputPos(inp)
+      if uint64(remaining(inp)) < hsize:
+        raise newException(RarError, "rar: truncated header")
+      let headerEnd = bs + int(hsize)
+      let crcSpan = spanAt(inp, hsizePos, (bs - hsizePos) + int(hsize))
+      let calc =
+        if crcSpan.len == 0: 0xFFFFFFFF'u32
+        else: crc32Update(0xFFFFFFFF'u32, crcSpan.p, crcSpan.len) xor
+          0xFFFFFFFF'u32
+      if calc != storedCrc:
+        raise newException(RarError, "rar: header crc mismatch")
+      let blen = 4 + (bs - hsizePos) + int(hsize)
+      let whole = spanAt(inp, hsizePos - 4, blen)
+      body = newString(blen)
+      if blen > 0:
+        copyMem(addr body[0], whole.p, blen)
+      seek(inp, headerEnd)
+    inc headerCount
+    if headerCount > rarMaxHeaderCount:
+      raise newException(RarError, "rar: too many headers")
+    let bin = openInputString(body)
+    discard readU32le(bin)
+    discard readVint(bin)
+    let htype = readVint(bin)
+    let hflags = readVint(bin)
+    var dataSize: uint64 = 0
+    if (hflags and 0x0001) != 0:
+      discard readVint(bin)
+    if (hflags and 0x0002) != 0:
+      dataSize = readVint(bin)
+    if htype == 4:
+      # HEAD_CRYPT: derive the archive key, subsequent headers encrypted.
+      let tsLen = remaining(bin)
+      if tsLen <= 0 or tsLen > 64:
+        raise newException(RarError, "rar: bad crypt header")
+      var tsStr = newString(tsLen)
+      if tsLen > 0:
+        let tsp = spanAt(bin, inputPos(bin), tsLen)
+        copyMem(addr tsStr[0], tsp.p, tsLen)
+      let hc = parseHeadCrypt(tsStr, 0)
+      if hc.ver != 0:
+        raise newException(RarCodecError,
+          "rar: unknown encryption version")
+      if password == "":
+        raise newException(RarError, "rar: password required")
+      if hc.lg2 > rarKdfMaxLg2:
+        raise newException(RarCodecError,
+          "rar: KDF count exceeds decoder maximum")
+      let akeys = deriveRarKeys(password, hc.salt, hc.lg2)
+      var stored12: array[12, byte]
+      for i in 0 ..< 12:
+        stored12[i] = hc.check[i]
+      if hc.hasCheck and not rarVerifyCheck(stored12, akeys.checkRaw):
+        raise newException(RarError, "rar: incorrect password")
+      archKey = akeys.key
+      hdrEnc = true
+      if dataSize > 0:
+        if dataSize > uint64(remaining(inp)):
+          raise newException(RarError, "rar: truncated crypt data")
+        skip(inp, int(dataSize))
+      continue
+    if htype == 5:
+      return ""
+    if htype != 2 and htype != 3:
+      seek(bin, 0) # unknown: skip via lengths (bin fully consumed anyway)
+      if dataSize > uint64(remaining(inp)):
+        raise newException(RarError, "rar: truncated unknown data")
+      skip(inp, int(dataSize))
+      continue
+    let fileFlags = readVint(bin)
+    let unpacked = readVint(bin)
+    discard readVint(bin) # attrs
+    if (fileFlags and 0x0002) != 0:
+      discard readU32le(bin)
+    if (fileFlags and 0x0004) != 0:
+      discard readU32le(bin)
+    discard readVint(bin) # compInfo
+    discard readVint(bin) # host OS
+    let nameLen = readVint(bin)
+    if nameLen > rarMaxNameLen.uint64:
+      raise newException(RarError, "rar: name too long")
+    var nm = ""
+    if nameLen > 0:
+      let nsp = spanAt(bin, inputPos(bin), int(nameLen))
+      nm = newString(int(nameLen))
+      copyMem(addr nm[0], nsp.p, int(nameLen))
+    if htype == 3 and nm == "CMT":
+      if dataSize > rarCommentMax.uint64:
+        raise newException(RarError, "rar: comment too large")
+      if dataSize > uint64(remaining(inp)):
+        raise newException(RarError, "rar: truncated service data")
+      if dataSize == 0:
+        return ""
+      let dsp = readSpan(inp, int(dataSize))
+      result = newString(int(dataSize))
+      copyMem(addr result[0], dsp.p, int(dataSize))
+      return result
+    if dataSize > uint64(remaining(inp)):
+      raise newException(RarError, "rar: truncated file data")
+    skip(inp, int(dataSize))
+    discard unpacked
+  result = ""
+
 # ---------- multivolume reader ----------
 
 type RarVolFrag = object
@@ -1865,28 +2233,329 @@ type RarVolLogical = object
   useHashMacFinal: bool
   frags: seq[RarVolFrag]
 
+type VolGroupMember = object
+  ## Compressed logical file for forward decode across volumes.
+  idx*: int
+  compInfo*: uint64
+  unpacked*: uint64
+  unpackedKnown*: bool
+  hasCrc*: bool
+  dataCrc*: uint32
+  hasBlake*: bool
+  dictSize*: uint64
+  algo70*: bool
+  meth*: int
+  grp*: int
+  encrypted*: bool
+  cryptVer*: int
+  cryptLg2*: int
+  cryptSalt*: array[16, byte]
+  cryptIv*: array[16, byte]
+  cryptCheck*: array[12, byte]
+  hasCryptCheck*: bool
+  useHashMac*: bool
+  frags*: seq[RarVolFrag] ## one per volume part (single for whole files)
+
+type VolGroupCache* = ref object
+  ## Per-extractRarVolumes decode cache. Mirrors RarGroupCache, but each
+  ## member's packed bytes are reassembled from volume fragments (owned,
+  ## bounded per file) instead of borrowed from one Input.
+  state*: UnpackState
+  groupId*: int
+  hasGroup*: bool
+  groupDict*: uint64
+  groupAlgo70*: bool
+  members*: Table[int, seq[VolGroupMember]]
+  upto*: Table[int, int]
+  decoded*: Table[int, string]
+
+proc decodeVolMember*(cache: VolGroupCache; ctx: ArchiveContext;
+    volumes: openArray[Input]; password: string; idx: int): string =
+  ## Decode (or fetch cached) one compressed logical file. Solid groups
+  ## decode forward with shared UnpackState; a lone file is a group of
+  ## one. Fragment bytes are concatenated lazily on first open, bounded
+  ## by the unpacked cap like the single-volume path.
+  if cache.decoded.hasKey(idx):
+    return cache.decoded[idx]
+  var grp = -1
+  var pos = -1
+  for gid, ms in cache.members:
+    for i, mm in ms:
+      if mm.idx == idx:
+        grp = gid
+        pos = i
+        break
+    if grp >= 0:
+      break
+  if grp < 0:
+    raise newException(RarCodecError, "rar: member not in solid walk")
+  let members = cache.members[grp]
+  if cache.state == nil or cache.groupId != grp:
+    cache.state = UnpackState()
+    let first = members[0]
+    let fm = checkRarMethod(first.compInfo, first.unpacked, ctx)
+    if fm.meth notin 1 .. 5:
+      raise newException(RarCodecError,
+        "rar: unknown compression method " & $fm.meth)
+    resetUnpack(cache.state, int(fm.dictSize),
+      if fm.algo70: 1 else: 0)
+    cache.groupId = grp
+    cache.upto[grp] = -1
+  let done = cache.upto.getOrDefault(grp, -1)
+  for i in done + 1 .. pos:
+    let mm = members[i]
+    let m = checkRarMethod(mm.compInfo, mm.unpacked, ctx)
+    if m.meth notin 1 .. 5:
+      raise newException(RarCodecError,
+        "rar: unknown compression method " & $m.meth)
+    if int(m.dictSize) != cache.state.dictSize or
+        m.algo70 != (cache.state.algoVer == 1):
+      # Dictionary change forces Solid=false: fresh window.
+      resetUnpack(cache.state, int(m.dictSize),
+        if m.algo70: 1 else: 0)
+    # Reassemble packed bytes from fragments (single copy, capped).
+    var totalPacked = 0
+    for fg in mm.frags:
+      totalPacked += fg.dataLen
+    if ctx.maxRarUnpackedBytes > 0 and
+        totalPacked > int(ctx.maxRarUnpackedBytes) + 16:
+      raise newException(RarCodecError,
+        "rar: unpacked size exceeds cap")
+    var packed = newString(totalPacked)
+    var poff = 0
+    for fg in mm.frags:
+      if fg.dataLen > 0:
+        let vsrc = volumes[fg.volIdx]
+        let fsp = spanAt(vsrc, fg.dataOff, fg.dataLen)
+        copyMem(addr packed[poff], fsp.p, fg.dataLen)
+      poff += fg.dataLen
+    let limit =
+      if mm.unpackedKnown: mm.unpacked
+      elif ctx.maxRarUnpackedBytes > 0: uint64(ctx.maxRarUnpackedBytes)
+      else: 1'u64 shl 62
+    var dec: string
+    var hashKey: array[32, byte]
+    var useMac = false
+    if mm.encrypted:
+      if password == "":
+        raise newException(RarError, "rar: password required")
+      if mm.cryptVer != 0:
+        raise newException(RarCodecError,
+          "rar: unknown encryption version")
+      if mm.cryptLg2 > rarKdfMaxLg2:
+        raise newException(RarCodecError,
+          "rar: KDF count exceeds decoder maximum")
+      let keys = deriveRarKeys(password, mm.cryptSalt, mm.cryptLg2)
+      var stored: array[12, byte]
+      for j in 0 ..< 12:
+        stored[j] = mm.cryptCheck[j]
+      if mm.hasCryptCheck and not rarVerifyCheck(stored, keys.checkRaw):
+        raise newException(RarError, "rar: incorrect password")
+      if mm.useHashMac:
+        hashKey = keys.hashKey
+        useMac = true
+      var ct = newSeq[byte](packed.len)
+      if packed.len > 0:
+        copyMem(addr ct[0], unsafeAddr packed[0], packed.len)
+      let pt = decryptRarBytes(ct, keys.key, mm.cryptIv)
+      if pt.len == 0:
+        dec = ""
+      else:
+        dec = decodeMember(cache.state, unsafeAddr pt[0], pt.len, limit,
+          if m.algo70: 1 else: 0)
+    else:
+      if packed.len == 0:
+        dec = ""
+      else:
+        dec = decodeMember(cache.state, unsafeAddr packed[0],
+          packed.len, limit, if m.algo70: 1 else: 0)
+    if mm.encrypted and mm.useHashMac:
+      verifyRarDecodedCrypt(dec, mm.unpacked, mm.unpackedKnown, mm.hasCrc,
+        mm.dataCrc, mm.hasBlake, useMac, hashKey)
+    else:
+      verifyRarDecoded(dec, mm.unpacked, mm.unpackedKnown, mm.hasCrc,
+        mm.dataCrc, mm.hasBlake)
+    cache.decoded[mm.idx] = dec
+    cache.upto[grp] = i
+  cache.decoded[idx]
+
+
+
+proc peekVolHeadCrypt*(inp: Input): tuple[found: bool; lg2: int;
+    salt: array[16, byte]; check: array[12, byte]; hasCheck: bool] =
+  ## Non-destructive probe: is the first block after MARK a HEAD_CRYPT?
+  ## Never raises; the cursor is always restored.
+  result.found = false
+  let save = inputPos(inp)
+  try:
+    if remaining(inp) < 8:
+      return
+    let sig = readSpan(inp, 8)
+    if not spanEqual(sig, rar5Magic):
+      return
+    if remaining(inp) < 4:
+      return
+    let storedCrc = readU32le(inp)
+    let hsizePos = inputPos(inp)
+    let hsize = readVint(inp)
+    if hsize > rarMaxHeaderSize.uint64:
+      return
+    let bodyStart = inputPos(inp)
+    if uint64(remaining(inp)) < hsize:
+      return
+    let hsizeBytes = bodyStart - hsizePos
+    let crcSpan = spanAt(inp, hsizePos, hsizeBytes + int(hsize))
+    let calc = crc32Update(0xFFFFFFFF'u32, crcSpan.p, crcSpan.len) xor
+      0xFFFFFFFF'u32
+    if calc != storedCrc:
+      return
+    let htype = readVint(inp)
+    if htype != 4:
+      return
+    let hflags = readVint(inp)
+    var extraSize, dataSize: uint64 = 0
+    if (hflags and 0x0001) != 0:
+      extraSize = readVint(inp)
+    if (hflags and 0x0002) != 0:
+      dataSize = readVint(inp)
+    discard extraSize
+    discard dataSize
+    let headerEnd = bodyStart + int(hsize)
+    let tsLen = headerEnd - inputPos(inp)
+    if tsLen <= 0 or tsLen > 64:
+      return
+    let tsSp = spanAt(inp, inputPos(inp), tsLen)
+    var tsStr = newString(tsLen)
+    copyMem(addr tsStr[0], tsSp.p, tsLen)
+    let hc = parseHeadCrypt(tsStr, 0)
+    if hc.ver != 0:
+      return
+    if hc.lg2 > rarKdfMaxLg2:
+      return
+    result.found = true
+    result.lg2 = hc.lg2
+    result.salt = hc.salt
+    result.check = hc.check
+    result.hasCheck = hc.hasCheck
+  except CatchableError:
+    discard
+  finally:
+    seek(inp, save)
+
+proc rebuildClearVolume*(inp: Input; archKey: array[32, byte];
+    ctx: ArchiveContext; cap: var uint64;
+    skipHeadCrypt: bool): string =
+  ## Decrypt every header of one header-encrypted volume into clear
+  ## bytes; data areas are copied verbatim. Counts copied data against
+  ## `cap` (remaining budget, shared across volumes).
+  let outp = newOutput()
+  if remaining(inp) < 8:
+    raise newException(RarError, "rar: truncated signature")
+  let sig = readSpan(inp, 8)
+  if not spanEqual(sig, rar5Magic):
+    raise newException(RarError, "rar: bad signature")
+  writeStr(outp, rar5Magic)
+  if skipHeadCrypt:
+    # Consume the clear HEAD_CRYPT (validated); it is not copied.
+    if remaining(inp) < 4:
+      raise newException(RarError, "rar: truncated header crc")
+    discard readU32le(inp)
+    let hsizePos = inputPos(inp)
+    let hsize = readVint(inp)
+    if hsize > rarMaxHeaderSize.uint64:
+      raise newException(RarError, "rar: header too large")
+    let bodyStart = inputPos(inp)
+    if uint64(remaining(inp)) < hsize:
+      raise newException(RarError, "rar: truncated header")
+    let headerEnd = bodyStart + int(hsize)
+    seek(inp, headerEnd)
+  while true:
+    ctx.checkCancelled()
+    if remaining(inp) == 0:
+      break
+    var allZero = true
+    for i in 0 ..< remaining(inp):
+      if byteAt(inp, inputPos(inp) + i) != 0:
+        allZero = false
+        break
+    if allZero:
+      break
+    let plain = readHdrEncPlaintext(inp, archKey)
+    let hin = openInputString(plain)
+    discard readU32le(hin)
+    discard readVint(hin)
+    let ht = readVint(hin)
+    let hf = readVint(hin)
+    var edata: uint64 = 0
+    if (hf and 0x0001) != 0:
+      discard readVint(hin)
+    if (hf and 0x0002) != 0:
+      edata = readVint(hin)
+    writeStr(outp, plain)
+    if edata > 0:
+      if edata > uint64(remaining(inp)):
+        raise newException(RarError, "rar: truncated file data")
+      if edata > cap:
+        raise newException(RarCodecError,
+          "rar: unpacked size exceeds cap")
+      cap -= edata
+      let dsp = readSpan(inp, int(edata))
+      if dsp.len > 0:
+        writeBytes(outp, dsp.p, dsp.len)
+    if ht == 5:
+      break
+  take(outp)
+
 proc extractRarVolumes*(r: Rar; ctx: ArchiveContext;
     volumes: openArray[Input]; handle: FileHandler) =
   ## Walk a multivolume set in order, reassembling split files (data
-  ## areas concatenated across volumes) before decoding. Non-solid only
-  ## in v1; solid multivolume and header-encrypted multivolume are
-  ## refused with clear errors. Listing stays cheap (headers only);
-  ## reassembly buffers are bounded by the unpacked cap.
+  ## areas concatenated across volumes) before decoding. Solid groups
+  ## decode forward with shared state like the single-volume path;
+  ## header-encrypted sets are decrypted volume by volume under the
+  ## archive key from volume 1's HEAD_CRYPT. Listing stays cheap
+  ## (headers only); reassembly buffers are bounded by the unpacked cap.
   if volumes.len == 0:
     raise newException(RarError, "rar: no volumes")
-  if r.encHeaders:
-    # Header-encrypted multivolume would need the arch key shared across
-    # volumes; refuse for now (single-volume header encryption works).
-    # Callers can still read header-encrypted single volumes via extractRar.
-    raise newException(RarError,
-      "rar: header-encrypted multivolume unsupported in v1")
+  let volSeq = @volumes
+  # Header-encryption auto-detect: HEAD_CRYPT as first block of vol1.
+  # Rebuild clear volumes and recurse (same pattern as single-volume
+  # extractRar; per-file AES is handled by the clear walk).
+  block hdrEncProbe:
+    let peek = peekVolHeadCrypt(volSeq[0])
+    if not peek.found:
+      break hdrEncProbe
+    if r.password == "":
+      raise newException(RarError, "rar: password required")
+    let akeys = deriveRarKeys(r.password, peek.salt, peek.lg2)
+    var stored: array[12, byte]
+    for i in 0 ..< 12:
+      stored[i] = peek.check[i]
+    if peek.hasCheck and not rarVerifyCheck(stored, akeys.checkRaw):
+      raise newException(RarError, "rar: incorrect password")
+    var cap: uint64 =
+      if ctx.maxRarUnpackedBytes > 0: uint64(ctx.maxRarUnpackedBytes) +
+        16 * 1024 * 1024 else: 1'u64 shl 62
+    var clearStrs: seq[string] = @[]
+    clearStrs.add(rebuildClearVolume(volSeq[0], akeys.key, ctx, cap, true))
+    var clearVols: seq[Input] = @[]
+    clearVols.add(openInputString(clearStrs[0]))
+    for vi in 1 ..< volSeq.len:
+      clearStrs.add(rebuildClearVolume(volSeq[vi], akeys.key, ctx, cap,
+        false))
+      clearVols.add(openInputString(clearStrs[^1]))
+    # clearStrs stays alive through the recursion below, retaining every
+    # rebuilt volume buffer (Inputs borrow; temporaries would dangle).
+    var r2 = r
+    r2.encHeaders = false
+    extractRarVolumes(r2, ctx, clearVols, handle)
+    return
   var pending: RarVolLogical
   var hasPending = false
-  var volNo = 0
   var totalLogical = 0
-  # For non-split STORE zero-copy: need volume Inputs retained (kept by
-  # caller; volumes array outlives extraction).
-  for vi, vinp in volumes:
+  # Volume Inputs are retained by the caller; volSeq (a copy of the refs)
+  # outlives extraction and is safe to capture in openers.
+  let volCache = VolGroupCache()
+  for vi, vinp in volSeq:
     let inp = vinp
     if remaining(inp) < 8:
       raise newException(RarError, "rar: truncated signature")
@@ -1955,9 +2624,8 @@ proc extractRarVolumes*(r: Rar; ctx: ArchiveContext;
           let vn = readVint(inp)
           if vn != expectVolNum.uint64:
             raise newException(RarError, "rar: wrong volume number")
-        if (archFlags and 0x0004) != 0:
-          raise newException(RarError,
-            "rar: solid multivolume unsupported in v1")
+        discard (archFlags and 0x0004) # solid-archive hint; grouping
+        # uses the per-file solid bit like the single-volume path
         seek(inp, headerEnd)
         if (hflags and 0x0002) != 0:
           if dataSize > uint64(remaining(inp)):
@@ -1965,7 +2633,7 @@ proc extractRarVolumes*(r: Rar; ctx: ArchiveContext;
           skip(inp, int(dataSize))
       of 4:
         raise newException(RarError,
-          "rar: header-encrypted multivolume unsupported in v1")
+          "rar: unexpected HEAD_CRYPT (pass all volumes)")
       of 2, 3:
         let isService = htype == 3
         let fileFlags = readVint(inp)
@@ -2011,9 +2679,7 @@ proc extractRarVolumes*(r: Rar; ctx: ArchiveContext;
           seek(inp, headerEnd)
         let splitBefore = (hflags and 0x0008) != 0
         let splitAfter = (hflags and 0x0010) != 0
-        if compSolid(compInfo):
-          raise newException(RarError,
-            "rar: solid multivolume unsupported in v1")
+        discard compSolid(compInfo) # handled by group recording below
         if isService:
           if uint64(remaining(inp)) < dataSize:
             raise newException(RarError, "rar: truncated service data")
@@ -2104,121 +2770,63 @@ proc extractRarVolumes*(r: Rar; ctx: ArchiveContext;
               handle(ctx, fi)
             skip(inp, fragLen)
           else:
-            # Compressed or encrypted: reassemble single-fragment logical
-            # file (copy bounded by the unpacked cap) then decode.
-            if ctx.maxRarUnpackedBytes > 0 and
-                fragLen > int(ctx.maxRarUnpackedBytes) + 16:
-              raise newException(RarCodecError,
-                "rar: unpacked size exceeds cap")
-            var packed = newString(fragLen)
-            if fragLen > 0:
-              let fsp = spanAt(inp, fragOff, fragLen)
-              copyMem(addr packed[0], fsp.p, fragLen)
-            skip(inp, fragLen)
-            let e = entry
-            let curCtx = ctx
-            let curIdx = totalLogical
-            let pwd = r.password
-            var owned = ""
-            var done = false
-            proc opener(): Input =
-              if compMethod(e.compInfo) == 0:
-                if curCtx.maxRarUnpackedBytes != 0 and
-                    e.size > curCtx.maxRarUnpackedBytes:
-                  raise newException(RarError,
-                    "rar: unpacked size exceeds cap")
-                var pt = packed
-                if e.encrypted:
-                  if pwd == "":
-                    raise newException(RarError, "rar: password required")
-                  if e.cryptVer != 0:
-                    raise newException(RarCodecError,
-                      "rar: unknown encryption version")
-                  let keys = deriveRarKeys(pwd, e.cryptSalt, e.cryptLg2)
-                  var st: array[12, byte]
-                  for i in 0 ..< 12: st[i] = e.cryptCheck[i]
-                  if e.hasCryptCheck and
-                      not rarVerifyCheck(st, keys.checkRaw):
-                    raise newException(RarError, "rar: incorrect password")
-                  var ct = newSeq[byte](packed.len)
-                  if packed.len > 0:
-                    copyMem(addr ct[0], unsafeAddr packed[0], packed.len)
-                  let full = decryptRarBytes(ct, keys.key, e.cryptIv)
-                  if full.len < int(e.size):
-                    raise newException(RarError,
-                      "rar: truncated file data")
-                  pt = full[0 ..< int(e.size)]
-                  if e.hasCrc and pt.len > 0:
-                    let raw = crc32Update(0xFFFFFFFF'u32,
-                      unsafeAddr pt[0], pt.len) xor 0xFFFFFFFF'u32
-                    let expect =
-                      if e.useHashMac: rarHashMacCrc(keys.hashKey, raw)
-                      else: raw
-                    if expect != e.dataCrc:
-                      raise newException(RarError,
-                        "rar: data crc mismatch")
-                else:
-                  if packed.len != int(e.size):
-                    raise newException(RarError, "rar: size mismatch")
-                  if e.hasCrc and packed.len > 0:
-                    let got = crc32Update(0xFFFFFFFF'u32,
-                      unsafeAddr packed[0], packed.len) xor 0xFFFFFFFF'u32
-                    if got != e.dataCrc:
-                      raise newException(RarError,
-                        "rar: data crc mismatch")
-                owned = pt
-                done = true
-                return openInputString(owned)
-              # Compressed: fresh window per file (non-solid multivolume).
-              let m = checkRarMethod(e.compInfo,
-                cast[uint64](e.size), curCtx)
-              if m.meth notin 1 .. 5:
-                raise newException(RarCodecError,
-                  "rar: unknown compression method " & $m.meth)
-              var st = UnpackState()
-              resetUnpack(st, int(m.dictSize), if m.algo70: 1 else: 0)
-              var ptPacked = packed
-              if e.encrypted:
-                if pwd == "":
-                  raise newException(RarError, "rar: password required")
-                if e.cryptVer != 0:
-                  raise newException(RarCodecError,
-                    "rar: unknown encryption version")
-                let keys = deriveRarKeys(pwd, e.cryptSalt, e.cryptLg2)
-                var stc: array[12, byte]
-                for i in 0 ..< 12: stc[i] = e.cryptCheck[i]
-                if e.hasCryptCheck and
-                    not rarVerifyCheck(stc, keys.checkRaw):
-                  raise newException(RarError, "rar: incorrect password")
-                var ct = newSeq[byte](packed.len)
-                if packed.len > 0:
-                  copyMem(addr ct[0], unsafeAddr packed[0], packed.len)
-                ptPacked = decryptRarBytes(ct, keys.key, e.cryptIv)
-              let limit =
-                if curCtx.maxRarUnpackedBytes > 0:
-                  uint64(curCtx.maxRarUnpackedBytes)
-                else: 1'u64 shl 62
-              let dec = decodeMember(st, unsafeAddr ptPacked[0],
-                ptPacked.len, limit, if m.algo70: 1 else: 0)
-              if e.encrypted and e.useHashMac:
-                let keys2 = deriveRarKeys(pwd, e.cryptSalt, e.cryptLg2)
-                verifyRarDecodedCrypt(dec, cast[uint64](e.size), true,
-                  e.hasCrc, e.dataCrc, e.hasBlake, true, keys2.hashKey)
-              else:
-                verifyRarDecoded(dec, cast[uint64](e.size), true,
-                  e.hasCrc, e.dataCrc, e.hasBlake)
-              owned = dec
-              done = true
-              openInputString(owned)
-            var meta = FileMeta(name: baseNameV(nm), size: e.size,
-              mode: e.mode, modTime: e.modTime, isDir: false,
-              isSymlink: false, isRegular: true)
-            let fi = FileInfo(meta: meta, nameInArchive: nm,
-              linkTarget: "", open: opener)
-            ctx.reportProgress(nm, totalLogical, -1, e.size)
-            inc totalLogical
-            {.gcsafe.}:
-              handle(ctx, fi)
+            # Compressed whole file: record group membership (metadata
+            # only) and decode lazily via the shared solid cache, exactly
+            # like the single-volume path. Unknown methods still list and
+            # fail on open with the accurate error.
+            let methW = compMethod(compInfo)
+            if methW != 0:
+              let verW = compVersion(compInfo)
+              let compatW = (compInfo shr 20) and 1
+              let algo70W = verW == 1 and compatW == 0
+              let dsW = rarDictSize(compInfo)
+              var grpW = volCache.groupId
+              if not volCache.hasGroup or not compSolid(compInfo) or
+                  dsW != volCache.groupDict or algo70W != volCache.groupAlgo70:
+                inc volCache.groupId
+                grpW = volCache.groupId
+                volCache.hasGroup = true
+              volCache.groupDict = dsW
+              volCache.groupAlgo70 = algo70W
+              if not volCache.members.hasKey(grpW):
+                volCache.members[grpW] = @[]
+                volCache.upto[grpW] = -1
+              volCache.members[grpW].add(VolGroupMember(idx: totalLogical,
+                compInfo: compInfo, unpacked: cast[uint64](entry.size),
+                unpackedKnown: (fileFlags and 0x0008) == 0,
+                hasCrc: entry.hasCrc, dataCrc: entry.dataCrc,
+                hasBlake: entry.hasBlake, dictSize: dsW, algo70: algo70W,
+                meth: methW, grp: grpW, encrypted: entry.encrypted,
+                cryptVer: entry.cryptVer, cryptLg2: entry.cryptLg2,
+                cryptSalt: entry.cryptSalt, cryptIv: entry.cryptIv,
+                cryptCheck: entry.cryptCheck,
+                hasCryptCheck: entry.hasCryptCheck,
+                useHashMac: entry.useHashMac,
+                frags: @[RarVolFrag(dataOff: fragOff, dataLen: fragLen,
+                  volIdx: vi, storedCrc: dcrc, hasCrc: hasCrc)]))
+              let e = entry
+              let curCtx = ctx
+              let curIdx = totalLogical
+              let pwd = r.password
+              let vc = volCache
+              let vols = volSeq
+              var owned = ""
+              var done = false
+              proc opener(): Input =
+                if not done:
+                  owned = decodeVolMember(vc, curCtx, vols, pwd, curIdx)
+                  done = true
+                openInputString(owned)
+              var meta = FileMeta(name: baseNameV(nm), size: e.size,
+                mode: e.mode, modTime: e.modTime, isDir: false,
+                isSymlink: false, isRegular: true)
+              let fi = FileInfo(meta: meta, nameInArchive: nm,
+                linkTarget: "", open: opener)
+              ctx.reportProgress(nm, totalLogical, -1, e.size)
+              inc totalLogical
+              {.gcsafe.}:
+                handle(ctx, fi)
+              skip(inp, fragLen)
         else:
           # Split file: accumulate fragments, emit on last part.
           if not splitBefore and splitAfter:
@@ -2282,33 +2890,33 @@ proc extractRarVolumes*(r: Rar; ctx: ArchiveContext;
               discard
           skip(inp, fragLen)
           if isLastFrag:
-            # Reassemble logical packed data from fragments across volumes.
-            var totalPacked = 0
-            for fg in pending.frags:
-              totalPacked += fg.dataLen
-            if ctx.maxRarUnpackedBytes > 0 and
-                totalPacked > int(ctx.maxRarUnpackedBytes) + 16:
-              raise newException(RarCodecError,
-                "rar: unpacked size exceeds cap")
-            var packed = newString(totalPacked)
-            var poff = 0
-            for fg in pending.frags:
-              let vsrc = volumes[fg.volIdx]
-              let fsp = spanAt(vsrc, fg.dataOff, fg.dataLen)
-              if fg.dataLen > 0:
-                copyMem(addr packed[poff], fsp.p, fg.dataLen)
-              poff += fg.dataLen
-            let lp = pending
-            hasPending = false
-            let curCtx2 = ctx
-            let curIdx2 = totalLogical
-            let pwd2 = r.password
-            var owned2 = ""
-            var done2 = false
-            # Capture packed by value (owned string, pinned in closure).
-            let packedOwned = packed
-            proc opener2(): Input =
-              if compMethod(lp.compInfo) == 0:
+            if compMethod(pending.compInfo) == 0:
+              # STORE split file: reassemble eagerly (bounded per file);
+              # no decoder state involved.
+              var totalPacked = 0
+              for fg in pending.frags:
+                totalPacked += fg.dataLen
+              if ctx.maxRarUnpackedBytes > 0 and
+                  totalPacked > int(ctx.maxRarUnpackedBytes) + 16:
+                raise newException(RarCodecError,
+                  "rar: unpacked size exceeds cap")
+              var packed = newString(totalPacked)
+              var poff = 0
+              for fg in pending.frags:
+                let vsrc = volSeq[fg.volIdx]
+                let fsp = spanAt(vsrc, fg.dataOff, fg.dataLen)
+                if fg.dataLen > 0:
+                  copyMem(addr packed[poff], fsp.p, fg.dataLen)
+                poff += fg.dataLen
+              let lp = pending
+              hasPending = false
+              let curCtx2 = ctx
+              let pwd2 = r.password
+              var owned2 = ""
+              var done2 = false
+              # Capture packed by value (owned string, pinned in closure).
+              let packedOwned = packed
+              proc opener2(): Input =
                 if curCtx2.maxRarUnpackedBytes != 0 and
                     lp.size > curCtx2.maxRarUnpackedBytes:
                   raise newException(RarError,
@@ -2358,57 +2966,73 @@ proc extractRarVolumes*(r: Rar; ctx: ArchiveContext;
                 owned2 = pt
                 done2 = true
                 return openInputString(owned2)
-              let m = checkRarMethod(lp.compInfo,
-                cast[uint64](lp.size), curCtx2)
-              if m.meth notin 1 .. 5:
-                raise newException(RarCodecError,
-                  "rar: unknown compression method " & $m.meth)
-              var st = UnpackState()
-              resetUnpack(st, int(m.dictSize), if m.algo70: 1 else: 0)
-              var ptPacked = packedOwned
-              if lp.encrypted:
-                if pwd2 == "":
-                  raise newException(RarError, "rar: password required")
-                if lp.cryptVer != 0:
-                  raise newException(RarCodecError,
-                    "rar: unknown encryption version")
-                let keys = deriveRarKeys(pwd2, lp.cryptSalt, lp.cryptLg2)
-                var stc: array[12, byte]
-                for i in 0 ..< 12: stc[i] = lp.cryptCheck[i]
-                if lp.hasCryptCheck and
-                    not rarVerifyCheck(stc, keys.checkRaw):
-                  raise newException(RarError, "rar: incorrect password")
-                var ct = newSeq[byte](packedOwned.len)
-                if packedOwned.len > 0:
-                  copyMem(addr ct[0], unsafeAddr packedOwned[0],
-                    packedOwned.len)
-                ptPacked = decryptRarBytes(ct, keys.key, lp.cryptIv)
-              let limit =
-                if curCtx2.maxRarUnpackedBytes > 0:
-                  uint64(curCtx2.maxRarUnpackedBytes)
-                else: 1'u64 shl 62
-              let dec = decodeMember(st, unsafeAddr ptPacked[0],
-                ptPacked.len, limit, if m.algo70: 1 else: 0)
-              if lp.encrypted and lp.useHashMacFinal:
-                let keys2 = deriveRarKeys(pwd2, lp.cryptSalt, lp.cryptLg2)
-                verifyRarDecodedCrypt(dec, cast[uint64](lp.size), true,
-                  lp.hasCrcFinal, lp.dataCrcFinal, lp.hasBlake, true,
-                  keys2.hashKey)
-              else:
-                verifyRarDecoded(dec, cast[uint64](lp.size), true,
-                  lp.hasCrcFinal, lp.dataCrcFinal, lp.hasBlake)
-              owned2 = dec
-              done2 = true
-              openInputString(owned2)
-            var meta = FileMeta(name: baseNameV(lp.name), size: lp.size,
-              mode: lp.mode, modTime: lp.modTime, isDir: false,
-              isSymlink: false, isRegular: true)
-            let fi = FileInfo(meta: meta, nameInArchive: lp.name,
-              linkTarget: "", open: opener2)
-            ctx.reportProgress(lp.name, totalLogical, -1, lp.size)
-            inc totalLogical
-            {.gcsafe.}:
-              handle(ctx, fi)
+              var meta = FileMeta(name: baseNameV(lp.name), size: lp.size,
+                mode: lp.mode, modTime: lp.modTime, isDir: false,
+                isSymlink: false, isRegular: true)
+              let fi = FileInfo(meta: meta, nameInArchive: lp.name,
+                linkTarget: "", open: opener2)
+              ctx.reportProgress(lp.name, totalLogical, -1, lp.size)
+              inc totalLogical
+              {.gcsafe.}:
+                handle(ctx, fi)
+            else:
+              # Compressed split file: record group membership and decode
+              # lazily via the shared solid cache (reassembly happens
+              # inside decodeVolMember, bounded per file).
+              let methS = compMethod(pending.compInfo)
+              let verS = compVersion(pending.compInfo)
+              let compatS = (pending.compInfo shr 20) and 1
+              let algo70S = verS == 1 and compatS == 0
+              let dsS = rarDictSize(pending.compInfo)
+              var grpS = volCache.groupId
+              if not volCache.hasGroup or not compSolid(pending.compInfo) or
+                  dsS != volCache.groupDict or algo70S != volCache.groupAlgo70:
+                inc volCache.groupId
+                grpS = volCache.groupId
+                volCache.hasGroup = true
+              volCache.groupDict = dsS
+              volCache.groupAlgo70 = algo70S
+              if not volCache.members.hasKey(grpS):
+                volCache.members[grpS] = @[]
+                volCache.upto[grpS] = -1
+              volCache.members[grpS].add(VolGroupMember(idx: totalLogical,
+                compInfo: pending.compInfo,
+                unpacked: cast[uint64](pending.size),
+                unpackedKnown: (fileFlags and 0x0008) == 0,
+                hasCrc: pending.hasCrcFinal,
+                dataCrc: pending.dataCrcFinal, hasBlake: pending.hasBlake,
+                dictSize: dsS, algo70: algo70S, meth: methS, grp: grpS,
+                encrypted: pending.encrypted,
+                cryptVer: pending.cryptVer, cryptLg2: pending.cryptLg2,
+                cryptSalt: pending.cryptSalt, cryptIv: pending.cryptIv,
+                cryptCheck: pending.cryptCheck,
+                hasCryptCheck: pending.hasCryptCheck,
+                useHashMac: pending.useHashMacFinal,
+                frags: pending.frags))
+              hasPending = false
+              let curCtx = ctx
+              let curIdx = totalLogical
+              let pwd = r.password
+              let vc = volCache
+              let vols = volSeq
+              var owned = ""
+              var done = false
+              proc opener(): Input =
+                if not done:
+                  owned = decodeVolMember(vc, curCtx, vols, pwd, curIdx)
+                  done = true
+                openInputString(owned)
+              var meta = FileMeta(name: baseNameV(pending.name),
+                size: pending.size, mode: pending.mode,
+                modTime: pending.modTime, isDir: false, isSymlink: false,
+                isRegular: true)
+              let fi = FileInfo(meta: meta, nameInArchive: pending.name,
+                linkTarget: "", open: opener)
+              ctx.reportProgress(pending.name, totalLogical, -1,
+                pending.size)
+              inc totalLogical
+              {.gcsafe.}:
+                handle(ctx, fi)
       of 5:
         seek(inp, headerEnd)
         if dataSize > 0:
@@ -2451,6 +3075,5 @@ proc extractRarVolumes*(r: Rar; ctx: ArchiveContext;
       let nextPos = inputPos(inp)
       if nextPos <= blockPos:
         raise newException(RarError, "rar: walk did not advance")
-    inc volNo
   if hasPending:
     raise newException(RarError, "rar: missing split continuation")

@@ -173,9 +173,10 @@ for path, e in walkFs("out.tar.gz"):
 - [ ] lzip (.lz), minlz (.mz)
 - [x] rar 5.0/7.0 read + write (Unpack50/70 LZ incl. solid groups and
   DELTA/E8/E8E9/ARM decode; own m1..m5 LZ encoder with STORE fallback and
-  opt-in E8E9/DELTA/ARM filters; AES-256-CBC per-file + header encryption
-  via PBKDF2-HMAC-SHA256; multivolume read/write; Unpack70 80-symbol
-  distance path; recovery records skipped)
+  opt-in E8E9/DELTA/ARM filters; solid-group write; AES-256-CBC per-file +
+  header encryption via PBKDF2-HMAC-SHA256; multivolume read/write incl.
+  solid and header-encrypted sets; archive comments (CMT); Unpack70
+  80-symbol distance path; recovery records skipped)
 - [ ] 7z read/write (needs new port; public-domain LZMA SDK reference)
 
 ### ❤ Contributions & Support

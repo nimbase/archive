@@ -610,3 +610,205 @@ suite "rar5 unpack70":
     # Non-power-of-two needs fraction (v1).
     let ciF = rarCompInfo70(3, (1 shl 20) + (1 shl 15))
     check ((ciF shr 15) and 0x1F) != 0
+
+suite "rar5 solid":
+  test "solid single volume round trips and wins on shared data":
+    var ctx: ArchiveContext
+    let a = "lorem ipsum dolor sit amet ".repeat(120)
+    let b = "lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(72)
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: a.len, isRegular: true), data: a),
+      FsEntry(path: "b.txt", meta: FileMeta(name: "b.txt", size: b.len, isRegular: true), data: b),
+    ], ".", "")
+    let d0 = newOutput()
+    archiveRar(Rar(meth: 3), ctx, d0, files)
+    let d1 = newOutput()
+    archiveRar(Rar(meth: 3, solid: true), ctx, d1, files)
+    let b0 = take(d0)
+    let b1 = take(d1)
+    check b1.len < b0.len
+    var backs: seq[string] = @[]
+    extractRar(Rar(), ctx, openInputString(b1)) do (
+        c: ArchiveContext; info: FileInfo):
+      if info.isRegular():
+        backs.add(readAll(info.open()))
+    check backs == @[a, b]
+
+  test "solid groups split at dirs empties and store fallbacks":
+    randomize(7)
+    var noise = newString(3000)
+    for i in 0 ..< noise.len:
+      noise[i] = chr(rand(255))
+    let a = "shared phrase one ".repeat(150)
+    let b = "shared phrase two ".repeat(150)
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "d", meta: FileMeta(name: "d", isDir: true), data: ""),
+      FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: a.len, isRegular: true), data: a),
+      FsEntry(path: "empty.txt", meta: FileMeta(name: "empty.txt", size: 0, isRegular: true), data: ""),
+      FsEntry(path: "b.txt", meta: FileMeta(name: "b.txt", size: b.len, isRegular: true), data: b),
+      FsEntry(path: "n.bin", meta: FileMeta(name: "n.bin", size: noise.len, isRegular: true), data: noise),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 3, solid: true), ctx, dst, files)
+    let blob = take(dst)
+    var seen: seq[string] = @[]
+    var bodies = initOrderedTable[string, string]()
+    extractRar(Rar(), ctx, openInputString(blob)) do (
+        c: ArchiveContext; info: FileInfo):
+      seen.add(info.nameInArchive)
+      if info.isRegular():
+        bodies[info.nameInArchive] = readAll(info.open())
+    check bodies["a.txt"] == a
+    check bodies["b.txt"] == b
+    check bodies["n.bin"] == noise
+    check bodies["empty.txt"] == ""
+    check "d" in seen
+
+  test "solid with per-file encryption round trips":
+    let a = "solid secret one ".repeat(200)
+    let b = "solid secret two ".repeat(200)
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: a.len, isRegular: true), data: a),
+      FsEntry(path: "b.txt", meta: FileMeta(name: "b.txt", size: b.len, isRegular: true), data: b),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 3, solid: true, password: "pw", kdfLg2: 4), ctx, dst, files)
+    let blob = take(dst)
+    var backs: seq[string] = @[]
+    extractRar(Rar(password: "pw"), ctx, openInputString(blob)) do (
+        c: ArchiveContext; info: FileInfo):
+      if info.isRegular():
+        backs.add(readAll(info.open()))
+    check backs == @[a, b]
+
+suite "rar5 solid multivolume":
+  test "solid split round trip":
+    randomize(11)
+    var datas: seq[string] = @[]
+    for f in 0 ..< 3:
+      var d = newString(6000)
+      for j in 0 ..< d.len:
+        d[j] = chr(rand(255))
+      datas.add(d)
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "h0.bin", meta: FileMeta(name: "h0.bin", size: datas[0].len, isRegular: true), data: datas[0]),
+      FsEntry(path: "h1.bin", meta: FileMeta(name: "h1.bin", size: datas[1].len, isRegular: true), data: datas[1]),
+      FsEntry(path: "h2.bin", meta: FileMeta(name: "h2.bin", size: datas[2].len, isRegular: true), data: datas[2]),
+    ], ".", "")
+    let vols = archiveRarVolumes(Rar(meth: 3, solid: true), ctx, files, 4096)
+    check vols.len >= 2
+    var inps: seq[Input] = @[]
+    for v in vols:
+      inps.add(openInputString(v))
+    var backs: seq[string] = @[]
+    extractRarVolumes(Rar(), ctx, inps, proc(c: ArchiveContext; info: FileInfo) =
+      if info.isRegular():
+        backs.add(readAll(info.open()))
+    )
+    check backs == datas
+
+suite "rar5 header-encrypted multivolume":
+  test "split round trip with header encryption":
+    randomize(13)
+    var datas: seq[string] = @[]
+    for f in 0 ..< 3:
+      var d = newString(6000)
+      for j in 0 ..< d.len:
+        d[j] = chr(rand(255))
+      datas.add(d)
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "h0.bin", meta: FileMeta(name: "h0.bin", size: datas[0].len, isRegular: true), data: datas[0]),
+      FsEntry(path: "h1.bin", meta: FileMeta(name: "h1.bin", size: datas[1].len, isRegular: true), data: datas[1]),
+      FsEntry(path: "h2.bin", meta: FileMeta(name: "h2.bin", size: datas[2].len, isRegular: true), data: datas[2]),
+    ], ".", "")
+    let vols = archiveRarVolumes(Rar(meth: 0, password: "pw123", kdfLg2: 4,
+      encHeaders: true), ctx, files, 4096)
+    check vols.len >= 2
+    var inps: seq[Input] = @[]
+    for v in vols:
+      inps.add(openInputString(v))
+    var backs: seq[string] = @[]
+    extractRarVolumes(Rar(password: "pw123"), ctx, inps, proc(c: ArchiveContext; info: FileInfo) =
+      if info.isRegular():
+        backs.add(readAll(info.open()))
+    )
+    check backs == datas
+
+  test "wrong password fails on header-encrypted volumes":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "h.bin", meta: FileMeta(name: "h.bin", size: 3000, isRegular: true), data: "x".repeat(3000)),
+    ], ".", "")
+    let vols = archiveRarVolumes(Rar(meth: 0, password: "pw123", kdfLg2: 4,
+      encHeaders: true), ctx, files, 2048)
+    check vols.len >= 2
+    var inps: seq[Input] = @[]
+    for v in vols:
+      inps.add(openInputString(v))
+    var failed = false
+    try:
+      extractRarVolumes(Rar(password: "bad"), ctx, inps, proc(c: ArchiveContext; info: FileInfo) = discard)
+    except RarError as e:
+      failed = "incorrect password" in e.msg
+    check failed
+
+suite "rar5 archive comment":
+  test "comment write and readback":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "f.txt", meta: FileMeta(name: "f.txt", size: 2, isRegular: true), data: "hi"),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 1, comment: "hello comment"), ctx, dst, files)
+    let blob = take(dst)
+    check readRarComment(ctx, openInputString(blob)) == "hello comment"
+    # Files still walk normally past the CMT service header.
+    var back = ""
+    extractRar(Rar(), ctx, openInputString(blob)) do (
+        c: ArchiveContext; info: FileInfo):
+      if info.isRegular():
+        back = readAll(info.open())
+    check back == "hi"
+
+  test "no comment reads empty":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "f.txt", meta: FileMeta(name: "f.txt", size: 2, isRegular: true), data: "hi"),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 1), ctx, dst, files)
+    check readRarComment(ctx, openInputString(take(dst))) == ""
+
+  test "header-encrypted comment readback":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "f.txt", meta: FileMeta(name: "f.txt", size: 2, isRegular: true), data: "hi"),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 1, password: "pw", kdfLg2: 4, encHeaders: true,
+      comment: "secret note"), ctx, dst, files)
+    let blob = take(dst)
+    check readRarComment(ctx, openInputString(blob), "pw") == "secret note"
+    var failed = false
+    try:
+      discard readRarComment(ctx, openInputString(blob), "bad")
+    except RarError:
+      failed = true
+    check failed
+
+  test "oversize comment refused":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "f.txt", meta: FileMeta(name: "f.txt", size: 2, isRegular: true), data: "hi"),
+    ], ".", "")
+    let dst = newOutput()
+    var failed = false
+    try:
+      archiveRar(Rar(meth: 0, comment: "z".repeat(300 * 1024)), ctx, dst, files)
+    except RarError:
+      failed = true
+    check failed
