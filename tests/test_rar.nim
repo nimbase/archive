@@ -1,4 +1,5 @@
-import std/[unittest, tables, strutils, options]
+import std/[unittest, tables, strutils, options, random]
+import std/unicode
 from std/os import joinPath, getTempDir, removeFile
 import archive/types
 import archive/io
@@ -7,6 +8,8 @@ import archive/crc32
 import archive/formats/rar
 import archive/formats/rarcodec
 import archive/formats/rarenc
+import archive/formats/rarcrypt
+import nimcypher/utils as ncUtils
 import archive/vfs
 import archive
 
@@ -419,3 +422,191 @@ suite "rar5 encode":
         if L != 0:
           sum += 1 shl (15 - L)
       check sum <= 1 shl 15
+
+suite "rar5 encryption":
+  test "pbkdf2 vectors":
+    let v1 = rarPbkdf2Chain(ncUtils.toBytes("password"), ncUtils.toBytes("salt"), 1)
+    check ncUtils.toHex(v1.key) == "120FB6CFFCF8B32C43E7225256C4F837A86548C92CCC35480805987CB70BE17B"
+    let v2 = rarPbkdf2Chain(ncUtils.toBytes("password"), ncUtils.toBytes("salt"), 4096)
+    check ncUtils.toHex(v2.key) == "C5E478D59288C841AA530DB6845C4C8D962893A001CE4E11A4963873AA98134A"
+
+  test "per-file aes round trip":
+    for m in [0, 1, 3, 5]:
+      var ctx: ArchiveContext
+      let files = filesFromEntries(ctx, FromFSOptions(), [
+        FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: 5, isRegular: true), data: "hello"),
+        FsEntry(path: "b.bin", meta: FileMeta(name: "b.bin", size: 3000, isRegular: true), data: "abc".repeat(1000)),
+      ], ".", "")
+      let dst = newOutput()
+      archiveRar(Rar(meth: m, password: "hunter2", kdfLg2: 4), ctx, dst, files)
+      let blob = take(dst)
+      var backs: seq[string] = @[]
+      extractRar(Rar(password: "hunter2"), ctx, openInputString(blob)) do (
+          c: ArchiveContext; info: FileInfo):
+        if info.isRegular():
+          backs.add(readAll(info.open()))
+      check backs == @["hello", "abc".repeat(1000)]
+      # wrong password fails
+      var wrongFailed = false
+      try:
+        extractRar(Rar(password: "wrong"), ctx, openInputString(blob)) do (
+            c: ArchiveContext; info: FileInfo):
+          if info.isRegular():
+            discard readAll(info.open())
+      except ArchiveError:
+        wrongFailed = true
+      check wrongFailed
+      # missing password fails
+      var missingFailed = false
+      try:
+        extractRar(Rar(), ctx, openInputString(blob)) do (
+            c: ArchiveContext; info: FileInfo):
+          if info.isRegular():
+            discard readAll(info.open())
+      except ArchiveError:
+        missingFailed = true
+      check missingFailed
+
+  test "header encryption round trip":
+    for m in [0, 3]:
+      var ctx: ArchiveContext
+      let files = filesFromEntries(ctx, FromFSOptions(), [
+        FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: 5, isRegular: true), data: "hello"),
+      ], ".", "")
+      let dst = newOutput()
+      archiveRar(Rar(meth: m, password: "hunter2", kdfLg2: 4, encHeaders: true), ctx, dst, files)
+      let blob = take(dst)
+      var back = ""
+      extractRar(Rar(password: "hunter2"), ctx, openInputString(blob)) do (
+          c: ArchiveContext; info: FileInfo):
+        if info.isRegular():
+          back = readAll(info.open())
+      check back == "hello"
+      var wrongFailed = false
+      try:
+        extractRar(Rar(password: "wrong"), ctx, openInputString(blob)) do (
+            c: ArchiveContext; info: FileInfo):
+          if info.isRegular():
+            discard readAll(info.open())
+      except ArchiveError:
+        wrongFailed = true
+      check wrongFailed
+
+suite "rar5 multivolume":
+  test "split round trip store and compressed":
+    randomize(42)
+    var data = newString(4096)
+    for i in 0 ..< data.len:
+      data[i] = chr(rand(255))
+    for m in [0, 3]:
+      var ctx: ArchiveContext
+      let files = filesFromEntries(ctx, FromFSOptions(), [
+        FsEntry(path: "r.bin", meta: FileMeta(name: "r.bin", size: data.len, isRegular: true), data: data),
+      ], ".", "")
+      let vols = archiveRarVolumes(Rar(meth: m), ctx, files, 2048)
+      check vols.len >= 2
+      for v in vols:
+        check v.len <= 2048
+      var inps: seq[Input] = @[]
+      for v in vols:
+        inps.add(openInputString(v))
+      var back = ""
+      extractRarVolumes(Rar(), ctx, inps, proc(c: ArchiveContext; info: FileInfo) =
+        if info.isRegular():
+          back = readAll(info.open())
+      )
+      check back == data
+
+  test "multivolume with per-file encryption":
+    randomize(99)
+    var data = newString(5000)
+    for i in 0 ..< data.len:
+      data[i] = chr(rand(255))
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "s.bin", meta: FileMeta(name: "s.bin", size: data.len, isRegular: true), data: data),
+    ], ".", "")
+    let vols = archiveRarVolumes(Rar(meth: 0, password: "pw", kdfLg2: 4), ctx, files, 2048)
+    check vols.len >= 2
+    var inps: seq[Input] = @[]
+    for v in vols:
+      inps.add(openInputString(v))
+    var back = ""
+    extractRarVolumes(Rar(password: "pw"), ctx, inps, proc(c: ArchiveContext; info: FileInfo) =
+      if info.isRegular():
+        back = readAll(info.open())
+    )
+    check back == data
+
+suite "rar5 filters on write":
+  test "filtered encode round trips and wins on x86":
+    # Repeated CALLs to one target: relative disps differ per site (LZ
+    # misses), absolute targets match after the forward transform.
+    var x86 = newString(20000)
+    for i in 0 ..< x86.len:
+      x86[i] = chr(0)
+    const target = 0x1000'u32
+    var at = 0
+    while at + 5 <= x86.len:
+      x86[at] = chr(0xE8)
+      let disp = (target - uint32(at + 5)) and 0xFFFFFFFF'u32
+      x86[at+1] = chr(int(disp and 0xFF))
+      x86[at+2] = chr(int((disp shr 8) and 0xFF))
+      x86[at+3] = chr(int((disp shr 16) and 0xFF))
+      x86[at+4] = chr(int((disp shr 24) and 0xFF))
+      at += 64
+    var ctx: ArchiveContext
+    let flist = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "x.bin", meta: FileMeta(name: "x.bin", size: x86.len, isRegular: true), data: x86),
+    ], ".", "")
+    let d0 = newOutput()
+    archiveRar(Rar(meth: 3), ctx, d0, flist)
+    let b0 = take(d0)
+    let d1 = newOutput()
+    archiveRar(Rar(meth: 3, useFilters: true), ctx, d1, flist)
+    let b1 = take(d1)
+    check b1.len < b0.len
+    var back = ""
+    extractRar(Rar(), ctx, openInputString(b1)) do (
+        c: ArchiveContext; info: FileInfo):
+      if info.isRegular():
+        back = readAll(info.open())
+    check back == x86
+
+  test "delta filtered encode round trips":
+    var pcm = newString(4096)
+    for i in 0 ..< pcm.len:
+      pcm[i] = chr((i * 3 + 11) and 0xFF)
+    let enc = fwdDelta(pcm, 2)
+    let specs = [RarFilterSpec(start: 0, len: enc.len, kind: 0, channels: 2)]
+    let packed = encodeRarMemberFiltered(enc.toOpenArrayByte(0, enc.len - 1), 3, rarEncDict, specs, 0)
+    var st = UnpackState()
+    resetUnpack(st, rarEncDict, 0)
+    let dec = decodeMember(st, unsafeAddr packed[0], packed.len, uint64(pcm.len), 0)
+    check dec == pcm
+
+suite "rar5 unpack70":
+  test "v1 forced round trips":
+    for m in [1, 3, 5]:
+      var ctx: ArchiveContext
+      let files = filesFromEntries(ctx, FromFSOptions(), [
+        FsEntry(path: "t.txt", meta: FileMeta(name: "t.txt", size: 3000, isRegular: true), data: "abc".repeat(1000)),
+      ], ".", "")
+      let dst = newOutput()
+      archiveRar(Rar(meth: m, algoVer: 1), ctx, dst, files)
+      let blob = take(dst)
+      var back = ""
+      extractRar(Rar(), ctx, openInputString(blob)) do (
+          c: ArchiveContext; info: FileInfo):
+        if info.isRegular():
+          back = readAll(info.open())
+      check back == "abc".repeat(1000)
+
+  test "v1 compinfo carries version and fraction":
+    let ci0 = rarCompInfo(3, 1 shl 20)
+    check (ci0 and 0x3F) == 0
+    let ci1 = rarCompInfo70(3, 1 shl 20)
+    check (ci1 and 0x3F) == 1
+    # Non-power-of-two needs fraction (v1).
+    let ciF = rarCompInfo70(3, (1 shl 20) + (1 shl 15))
+    check ((ciF shr 15) and 0x1F) != 0

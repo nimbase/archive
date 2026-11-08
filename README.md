@@ -171,9 +171,11 @@ for path, e in walkFs("out.tar.gz"):
 - [ ] zstd (.zst)
 - [ ] snappy/s2 (.sz/.s2, own port)
 - [ ] lzip (.lz), minlz (.mz)
-- [x] rar 5.0/7.0 read + write (Unpack50/70 LZ decode incl. solid groups
-  and DELTA/E8/E8E9/ARM filters; own m1..m5 LZ encoder with STORE
-  fallback; header encryption, multivolume and filters-on-write next)
+- [x] rar 5.0/7.0 read + write (Unpack50/70 LZ incl. solid groups and
+  DELTA/E8/E8E9/ARM decode; own m1..m5 LZ encoder with STORE fallback and
+  opt-in E8E9/DELTA/ARM filters; AES-256-CBC per-file + header encryption
+  via PBKDF2-HMAC-SHA256; multivolume read/write; Unpack70 80-symbol
+  distance path; recovery records skipped)
 - [ ] 7z read/write (needs new port; public-domain LZMA SDK reference)
 
 ### ❤ Contributions & Support

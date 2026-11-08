@@ -321,7 +321,13 @@ proc packLengths(lens: openArray[int]; outSyms: var seq[int];
 
 type
   TokenKind = enum
-    tkLit, tkRep, tkNew, tkLast
+    tkLit, tkRep, tkNew, tkLast, tkFilter
+  RarFilterSpec* = object
+    ## Encoder-side filter covering [start, start+len) of the file.
+    start*: int
+    len*: int
+    kind*: int ## 0=DELTA, 1=E8, 2=E8E9, 3=ARM
+    channels*: int ## DELTA only, 1..32
   Token = object
     case kind: TokenKind
     of tkLit:
@@ -340,19 +346,125 @@ type
       newDistExtra: uint64
     of tkLast:
       discard
+    of tkFilter:
+      filtOff: uint64
+      filtLen: uint64
+      filtKind: int
+      filtChannels: int
+
+# ---------- forward filter transforms (encoder side) ----------
+
+proc fwdDelta*(buf: string; channels: int): string =
+  ## Forward DELTA: deinterleave channels, byte-to-byte deltas packed
+  ## sequentially. Inverse of applyDelta in rarcodec.
+  if channels <= 0 or channels > 32:
+    raise newException(RarEncError, "rar: bad delta channels")
+  let n = buf.len
+  result = newString(n)
+  var sp = 0
+  for c in 0 ..< channels:
+    var prev = 0
+    var i = c
+    while i < n:
+      result[sp] = chr((prev - ord(buf[i])) and 0xFF)
+      prev = ord(buf[i])
+      inc sp
+      i += channels
+
+proc fwdE8Impl(buf: string; fileOff: uint64; e9: bool): string =
+  const FS = 0x1000000'u32
+  result = buf
+  var pos = 0
+  while pos + 5 <= result.len:
+    let b = ord(result[pos])
+    if (if e9: (b and 0xFE) == 0xE8 else: b == 0xE8):
+      let disp = uint32(ord(result[pos+1])) or
+        (uint32(ord(result[pos+2])) shl 8) or
+        (uint32(ord(result[pos+3])) shl 16) or
+        (uint32(ord(result[pos+4])) shl 24)
+      let off = uint32((fileOff + uint64(pos) + 1) and (FS - 1))
+      let a = disp + off
+      if a < FS:
+        let v = a
+        result[pos+1] = chr(int(v and 0xFF))
+        result[pos+2] = chr(int((v shr 8) and 0xFF))
+        result[pos+3] = chr(int((v shr 16) and 0xFF))
+        result[pos+4] = chr(int((v shr 24) and 0xFF))
+      else:
+        let bb = disp - FS
+        if bb > 0xFFFFFFFF'u32 - off:
+          let v = bb
+          result[pos+1] = chr(int(v and 0xFF))
+          result[pos+2] = chr(int((v shr 8) and 0xFF))
+          result[pos+3] = chr(int((v shr 16) and 0xFF))
+          result[pos+4] = chr(int((v shr 24) and 0xFF))
+      pos += 5
+    else:
+      inc pos
+
+proc fwdE8*(buf: string; fileOff: uint64): string =
+  fwdE8Impl(buf, fileOff, false)
+
+proc fwdE8E9*(buf: string; fileOff: uint64): string =
+  fwdE8Impl(buf, fileOff, true)
+
+proc fwdArm*(buf: string; fileOff: uint64): string =
+  result = buf
+  var pos = 0
+  while pos + 4 <= result.len:
+    if ord(result[pos+3]) == 0xEB:
+      let insn = uint32(ord(result[pos])) or
+        (uint32(ord(result[pos+1])) shl 8) or
+        (uint32(ord(result[pos+2])) shl 16) or
+        (uint32(ord(result[pos+3])) shl 24)
+      let off = (pos.uint64 + fileOff) shr 2
+      let low24 = (insn and 0x00FFFFFF'u32) + uint32(off and 0xFFFFFF'u64)
+      let nv = (low24 and 0x00FFFFFF'u32) or 0xEB000000'u32
+      result[pos] = chr(int(nv and 0xFF))
+      result[pos+1] = chr(int((nv shr 8) and 0xFF))
+      result[pos+2] = chr(int((nv shr 16) and 0xFF))
+      result[pos+3] = chr(int((nv shr 24) and 0xFF))
+    pos += 4
+
+proc putReadU32(w: var BitWriter; v: uint64) =
+  ## Filter-local ReadUInt32: 2 bits for byte count (1-4) + LE bytes.
+  let nbytes =
+    if v <= 0xFF: 1
+    elif v <= 0xFFFF: 2
+    elif v <= 0xFFFFFF: 3
+    else: 4
+  w.putBits(uint64(nbytes - 1), 2)
+  for i in 0 ..< nbytes:
+    w.putBits((v shr (8*i)) and 0xFF, 8)
+
+proc putBitsWide(w: var BitWriter; v: uint64; n: int) =
+  ## Emit up to 64 raw bits (for Unpack70 large distances, up to 38).
+  var left = n
+  var shift = 0
+  # Emit low chunks first? No: MSB-first, so emit high chunks first.
+  # Split into 16-bit pieces from the top.
+  while left > 0:
+    let take = min(left, 16)
+    let sh = left - take
+    w.putBits((v shr sh) and ((if take == 64: 0xFFFFFFFFFFFFFFFF'u64
+      elif take == 32: 0xFFFFFFFF'u64 else: (1'u64 shl take) - 1)), take)
+    left -= take
 
 proc tokenizeBlock(data: ptr UncheckedArray[byte]; dataLen, blk: int;
     m: var Matcher; useLazy: bool; litCost: int;
     mainLens, lenLens, distLens: seq[int];
-    reps: var array[4, int]; lastLen: var int): tuple[toks: seq[Token],
+    reps: var array[4, int]; lastLen: var int;
+    distSyms = rarDistSyms50): tuple[toks: seq[Token],
       freqMain, freqLen, freqDist: seq[int]] =
   ## Priced greedy (+optional lazy) parse over [blk, blkEnd). `reps` and
   ## `lastLen` persist across blocks of a file exactly like the decoder
   ## carries them. Costs come from the previous block's code lengths
   ## (adaptive); the first block uses static estimates from the caller.
+  ## `distSyms` selects the Unpack50 (64) vs Unpack70 (80) distance
+  ## alphabet; the slot codec itself is unchanged.
   var freqMain = newSeq[int](rarMainSyms)
   var freqLen = newSeq[int](rarLenSyms)
-  var freqDist = newSeq[int](rarDistSyms50)
+  var freqDist = newSeq[int](distSyms)
   var toks: seq[Token] = @[]
   let blkEnd = min(dataLen, blk + rarEncBlock)
   var pos = blk
@@ -429,7 +541,7 @@ proc tokenizeBlock(data: ptr UncheckedArray[byte]; dataLen, blk: int;
           let (dslot, db, dex) = encodeDistSlot(mdist.uint64)
           let cost = mainLen(262 + slot) + eb + distLen(dslot) + db
           if cost < litCost * int(useLen) and 262 + slot < rarMainSyms and
-              dslot < rarDistSyms50:
+              dslot < distSyms:
             toks.add(Token(kind: tkNew, newSlot: slot, newExtraBits: eb,
               newExtra: ex, newDistSlot: dslot, newDistBits: db,
               newDistExtra: dex))
@@ -480,7 +592,16 @@ proc emitBlock(data: ptr UncheckedArray[byte]; toks: seq[Token];
       if t.newDistBits > 0:
         # Align table is all-4s so the decoder stays on the raw path;
         # emitting the low nibble raw is bit-identical to align codes.
-        w.putBits(t.newDistExtra, t.newDistBits)
+        # Wide for Unpack70 (up to 38 bits).
+        w.putBitsWide(t.newDistExtra, t.newDistBits)
+    of tkFilter:
+      let c = mainC[256]
+      w.putBits(c.code.uint64, c.len)
+      w.putReadU32(t.filtOff)
+      w.putReadU32(t.filtLen)
+      w.putBits(t.filtKind.uint64, 3)
+      if t.filtKind == 0:
+        w.putBits(uint64(t.filtChannels - 1), 5)
 
 proc encodeLevelTable(levelLens: array[20, int]; w: var BitWriter) =
   ## Raw 4-bit lengths with the 15-escape for zero runs. Note 15,0 is
@@ -515,16 +636,37 @@ proc encodeLevelTable(levelLens: array[20, int]; w: var BitWriter) =
 
 # ---------- entry API ----------
 
-proc encodeRarMember*(data: openArray[byte]; meth: int;
-    dictSize = rarEncDict): string =
-  ## Compress one file's bytes into an Unpack50 stream (methods 1..5:
-  ## increasing match-finder effort; filter-free, fresh tables per
-  ## 64KB block, non-solid). Raises on empty input (no valid empty
-  ## compressed stream exists; the writer stores empties).
+proc encodeRarMemberFiltered*(data: openArray[byte]; meth: int;
+    dictSize = rarEncDict; filters: openArray[RarFilterSpec] = [];
+    algoVer = 0): string =
+  ## Compress one file's bytes into an Unpack50 (algoVer 0) or Unpack70
+  ## (algoVer 1, 80-symbol distance alphabet) stream. `filters` are
+  ## file-relative regions already forward-transformed in `data`; their
+  ## triggers are emitted at the start of the first block (offsets
+  ## relative to position 0). Fresh tables per 64KB block, non-solid.
+  ## Raises on empty input (no valid empty compressed stream exists;
+  ## the writer stores empties).
   if meth notin 1 .. 5:
     raise newException(RarEncError, "rar: unknown compression method")
+  if algoVer notin [0, 1]:
+    raise newException(RarEncError, "rar: unknown algorithm version")
   if data.len == 0:
     raise newException(RarEncError, "rar: cannot compress empty input")
+  # Validate filters (must not overlap, within file, 4MB max each).
+  var lastEnd = 0
+  for f in filters:
+    if f.kind notin 0 .. 3:
+      raise newException(RarEncError, "rar: bad filter type")
+    if f.len <= 0 or f.len > (1 shl 22):
+      raise newException(RarEncError, "rar: bad filter length")
+    if f.start < 0 or f.start + f.len > data.len:
+      raise newException(RarEncError, "rar: filter range invalid")
+    if f.start < lastEnd:
+      raise newException(RarEncError, "rar: overlapping filters")
+    lastEnd = f.start + f.len
+    if f.kind == 0 and (f.channels < 1 or f.channels > 32):
+      raise newException(RarEncError, "rar: bad delta channels")
+  let distSyms = if algoVer == 1: rarDistSyms70 else: rarDistSyms50
   let maxChain =
     case meth
     of 1: 32
@@ -538,7 +680,7 @@ proc encodeRarMember*(data: openArray[byte]; meth: int;
   # adaptive costs: previous block's code lengths (static for block 0)
   var prevMain = newSeq[int](rarMainSyms)
   var prevLen = newSeq[int](rarLenSyms)
-  var prevDist = newSeq[int](rarDistSyms50)
+  var prevDist = newSeq[int](distSyms)
   # match state persists across blocks exactly like the decoder's
   var reps = [0, 0, 0, 0]
   var lastLen = 0
@@ -556,8 +698,17 @@ proc encodeRarMember*(data: openArray[byte]; meth: int;
       while r < pos:
         m.insertPos(dp, data.len, r)
         inc r
-    let (toks, fMain, fLen, fDist) = tokenizeBlock(dp, data.len, pos, m,
-      useLazy, 9, prevMain, prevLen, prevDist, reps, lastLen)
+    var (toks, fMain, fLen, fDist) = tokenizeBlock(dp, data.len, pos, m,
+      useLazy, 9, prevMain, prevLen, prevDist, reps, lastLen, distSyms)
+    # Prepend filter triggers in the first block (curPos 0, so off=start).
+    if pos == 0 and filters.len > 0:
+      var filtToks: seq[Token] = @[]
+      for f in filters:
+        filtToks.add(Token(kind: tkFilter, filtOff: f.start.uint64,
+          filtLen: f.len.uint64, filtKind: f.kind,
+          filtChannels: if f.kind == 0: f.channels else: 1))
+        inc fMain[256]
+      toks = filtToks & toks
     let mainLens = huffmanLengths(fMain)
     let lenLens = huffmanLengths(fLen)
     let distLens = huffmanLengths(fDist)
@@ -627,6 +778,11 @@ proc encodeRarMember*(data: openArray[byte]; meth: int;
   if outp.len > 0:
     copyMem(addr result[0], unsafeAddr outp[0], outp.len)
 
+proc encodeRarMember*(data: openArray[byte]; meth: int;
+    dictSize = rarEncDict): string =
+  ## Back-compat: Unpack50, no filters.
+  encodeRarMemberFiltered(data, meth, dictSize, [], 0)
+
 proc rarCompInfo*(meth: int; dictSize = rarEncDict): uint64 =
   ## Compression Information vint for encoder-chosen settings (v0,
   ## non-solid). Dict decomposed per §11.11.10 (truncate, never round).
@@ -644,4 +800,22 @@ proc rarCompInfo*(meth: int; dictSize = rarEncDict): uint64 =
     if power <= 15: 0
     else: min(31, (dictSize - base) div (base div 32))
   result = (meth.uint64 shl 7) or (power.uint64 shl 10) or
+    (frac.uint64 shl 15)
+
+proc rarCompInfo70*(meth: int; dictSize = rarEncDict): uint64 =
+  ## Unpack70 CompInfo (version 1, 80-symbol distance table). Same
+  ## decomposition as v0 but with the version bit set; callers must pass
+  ## a dictSize that actually needs v1 (non-power-of-2 or >4GiB) or force
+  ## v1 for testing the 80-symbol path with a small dictionary.
+  if meth notin 0 .. 5:
+    raise newException(RarEncError, "rar: unknown compression method")
+  if meth == 0:
+    return 0
+  const base0 = 128 * 1024
+  var power = 0
+  while power < 23 and base0 shl (power + 1) <= dictSize:
+    inc power
+  let base = base0 shl power
+  let frac = min(31, (dictSize - base) div max(1, base div 32))
+  result = 1'u64 or (meth.uint64 shl 7) or (power.uint64 shl 10) or
     (frac.uint64 shl 15)
