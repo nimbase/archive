@@ -12,6 +12,7 @@ from std/os import dirExists, fileExists, symlinkExists, walkDir,
 import ./io
 import ./types
 import ./registry
+import ./crypt
 
 type
   FsKind* = enum
@@ -339,6 +340,9 @@ proc fileSystem*(ctx: ArchiveContext; filename: string;
     let res =
       try: identify(ctx, lastPathPart(filename), probe)
       except NoMatchError:
+        if isEncryptedFile(filename):
+          raise newException(ArchiveError,
+            "encrypted archive, use decryptExtract/decryptFile: " & filename)
         return Fs(kind: fkFile, filePath: filename)
       except CatchableError as e:
         raise e

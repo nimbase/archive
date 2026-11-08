@@ -9,8 +9,10 @@
 ## no rewind buffering is needed at all (the Go rewindReader disappears).
 
 import std/[options, strutils]
+import nimcypher/utils as ncUtils
 import ./io
 import ./types
+import ./crypt
 import ./formats/tar
 import ./formats/zip
 import ./formats/gz
@@ -34,6 +36,14 @@ type
     ## no constructor validation is needed.
     archival*: ArchiveFormat
     compression*: CompressionFormat
+
+  EncryptedArchive* = object
+    ## Keyless pipeline descriptor: archive, optionally compress, then
+    ## encrypt (reverse on read). Keys and passwords flow per call like
+    ## `ctx` — never stored — so there is no secret material to wipe
+    ## when the descriptor is copied or dropped.
+    archival*: ArchiveFormat
+    compression*: Option[CompressionFormat]
 
 proc extension*(c: CompressedArchive): string =
   ## Multi-extension name, e.g. ".tar.gz".
@@ -153,6 +163,64 @@ proc extractFrom*(c: CompressedArchive; ctx: ArchiveContext;
   let tmp = newOutput()
   decompressInto(c.compression, inp, tmp)
   extractFormat(c.archival, ctx, toInput(tmp), handle)
+
+proc archiveTo*(e: EncryptedArchive; ctx: ArchiveContext; dst: Output;
+    files: seq[FileInfo]; key: ncUtils.Key32; level = 0;
+    chunkSize = encChunkDefault) =
+  ## Archive, optionally compress, then encrypt into `dst`.
+  let tmp = newOutput()
+  if e.compression.isSome:
+    CompressedArchive(archival: e.archival,
+      compression: e.compression.get).archiveTo(ctx, tmp, files, level)
+  else:
+    archiveFormat(e.archival, ctx, tmp, files)
+  let ob = outputBytes(tmp)
+  if ob.len == 0:
+    encryptInto(newSeq[byte](0), key, dst, chunkSize)
+  else:
+    encryptInto(toOpenArray(cast[ptr UncheckedArray[byte]](ob.p), 0,
+      ob.len - 1), key, dst, chunkSize)
+
+proc archiveTo*(e: EncryptedArchive; ctx: ArchiveContext; dst: Output;
+    files: seq[FileInfo]; password: string; level = 0;
+    chunkSize = encChunkDefault) =
+  ## Password variant: fresh random salt per message, Argon2id KDF.
+  let tmp = newOutput()
+  if e.compression.isSome:
+    CompressedArchive(archival: e.archival,
+      compression: e.compression.get).archiveTo(ctx, tmp, files, level)
+  else:
+    archiveFormat(e.archival, ctx, tmp, files)
+  let ob = outputBytes(tmp)
+  if ob.len == 0:
+    encryptInto(newSeq[byte](0), password, dst, chunkSize)
+  else:
+    encryptInto(toOpenArray(cast[ptr UncheckedArray[byte]](ob.p), 0,
+      ob.len - 1), password, dst, chunkSize)
+
+proc extractFrom*(e: EncryptedArchive; ctx: ArchiveContext; inp: Input;
+    handle: FileHandler; key: ncUtils.Key32) =
+  ## Decrypt, optionally decompress, then extract.
+  let tmp = newOutput()
+  decryptInto(inp, key, tmp)
+  let inner = toInput(tmp)
+  if e.compression.isSome:
+    CompressedArchive(archival: e.archival,
+      compression: e.compression.get).extractFrom(ctx, inner, handle)
+  else:
+    extractFormat(e.archival, ctx, inner, handle)
+
+proc extractFrom*(e: EncryptedArchive; ctx: ArchiveContext; inp: Input;
+    handle: FileHandler; password: string) =
+  ## Password variant: salt comes from the header.
+  let tmp = newOutput()
+  decryptInto(inp, password, tmp)
+  let inner = toInput(tmp)
+  if e.compression.isSome:
+    CompressedArchive(archival: e.archival,
+      compression: e.compression.get).extractFrom(ctx, inner, handle)
+  else:
+    extractFormat(e.archival, ctx, inner, handle)
 
 proc matchOne(fmt: CompressionFormat; filename: string; inp: Input;
     inner: Input): MatchResult =

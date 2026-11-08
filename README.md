@@ -27,6 +27,7 @@
 - Split `CompressionFormat`/`ArchiveFormat` string enums plus a `MediaType` enum: misuse fails at compile time, no runtime registry
 - High-level one-shots: `compress`/`decompress` (strings, files, buffers), `archiveDir`/`archiveData`, auto-identifying `extractFile`/`extractAll`/`listEntries`
 - Own DEFLATE/gzip/zip/tar/crc32, no C bindings, brotli via [pkg/nbrotli](https://github.com/nimbase/nbrotli)
+- Encrypted archives via [pkg/nimcypher](https://github.com/nimbase/nimcypher): XChaCha20-Poly1305 envelope with Argon2id passwords or raw keys, streaming with fixed reused buffers
 - Zero-copy I/O core powered by `std/memfiles`: memory-mapped inputs, caller-reused output buffers, borrowed spans — memory-efficient with bounded working sets, no `streams` anywhere
 - Format detection by filename and magic bytes without consuming input, plus tar.gz-style two-layer composition
 - Virtual filesystem with uniform reads over dirs, files, archives and compressed archives
@@ -116,6 +117,15 @@ recreates symlinks, rejects entries escaping the destination):
 extractFile("out.tar.gz", "restored")
 ```
 
+Encrypt a file with a password (XChaCha20-Poly1305 chunked AEAD via
+`pkg/nimcypher`; raw `Key32` keys work anywhere a password does):
+
+```nim
+import archive/crypt
+encryptFile("backup.tar.gz", "backup.tar.gz.enc", "correct horse")
+decryptFile("backup.tar.gz.enc", "backup.tar.gz", "correct horse")
+```
+
 Same work with reusable buffers instead of fresh strings:
 
 ```nim
@@ -151,13 +161,11 @@ for path, e in walkFs("out.tar.gz"):
 - [x] `Identify` by name and magic bytes, `CompressedArchive` composition (tar.gz, tar.bz2, ...)
 - [x] Virtual filesystem (DirFS, ArchiveFS, DeepFS, path helpers)
 - [x] SIMD acceleration behind the `nimsimd` feature with silicon self-test
-- [ ] Encrypted archives via `pkg/nimcypher` (XChaCha20-Poly1305 AEAD,
-  envelope around the whole blob, format-agnostic like `CompressedArchive`):
-  `EncryptedArchive` composition (archive → compress → encrypt on write,
-  decrypt → decompress → extract on read), password keys via Argon2
-  (`deriveKeyFromPassword` + stored salt) plus a raw-key API, streaming
-  AEAD (`aeadStreamWrite`/`aeadStreamRead`) so file-to-file paths stay
-  bounded-memory, own framing magic + salt + nonce header
+- [x] Encrypted archives via `pkg/nimcypher` (XChaCha20-Poly1305 chunked
+  AEAD, envelope around the whole blob): `EncryptedArchive` composition
+  (archive → compress → encrypt on write, reverse on read), password keys
+  via Argon2id plus raw-key API, streaming file paths with fixed reused
+  buffers, own framing magic + salt + nonce header
 - [ ] xz (.xz, LZMA2 framing + range coder)
 - [ ] zstd (.zst)
 - [ ] snappy/s2 (.sz/.s2, own port)

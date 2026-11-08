@@ -10,10 +10,12 @@
 import std/[options, strutils]
 from std/os import createDir, joinPath, parentDir, isAbsolute, createSymlink,
   DirSep, removeFile
+import nimcypher/utils as ncUtils
 import ./archive/types
 import ./archive/io
 import ./archive/registry
 import ./archive/files
+import ./archive/crypt
 import ./archive/vfs
 import ./archive/zipfile
 
@@ -130,11 +132,112 @@ proc identifyPath*(path: string): IdentifyResult =
   finally:
     close(inp)
 
+# ---------- encrypted archives ----------
+
+proc encryptArchive*(archival: ArchiveFormat; files: seq[FileInfo];
+    key: ncUtils.Key32; ctx = ArchiveContext();
+    compression = none(CompressionFormat); level = 0;
+    chunkSize = encChunkDefault): string =
+  ## Archive a file list, optionally compress, then encrypt to a blob.
+  ## `key` flows per call and is never stored; the stream state is wiped
+  ## after use. Chunked AEAD with fixed reused buffers.
+  let dst = newOutput()
+  EncryptedArchive(archival: archival,
+    compression: compression).archiveTo(ctx, dst, files, key, level,
+    chunkSize)
+  take(dst)
+
+proc encryptArchive*(archival: ArchiveFormat; files: seq[FileInfo];
+    password: string; ctx = ArchiveContext();
+    compression = none(CompressionFormat); level = 0;
+    chunkSize = encChunkDefault): string =
+  ## Password variant: fresh random salt per message, Argon2id KDF.
+  let dst = newOutput()
+  EncryptedArchive(archival: archival,
+    compression: compression).archiveTo(ctx, dst, files, password, level,
+    chunkSize)
+  take(dst)
+
+proc decryptExtract*(inp: Input; key: ncUtils.Key32; ctx: ArchiveContext;
+    handle: FileHandler) =
+  ## Decrypt a blob, then dispatch the inner archive to `handle`.
+  ## Raises CryptoError on bad magic, truncation, or MAC failure.
+  let tmp = newOutput()
+  decryptInto(inp, key, tmp)
+  let inner = toInput(tmp)
+  let res = identify(ctx, "", inner)
+  # identify may advance the cursor while probing; rewind like
+  # extractFile does with its second open.
+  seek(inner, 0)
+  extractIdentified(res, ctx, inner, handle)
+
+proc decryptExtract*(inp: Input; password: string; ctx: ArchiveContext;
+    handle: FileHandler) =
+  ## Password variant: salt comes from the header.
+  let tmp = newOutput()
+  decryptInto(inp, password, tmp)
+  let inner = toInput(tmp)
+  let res = identify(ctx, "", inner)
+  seek(inner, 0)
+  extractIdentified(res, ctx, inner, handle)
+
+proc decryptExtract*(path: string; key: ncUtils.Key32; ctx: ArchiveContext;
+    handle: FileHandler) =
+  ## Decrypt an encrypted archive file, then dispatch to `handle`.
+  ## The `.enc` suffix (if any) is stripped for the identify hint;
+  ## content magic decides regardless.
+  let hint =
+    if path.endsWith(".enc"): path[0 ..< path.len - 4]
+    else: path
+  let inp = openInputFile(path)
+  try:
+    let tmp = newOutput()
+    decryptInto(inp, key, tmp)
+    let inner = toInput(tmp)
+    let res = identify(ctx, hint, inner)
+    seek(inner, 0)
+    extractIdentified(res, ctx, inner, handle)
+  finally:
+    close(inp)
+
+proc decryptExtract*(path: string; password: string; ctx: ArchiveContext;
+    handle: FileHandler) =
+  ## Password variant of decrypting an encrypted archive file.
+  let hint =
+    if path.endsWith(".enc"): path[0 ..< path.len - 4]
+    else: path
+  let inp = openInputFile(path)
+  try:
+    let tmp = newOutput()
+    decryptInto(inp, password, tmp)
+    let inner = toInput(tmp)
+    let res = identify(ctx, hint, inner)
+    seek(inner, 0)
+    extractIdentified(res, ctx, inner, handle)
+  finally:
+    close(inp)
+
+proc decryptExtract*(path: string; key: ncUtils.Key32;
+    handle: FileHandler) =
+  ## Same, with an internal context.
+  var ctx: ArchiveContext
+  decryptExtract(path, key, ctx, handle)
+
+proc decryptExtract*(path: string; password: string;
+    handle: FileHandler) =
+  ## Same, with an internal context.
+  var ctx: ArchiveContext
+  decryptExtract(path, password, ctx, handle)
+
+
 proc extractFile*(path: string; handle: FileHandler;
     ctx: ArchiveContext) =
   ## Extract an archive by path with auto-identify. Opens the file twice
   ## (once to identify, once to extract) because identify may advance
   ## the cursor while probing the compression layer.
+  if isEncryptedFile(path):
+    raise newException(ArchiveError,
+      "encrypted archive, use decryptExtract/decryptFile: " & path)
   let res = identifyPath(path)
   let inp = openInputFile(path)
   try:
