@@ -19,10 +19,15 @@ import ../io
 import ../types
 import ../crc32
 import ./rarcodec
+import ./rarenc
 
 type Rar* = object
-  ## RAR5/7.0 archive. No settings in v1 (STORE-only writer).
+  ## RAR5/7.0 archive. `method` selects the file codec: 0 = STORE
+  ## (default, also used for empty files), 1..5 = Unpack50 LZ with
+  ## increasing match-finder effort. Writer always emits non-solid
+  ## archives with a 1 MiB dictionary.
   continueOnError*: bool
+  meth*: int
 
 proc extension*(r: Rar): ArchiveFormat = afRar
 proc mediaType*(r: Rar): MediaType = mtRar
@@ -205,6 +210,9 @@ proc archiveRar*(r: Rar; ctx: ArchiveContext; dst: Output;
       emitBlock(dst, 2, 0x0001'u64 or 0x0002'u64, take(tsf), extra,
         newSeq[byte](0), true, 0)
     else:
+      if r.meth notin 0 .. 5:
+        raise newException(RarError,
+          "rar: unknown compression method " & $r.meth)
       var fr: Input
       {.gcsafe.}:
         fr = f.open()
@@ -221,17 +229,39 @@ proc archiveRar*(r: Rar; ctx: ArchiveContext; dst: Output;
         else: crc32Update(0xFFFFFFFF'u32, content.p, content.len) xor
           0xFFFFFFFF'u32
       putU32le(tsf, crc)
-      putVint(tsf, 0'u64) # STORE
-      putVint(tsf, 1'u64)
-      putVint(tsf, arcName.len.uint64)
-      writeStr(tsf, arcName)
-      if content.len == 0:
-        emitBlock(dst, 2, 0x0002'u64, take(tsf), "", [], true, 0)
+      if r.meth == 0 or content.len == 0:
+        # STORE (empties always: no valid empty compressed stream).
+        putVint(tsf, 0'u64)
+        putVint(tsf, 1'u64)
+        putVint(tsf, arcName.len.uint64)
+        writeStr(tsf, arcName)
+        if content.len == 0:
+          emitBlock(dst, 2, 0x0002'u64, take(tsf), "", [], true, 0)
+        else:
+          var tmp = newString(content.len)
+          copyMem(addr tmp[0], content.p, content.len)
+          emitBlock(dst, 2, 0x0002'u64, take(tsf), "", tmp.toOpenArrayByte(0,
+            tmp.len - 1), true, content.len.uint64)
       else:
-        var tmp = newString(content.len)
-        copyMem(addr tmp[0], content.p, content.len)
-        emitBlock(dst, 2, 0x0002'u64, take(tsf), "", tmp.toOpenArrayByte(0,
-          tmp.len - 1), true, content.len.uint64)
+        # Compressed: fall back to STORE when packing gains nothing.
+        var raw = newString(content.len)
+        copyMem(addr raw[0], content.p, content.len)
+        let packed = encodeRarMember(
+          raw.toOpenArrayByte(0, raw.len - 1), r.meth)
+        if packed.len >= raw.len:
+          putVint(tsf, 0'u64)
+          putVint(tsf, 1'u64)
+          putVint(tsf, arcName.len.uint64)
+          writeStr(tsf, arcName)
+          emitBlock(dst, 2, 0x0002'u64, take(tsf), "", raw.toOpenArrayByte(0,
+            raw.len - 1), true, raw.len.uint64)
+        else:
+          putVint(tsf, rarCompInfo(r.meth))
+          putVint(tsf, 1'u64)
+          putVint(tsf, arcName.len.uint64)
+          writeStr(tsf, arcName)
+          emitBlock(dst, 2, 0x0002'u64, take(tsf), "", packed.toOpenArrayByte(0,
+            packed.len - 1), true, packed.len.uint64)
   # end header: type 5, flags 0, end flags 0
   let te = newOutput()
   putVint(te, 0'u64)

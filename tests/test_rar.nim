@@ -6,6 +6,7 @@ import archive/files
 import archive/crc32
 import archive/formats/rar
 import archive/formats/rarcodec
+import archive/formats/rarenc
 import archive/vfs
 import archive
 
@@ -321,3 +322,100 @@ suite "rar5 filters":
     var e0 = ""
     applyDelta(e0, 0, 0, 4)
     check e0 == ""
+
+suite "rar5 encode":
+  # Round-trip the clean-room encoder through the decoder at every
+  # method. Interop with third-party readers (bsdtar/libarchive) is
+  # verified manually; these hermetic vectors pin the behavior here.
+
+  proc encRoundTrip(data: string; meth: int): string =
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "f.bin", meta: FileMeta(name: "f.bin", size: data.len,
+        isRegular: true), data: data),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: meth), ctx, dst, files)
+    let blob = take(dst)
+    var back = ""
+    extractRar(Rar(), ctx, openInputString(blob)) do (
+        c: ArchiveContext; info: FileInfo):
+      if info.isRegular():
+        back = readAll(info.open())
+    check back == data
+    blob
+
+  test "methods 1..5 round trip":
+    for m in 1 .. 5:
+      discard encRoundTrip("", m) # empty always stores, never encodes
+      discard encRoundTrip("x", m)
+      discard encRoundTrip("hello, world! ".repeat(3), m)
+      discard encRoundTrip("abc".repeat(1000), m)
+      discard encRoundTrip(newString(70000), m)
+
+  test "random and text payloads round trip":
+    var rnd = newString(4096)
+    var s = 0x12345
+    for i in 0 ..< rnd.len:
+      s = (s * 1103515245 + 12345) and 0x7FFFFFFF
+      rnd[i] = chr(s mod 256)
+    for m in [1, 3, 5]:
+      discard encRoundTrip(rnd, m)
+      var txt = newString(70000)
+      for i in 0 ..< txt.len:
+        txt[i] = chr((i * 31 + 7) mod 6)
+      discard encRoundTrip(txt, m)
+      discard encRoundTrip("lorem ipsum dolor sit amet ".repeat(8000), m)
+
+  test "multi-block streams round trip":
+    # 1 MiB of zeros spans 16 blocks; solid groups stay non-solid here.
+    for m in [1, 5]:
+      let blob = encRoundTrip(newString(1 shl 20), m)
+      check blob.len < 2000
+
+  test "incompressible input falls back to store":
+    var rnd = newString(4096)
+    var s = 99
+    for i in 0 ..< rnd.len:
+      s = (s * 1103515245 + 12345) and 0x7FFFFFFF
+      rnd[i] = chr(s mod 256)
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "r.bin", meta: FileMeta(name: "r.bin", size: rnd.len,
+        isRegular: true), data: rnd),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 3), ctx, dst, files)
+    let blob = take(dst)
+    # random data cannot compress: STORE fallback keeps the blob at
+    # input size plus header overhead (no table bloat).
+    check blob.len < rnd.len + 200
+    var back = ""
+    extractRar(Rar(), ctx, openInputString(blob)) do (
+        c: ArchiveContext; info: FileInfo):
+      if info.isRegular():
+        back = readAll(info.open())
+    check back == rnd
+
+  test "bad method rejected":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.bin", meta: FileMeta(name: "a.bin", size: 1,
+        isRegular: true), data: "x"),
+    ], ".", "")
+    expect(ArchiveError):
+      archiveRar(Rar(meth: 7), ctx, newOutput(), files)
+
+  test "huffman builder stays valid":
+    # Kraft-checked on adversarial frequency shapes incl. singletons.
+    for n in [1, 2, 3, 20, 64, 306]:
+      var freqs = newSeq[int](n)
+      for i in 0 ..< n:
+        freqs[i] = (i * 37 + 11) mod 5
+      let lens = huffmanLengths(freqs)
+      var sum = 0
+      for L in lens:
+        check L >= 0 and L <= 15
+        if L != 0:
+          sum += 1 shl (15 - L)
+      check sum <= 1 shl 15
