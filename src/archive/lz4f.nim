@@ -9,7 +9,6 @@
 ## reuses an Output.
 
 import ./io
-import ./simd
 import std/strutils
 from std/os import removeFile
 
@@ -91,6 +90,31 @@ proc lz4Hash32(p: pointer; pos: int): int {.inline.} =
     (b[pos + 2].uint32 shl 16) or (b[pos + 3].uint32 shl 24)
   ((v * 2654435761'u32) shr (32 - lz4HashBits)).int
 
+proc copyMatch(dst, src: pointer; len, dist: int) {.inline.} =
+  ## Overlap-safe LZ4 match copy. Scalar; system copyMem already beats
+  ## naive AVX2 bulk loops here.
+  if len <= 0 or dist <= 0:
+    return
+  if dist >= len:
+    copyMem(dst, src, len)
+    return
+  copyMem(dst, src, dist)
+  var done = dist
+  while done < len:
+    let n = min(done, len - done)
+    copyMem(cast[pointer](cast[int](dst) + done), dst, n)
+    done += n
+
+proc matchLen(a, b: pointer; maxLen: int): int {.inline.} =
+  ## Longest common prefix up to maxLen. Scalar byte loop: candidates
+  ## usually mismatch early, so vector compares buy nothing.
+  var ln = 0
+  while ln < maxLen and
+      cast[ptr UncheckedArray[byte]](a)[ln] ==
+      cast[ptr UncheckedArray[byte]](b)[ln]:
+    inc ln
+  ln
+
 proc lz4DecompressBlock*(blk: Span; dst: Output) =
   ## Decompress one raw LZ4 block into `dst`. Raises Lz4Error.
   ## Output may exceed the block size; offsets reach back into all
@@ -140,7 +164,7 @@ proc lz4DecompressBlock*(blk: Span; dst: Output) =
     discard reserve(dst, mLen)
     advance(dst, mLen)
     let ob = outputBytes(dst) # span AFTER growth: stable during copy
-    copyMatchSimd(cast[pointer](cast[int](ob.p) + dpos),
+    copyMatch(cast[pointer](cast[int](ob.p) + dpos),
       cast[pointer](cast[int](ob.p) + dpos - offset), mLen, offset)
 
 proc lz4CompressBlock*(src: pointer; len: int; dst: Output) =
@@ -176,7 +200,7 @@ proc lz4CompressBlock*(src: pointer; len: int; dst: Output) =
         dec c
       let litLen = p - anchor
       let maxTotal = (len - lastLits) - p # never run into the last 5 bytes
-      let mLen = min(lz4MinMatch + matchLenSimd(
+      let mLen = min(lz4MinMatch + matchLen(
         cast[pointer](cast[int](src) + c + 4),
         cast[pointer](cast[int](src) + p + 4), len - (p + 4)), maxTotal)
       let tok = byte((min(litLen, 15) shl 4) or min(mLen - lz4MinMatch, 15))
@@ -787,7 +811,7 @@ proc lz4DecompressFile*(srcPath, dstPath: string) =
               discard reserve(scratch, piece)
               advance(scratch, piece)
               let ob = outputBytes(scratch)
-              copyMatchSimd(
+              copyMatch(
                 cast[pointer](cast[int](ob.p) + dpos + (mLen - mLeft)),
                 cast[pointer](cast[int](ob.p) + dpos + (mLen - mLeft) - offset),
                 piece, offset)

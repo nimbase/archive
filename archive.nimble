@@ -12,6 +12,3 @@ srcDir        = "src"
 requires "nim >= 2.2.10"
 requires "nbrotli >= 0.1.0"
 requires "nimcypher >= 0.3.0"
-
-feature "nimsimd":
-  requires "nimsimd >= 1.3.2"

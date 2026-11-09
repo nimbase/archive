@@ -1,6 +1,6 @@
 <p align="center">
   Unified Nim library for creating/extracting archives and compress/decompress files<br>
-  SIMD-accelerated, zero-copy I/O core, walk virtual file system<br>
+  Zero-copy I/O core, walk virtual file system, SIMD-accelerated brotli compression<br>
   Supporting <code>.tar</code>, <code>.zip</code>, <code>.rar</code> (5.0/7.0), <code>.gz</code>, <code>.zz</code>, <code>.lz4</code>, <code>.bz2</code>, <code>.br</code>
 </p>
 
@@ -27,13 +27,12 @@
   gzip, zlib (.zz), lz4, bzip2 and brotli with one uniform API
 - Split `CompressionFormat`/`ArchiveFormat` string enums plus a `MediaType` enum: misuse fails at compile time, no runtime registry
 - High-level one-shots: `compress`/`decompress` (strings, files, buffers), `archiveDir`/`archiveData`, auto-identifying `extractFile`/`extractAll`/`listEntries`
-- Own DEFLATE/gzip/zip/tar/crc32, no C bindings, brotli via [pkg/nbrotli](https://github.com/nimbase/nbrotli)
+- Own DEFLATE/gzip/zip/tar/crc32, no C bindings, brotli via [pkg/nbrotli](https://github.com/nimbase/nbrotli) (SIMD-accelerated internally)
 - Encrypted archives via [pkg/nimcypher](https://github.com/nimbase/nimcypher): XChaCha20-Poly1305 envelope with Argon2id passwords or raw keys, streaming with fixed reused buffers
 - Zero-copy I/O core powered by `std/memfiles`: memory-mapped inputs, caller-reused output buffers, borrowed spans — memory-efficient with bounded working sets, no `streams` anywhere
 - Format detection by filename and magic bytes without consuming input, plus tar.gz-style two-layer composition
 - Virtual filesystem with uniform reads over dirs, files, archives and compressed archives
 - Per-entry progress callbacks plus a cancellable context, threaded through every operation
-- Optional `nimsimd` feature (AVX2 copies, match finding, SSE4.2 CRC32) behind a runtime silicon self-test
 - Per-block CRCs and stream checksums verified on every decode; corrupt inputs raise descriptive errors
 - Interop-tested both directions against system `gzip`/`unzip`, `bzip2`, `lz4` and CPython `zlib`/`bz2`
 
@@ -158,10 +157,9 @@ for path, e in walkFs("out.tar.gz"):
 - [x] tar (ustar/pax, symlinks, hardlinks, insert/append)
 - [x] zip (deflate/store, insert/replace)
 - [x] gzip (.gz), zlib (.zz), lz4 (.lz4), bzip2 (.bz2)
-- [x] brotli (.br) via `nbrotli` (decode full, store-only encode)
+- [x] brotli (.br) via `nbrotli` (decode full, store-only encode, SIMD-accelerated internally)
 - [x] `Identify` by name and magic bytes, `CompressedArchive` composition (tar.gz, tar.bz2, ...)
 - [x] Virtual filesystem (DirFS, ArchiveFS, DeepFS, path helpers)
-- [x] SIMD acceleration behind the `nimsimd` feature with silicon self-test
 - [x] Encrypted archives via `pkg/nimcypher` (XChaCha20-Poly1305 chunked
   AEAD, envelope around the whole blob): `EncryptedArchive` composition
   (archive → compress → encrypt on write, reverse on read), password keys

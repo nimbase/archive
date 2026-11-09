@@ -4,11 +4,10 @@
 ## Huffman. Deflate emits stored-empty plus fixed-Huffman blocks with a
 ## hash-chain LZ77 matcher. All entry points work on raw pointers and
 ## reusable `Output` buffers: no stream objects, no per-call output
-## allocation when the caller reuses an Output. Match copies and match
-## search use archive/simd kernels when the `nimsimd` feature is on.
+## allocation when the caller reuses an Output. Archive codecs stay
+## scalar pure Nim (brotli via nbrotli carries its own internal SIMD).
 
 import ./io
-import ./simd
 
 type FlateError* = object of CatchableError
 
@@ -124,6 +123,32 @@ proc putSpan(dst: Output; s: Span) {.inline.} =
   if s.len > 0:
     writeBytes(dst, s.p, s.len)
 
+proc copyMatch(dst, src: pointer; len, dist: int) {.inline.} =
+  ## Overlap-safe LZ77 match copy (dist < len repeats the pattern).
+  ## Scalar; system copyMem already beats naive AVX2 bulk loops here.
+  if len <= 0 or dist <= 0:
+    return
+  if dist >= len:
+    copyMem(dst, src, len)
+    return
+  copyMem(dst, src, dist)
+  var done = dist
+  while done < len:
+    let n = min(done, len - done)
+    copyMem(cast[pointer](cast[int](dst) + done), dst, n)
+    done += n
+
+proc matchLen(a, b: pointer; maxLen: int): int {.inline.} =
+  ## Length of longest common prefix up to maxLen. Scalar byte loop:
+  ## match candidates usually mismatch in the first bytes, so wide
+  ## vector compares buy nothing on realistic inputs.
+  var ln = 0
+  while ln < maxLen and
+      cast[ptr UncheckedArray[byte]](a)[ln] ==
+      cast[ptr UncheckedArray[byte]](b)[ln]:
+    inc ln
+  ln
+
 proc putMatch(dst: Output; dist, length: int) {.inline.} =
   ## Overlap-safe match copy from already-written bytes.
   let dpos = dst.len
@@ -133,7 +158,7 @@ proc putMatch(dst: Output; dist, length: int) {.inline.} =
   discard reserve(dst, length)
   advance(dst, length)
   let ob = outputBytes(dst) # span AFTER growth: stable during copy
-  copyMatchSimd(cast[pointer](cast[int](ob.p) + dpos),
+  copyMatch(cast[pointer](cast[int](ob.p) + dpos),
     cast[pointer](cast[int](ob.p) + src), length, dist)
 
 # ---------- block decoding ----------
@@ -1074,7 +1099,7 @@ proc deflateInto*(inp: Input; output: Output) =
       var chain = 0
       let maxLen = min(maxMatchLen, total - pos)
       while cand >= 0 and pos - cand <= windowSize and chain < maxChainLen:
-        let ln = matchLenSimd(
+        let ln = matchLen(
           cast[pointer](cast[int](bp) + cand),
           cast[pointer](cast[int](bp) + pos), maxLen)
         if ln > bestLen:
