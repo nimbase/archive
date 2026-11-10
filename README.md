@@ -177,6 +177,10 @@ for path, e in walkFs("out.tar.gz"):
   80-symbol distance path; recovery records skipped)
 - [ ] 7z read/write (needs new port; public-domain LZMA SDK reference)
 
+## Credits
+
+Thanks to [Gareth Davidson (bitplane)](https://github.com/bitplane) for the excellent [rar-research](https://github.com/bitplane/rar-research/tree/master/doc) documentation and the [rars](https://github.com/bitplane/rars) Rust implementation. Both were invaluable references for the RAR support in this library.
+
 ### ❤ Contributions & Support
 - 🐛 Found a bug? [Create a new Issue](https://github.com/nimbase/archive/issues)
 - 👋 Wanna help? [Fork it!](https://github.com/nimbase/archive/fork)
