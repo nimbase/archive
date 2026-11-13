@@ -17,15 +17,19 @@ shared-phrase files for solid coverage.
 | `bcj.7z` | BCJ + LZMA2 | x86 filter on synthetic code |
 | `bcj2.7z` | LZMA + LZMA + BCJ2 | **must refuse cleanly** (deferred) |
 | `ppmd.7z` | PPMD | **must refuse cleanly** (deferred) |
-| `aes.7z` | LZMA2 + 7zAES (2^19) | file-content encryption, plain headers |
+| `aes.7z` | LZMA2 + 7zAES (2^19) | file-content encryption, packed headers |
+| `aes_plainhdr.7z` | LZMA2 + 7zAES (2^19) | same, plain headers (`-mhc=off`) |
 | `aes_hdr.7z` | LZMA2 + 7zAES (2^19) | header encryption (`-mhe=on`) |
 | `empty.7z` | dirs only | no data streams |
+| `*_plain.7z` | same as base | plain-header twins (`-mhc=off`) for the container phase |
 
 Oracle matrix (all verified 2026-11-13):
-- Clear archives: `bsdtar -tf/-xf` (BSD oracle) and `7z l/x`.
+- Clear archives (plain headers): `bsdtar -tf/-xf` (BSD oracle) and `7z l/x`.
+- Packed-header archives: `7z l/x` (bsdtar reads them too, except AES).
 - AES content/headers: `7z x -ppassword` only (`bsdtar` refuses both
   cleanly: "content encrypted, currently not supported" / "header is
   encrypted, currently not supported").
-- `bcj2`/`ppmd`: `bsdtar` reads them; we must fail closed with an
-  explicit unsupported-method error.
-- Our future writer output: validated by both `bsdtar -xf` and `7z x`.
+- `bcj2`/`ppmd`: `bsdtar` reads them; we fail closed with an
+  explicit unsupported-method error (deferred to the LZMA phase).
+- Our STORE writer output: validated by both `bsdtar -xf` and `7z x`
+  (incl. symlinks, dirs, empty files).

@@ -65,12 +65,14 @@ type
     afTar = ".tar"
     afZip = ".zip"
     afRar = ".rar"
+    af7z = ".7z"
 
   MediaType* = enum
     ## Canonical MIME types, same string-enum pattern as the formats.
     mtTar = "application/x-tar"
     mtZip = "application/zip"
     mtRar = "application/x-rar"
+    mt7z = "application/x-7z-compressed"
     mtGz = "application/gzip"
     mtZlib = "application/zlib"
     mtLz4 = "application/x-lz4"
@@ -93,6 +95,7 @@ proc mediaTypeOf*(fmt: ArchiveFormat): MediaType =
   of afTar: mtTar
   of afZip: mtZip
   of afRar: mtRar
+  of af7z: mt7z
 
 type
   ArchiveContext* = object
@@ -115,6 +118,15 @@ type
       ## Cap on a single RAR entry's unpacked size. Bounds one-shot
       ## extraction; streaming to-disk paths enforce it while copying.
       ## 0 means no cap.
+    max7zHeaderBytes*: int = 64 * 1024 * 1024
+      ## Cap on the 7z header database size. Larger headers raise instead
+      ## of allocating (likely corrupt/malicious). 0 means no cap.
+    max7zUnpackedBytes*: int64 = 4 * 1024 * 1024 * 1024
+      ## Cap on a single 7z substream's unpacked size. 0 means no cap.
+    max7zDictBytes*: int = 64 * 1024 * 1024
+      ## Cap on a 7z coder's declared dictionary before the LZMA phase
+      ## allocates a window. Archives above this fail instead of
+      ## allocating. Tunable per call; 0 means no cap (not recommended).
 
   ProgressInfo* = object
     ## One progress tick: the entry about to be processed.

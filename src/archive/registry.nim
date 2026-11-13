@@ -16,6 +16,7 @@ import ./crypt
 import ./formats/tar
 import ./formats/zip
 import ./formats/rar
+import ./formats/sevenz
 import ./formats/gz
 import ./formats/zlib
 import ./formats/lz4
@@ -94,6 +95,7 @@ proc matchFormat*(fmt: ArchiveFormat; filename: string;
   of afTar: matchTar(filename, inp)
   of afZip: matchZip(filename, inp)
   of afRar: matchRar(filename, inp)
+  of af7z: matchSz(filename, inp)
 
 proc compressInto*(fmt: CompressionFormat; inp: Input; dst: Output;
     level = 0) =
@@ -146,6 +148,7 @@ proc archiveFormat*(fmt: ArchiveFormat; ctx: ArchiveContext; dst: Output;
   of afTar: archiveTar(Tar(), ctx, dst, files)
   of afZip: archiveZip(Zip(), ctx, dst, files)
   of afRar: archiveRar(Rar(), ctx, dst, files)
+  of af7z: archiveSz(Sz(), ctx, dst, files)
 
 proc extractFormat*(fmt: ArchiveFormat; ctx: ArchiveContext; inp: Input;
     handle: FileHandler) =
@@ -155,6 +158,7 @@ proc extractFormat*(fmt: ArchiveFormat; ctx: ArchiveContext; inp: Input;
   of afTar: extractTar(Tar(), ctx, inp, handle)
   of afZip: extractZip(Zip(), ctx, inp, handle)
   of afRar: extractRar(Rar(), ctx, inp, handle)
+  of af7z: extractSz(Sz(), ctx, inp, handle)
 
 proc archiveTo*(c: CompressedArchive; ctx: ArchiveContext;
     dst: Output; files: seq[FileInfo]; level = 0) =

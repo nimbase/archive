@@ -175,7 +175,9 @@ for path, e in walkFs("out.tar.gz"):
   header encryption via PBKDF2-HMAC-SHA256; multivolume read/write incl.
   solid and header-encrypted sets; archive comments (CMT); Unpack70
   80-symbol distance path; recovery records skipped)
-- [ ] 7z read/write (needs new port; public-domain LZMA SDK reference)
+- [ ] 7z read/write (container + STORE done: signature, plain headers,
+  folders/substreams/files walk, per-file Copy decode, STORE writer,
+  registry/vfs/high-level integration; LZMA/LZMA2/filters/AES next)
 
 ## Credits
 
