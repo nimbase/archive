@@ -316,3 +316,73 @@ suite "7z lzma2-solid write":
     except SzError:
       failed = true
     check failed
+
+suite "7z aes write":
+  test "encrypted solid round trips with password":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: 5,
+        isRegular: true), data: "hello"),
+      FsEntry(path: "empty.txt", meta: FileMeta(name: "empty.txt",
+        size: 0, isRegular: true), data: ""),
+      FsEntry(path: "link.txt", meta: FileMeta(name: "link.txt",
+        isSymlink: true), data: "", linkTarget: "a.txt"),
+      FsEntry(path: "lorem.txt", meta: FileMeta(name: "lorem.txt",
+        size: 11400, isRegular: true),
+        data: readFile(szCases & "sources/lorem.txt")),
+    ], ".", "")
+    let dst = newOutput()
+    archiveSz(Sz(meth: 1, password: "password", kdfLg2: 14), ctx,
+      dst, files)
+    let blob = take(dst)
+    check blob.len > 0
+    var bodies = initOrderedTable[string, string]()
+    var links = initOrderedTable[string, string]()
+    extractSz(Sz(password: "password"), ctx,
+        openInputString(blob)) do (
+        c: ArchiveContext; info: FileInfo):
+      if info.isSymlink():
+        links[info.nameInArchive] = info.linkTarget
+      elif info.isRegular():
+        bodies[info.nameInArchive] = readAll(info.open())
+    check bodies["a.txt"] == "hello"
+    check bodies["empty.txt"] == ""
+    check bodies["lorem.txt"] ==
+      readFile(szCases & "sources/lorem.txt")
+    check links["link.txt"] == "a.txt"
+
+  test "encrypted solid needs password":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: 5,
+        isRegular: true), data: "hello"),
+    ], ".", "")
+    let dst = newOutput()
+    archiveSz(Sz(meth: 1, password: "password", kdfLg2: 14), ctx,
+      dst, files)
+    let blob = take(dst)
+    for pw in ["", "wrong"]:
+      var failed = false
+      try:
+        extractSz(Sz(password: pw), ctx,
+            openInputString(blob)) do (
+            c: ArchiveContext; info: FileInfo):
+          if info.isRegular():
+            discard readAll(info.open())
+      except SzError:
+        failed = true
+      check failed
+
+  test "store with password refused":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: 5,
+        isRegular: true), data: "hello"),
+    ], ".", "")
+    let dst = newOutput()
+    var failed = false
+    try:
+      archiveSz(Sz(password: "password"), ctx, dst, files)
+    except SzError as e:
+      failed = "AES" in e.msg
+    check failed

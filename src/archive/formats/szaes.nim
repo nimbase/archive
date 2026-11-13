@@ -9,6 +9,7 @@
 ## with zero-padded IV, truncate to the AES unpack size. Raises
 ## ArchiveError with "7z: ..." messages.
 
+import nimcypher/utils as ncUtils
 import nimcypher/hash as ncHash
 import nimcypher/aes as ncAes
 import ../types
@@ -119,6 +120,17 @@ proc deriveAesKey*(password: string; salt: openArray[byte];
     discard counter
   result = st.finish()
 
+proc randomAesSaltIv*(): tuple[salt: seq[byte]; iv: array[16, byte]] =
+  ## 8-byte salt + 8-byte IV (18-byte props with the header; matches the
+  ## docs example and stays within the 18-byte 7z-written ceiling).
+  let s = ncUtils.randomBytes[8]()
+  let v = ncUtils.randomBytes[8]()
+  result.salt = @s
+  for i in 0 ..< 16:
+    result.iv[i] = 0
+  for i in 0 ..< 8:
+    result.iv[i] = v[i]
+
 proc aesCbcDecryptTrunc*(key: array[32, byte]; iv: array[16, byte];
     data: string; truncLen: int): string =
   if data.len mod 16 != 0:
@@ -135,4 +147,50 @@ proc aesCbcDecryptTrunc*(key: array[32, byte]; iv: array[16, byte];
     raise newException(AesError, "7z: aes short output")
   result = newString(truncLen)
   if truncLen > 0:
-    copyMem(addr result[0], unsafeAddr pt[0], truncLen)
+    var c = pt
+    copyMem(addr result[0], addr c[0], truncLen)
+
+proc buildAesProps*(salt: openArray[byte]; iv: openArray[byte];
+    power: int): string =
+  ## Writer-side props: flags byte + nibble byte + salt + IV.
+  if power < 0 or power > 30:
+    raise newException(AesError, "7z: aes iterations too large")
+  if salt.len > 16 or iv.len > 16:
+    raise newException(AesError, "7z: bad aes salt/iv length")
+  if salt.len == 0 and iv.len == 0:
+    result = newString(1)
+    result[0] = chr(power and 0x3F)
+    return
+  if salt.len == 0 or iv.len == 0:
+    raise newException(AesError, "7z: aes salt/iv must both be set")
+  result = newString(2 + salt.len + iv.len)
+  result[0] = chr(0x80 or 0x40 or (power and 0x3F))
+  result[1] = chr((((salt.len - 1) and 0x0F) shl 4) or
+    ((iv.len - 1) and 0x0F))
+  for i in 0 ..< salt.len:
+    result[2 + i] = chr(salt[i])
+  for i in 0 ..< iv.len:
+    result[2 + salt.len + i] = chr(iv[i])
+
+proc aesCbcEncryptPad*(key: array[32, byte]; iv: array[16, byte];
+    data: string): string =
+  ## AES-256-CBC encrypt with zero padding (no pad when already aligned).
+  if data.len == 0:
+    return ""
+  let paddedLen = ((data.len + 15) div 16) * 16
+  var buf = newString(paddedLen)
+  var d = data
+  copyMem(addr buf[0], addr d[0], data.len)
+  for i in data.len ..< paddedLen:
+    buf[i] = chr(0)
+  var ivSeq = newSeq[byte](16)
+  for i in 0 ..< 16:
+    ivSeq[i] = iv[i]
+  var keySeq = newSeq[byte](32)
+  for i in 0 ..< 32:
+    keySeq[i] = key[i]
+  let ct = ncAes.aesCbcEncrypt(keySeq, ivSeq,
+    buf.toOpenArrayByte(0, paddedLen - 1), padded = false)
+  result = newString(paddedLen)
+  var c = ct
+  copyMem(addr result[0], addr c[0], paddedLen)

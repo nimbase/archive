@@ -41,12 +41,17 @@ const
 
 type Sz* = object
   ## 7z archive options. `password` enables 7zAES decryption on read
-  ## (content and headers); empty means no encryption. `meth` selects
-  ## the file codec on write: 0 = STORE (default, one Copy folder per
-  ## data file), 1 = LZMA2-solid (fast level, files share one LZMA2
-  ## folder per ≤8MiB group). The value itself is per-call, never global.
+  ## (content and headers); on write it encrypts LZMA2-solid folders
+  ## (requires meth 1; STORE with a password raises instead of writing
+  ## plaintext). `kdfLg2` selects the KDF iteration log2 on write
+  ## (0 = default 19, i.e. 2^19 rounds); readers take the count from
+  ## each header and ignore this field. `meth` selects the file codec
+  ## on write: 0 = STORE (default, one Copy folder per data file),
+  ## 1 = LZMA2-solid (fast level, files share LZMA2 folders up to 8MiB
+  ## solid data each). The value itself is per-call, never global.
   meth*: int
   password*: string
+  kdfLg2*: int
   continueOnError*: bool
 
 proc extension*(z: Sz): ArchiveFormat = af7z
@@ -1629,10 +1634,21 @@ proc archiveSzLzma2*(z: Sz; ctx: ArchiveContext; dst: Output;
     curLen += p.raw.len
   if cur.len > 0:
     groups.add(cur)
-  # Encode groups.
+  # Encode groups (optionally AES-wrapped per folder).
+  let useAes = z.password != ""
+  if useAes and z.meth != 1:
+    raise newException(SzError,
+      "7z: AES write requires LZMA2-solid (meth 1)")
+  var power = 19
+  if z.kdfLg2 != 0:
+    if z.kdfLg2 < 0 or z.kdfLg2 > 30:
+      raise newException(SzError, "7z: bad kdf length")
+    power = z.kdfLg2
   var packOut = newOutput()
   var groupPack: seq[string] = @[]
   var groupSolid: seq[int] = @[]
+  var groupAes: seq[string] = @[] # props per group, "" when clear
+  var groupLzma: seq[int] = @[] # AES unpack sizes (pre-encryption)
   for gi, g in groups:
     var solid = newString(curLenOf(pend, g))
     var o = 0
@@ -1647,8 +1663,27 @@ proc archiveSzLzma2*(z: Sz; ctx: ArchiveContext; dst: Output;
         ctx.max7zDictBytes)
     except CatchableError as e:
       raise newException(SzError, "7z: lzma2 encode failed: " & e.msg)
+    var aprops = ""
+    var lzmaLen = pack.len
+    if useAes:
+      let (salt, iv) = randomAesSaltIv()
+      var key: array[32, byte]
+      try:
+        key = deriveAesKey(z.password, salt, power)
+        aprops = buildAesProps(salt, iv, power)
+      except CatchableError as e:
+        raise newException(SzError, "7z: " & e.msg)
+      var ivArr: array[16, byte]
+      for i in 0 ..< 16:
+        ivArr[i] = iv[i]
+      try:
+        pack = aesCbcEncryptPad(key, ivArr, pack)
+      except CatchableError as e:
+        raise newException(SzError, "7z: aes encrypt failed: " & e.msg)
     groupPack.add(pack)
     groupSolid.add(solid.len)
+    groupAes.add(aprops)
+    groupLzma.add(lzmaLen)
     if pack.len > 0:
       var pp = pack
       writeBytes(packOut, addr pp[0], pp.len)
@@ -1675,14 +1710,36 @@ proc archiveSzLzma2*(z: Sz; ctx: ArchiveContext; dst: Output;
     writeNum(hdr, groups.len.uint64)
     writeByte(hdr, char(0x00))
     for gi in 0 ..< groups.len:
-      writeNum(hdr, 1)
-      writeByte(hdr, char(0x21))
-      writeByte(hdr, char(0x21))
-      writeNum(hdr, 1)
-      writeByte(hdr, char(0x10))
+      if groupAes[gi] == "":
+        writeNum(hdr, 1)
+        writeByte(hdr, char(0x21))
+        writeByte(hdr, char(0x21))
+        writeNum(hdr, 1)
+        writeByte(hdr, char(0x10))
+      else:
+        writeNum(hdr, 2)
+        writeByte(hdr, char(0x24))
+        writeByte(hdr, char(0x06))
+        writeByte(hdr, char(0xF1))
+        writeByte(hdr, char(0x07))
+        writeByte(hdr, char(0x01))
+        writeNum(hdr, groupAes[gi].len.uint64)
+        var ap = groupAes[gi]
+        writeBytes(hdr, addr ap[0], ap.len)
+        writeByte(hdr, char(0x21))
+        writeByte(hdr, char(0x21))
+        writeNum(hdr, 1)
+        writeByte(hdr, char(0x10))
+        # bind: LZMA2 input (1) <- AES output (0)
+        writeNum(hdr, 1)
+        writeNum(hdr, 0)
     writeByte(hdr, char(0x0C))
-    for s in groupSolid:
-      writeNum(hdr, s.uint64)
+    for gi in 0 ..< groups.len:
+      if groupAes[gi] == "":
+        writeNum(hdr, groupSolid[gi].uint64)
+      else:
+        writeNum(hdr, groupLzma[gi].uint64)
+        writeNum(hdr, groupSolid[gi].uint64)
     writeByte(hdr, char(0x00))
     # SubStreams: counts (only when a folder holds >1 file), sizes,
     # and one AllAreDefined CRC list (mirrors 7z's own layout).
@@ -1720,14 +1777,17 @@ proc archiveSzLzma2*(z: Sz; ctx: ArchiveContext; dst: Output;
 proc archiveSz*(z: Sz; ctx: ArchiveContext; dst: Output;
     files: seq[FileInfo]) =
   ## Writer dispatcher: meth 0 = STORE (one Copy folder per data file),
-  ## meth 1 = LZMA2-solid (fast level, shared folders). Plain headers.
-  ## Dirs and empty files carry no streams. Symlinks store the UTF-8
-  ## target as file data with a symlink mode.
+  ## meth 1 = LZMA2-solid (fast level, shared folders, optional AES).
+  ## Plain headers. Dirs and empty files carry no streams. Symlinks store
+  ## the UTF-8 target as file data with a symlink mode.
   if z.meth == 1:
     archiveSzLzma2(z, ctx, dst, files)
     return
   elif z.meth != 0:
     raise newException(SzError, "7z: unknown write method")
+  if z.password != "":
+    raise newException(SzError,
+      "7z: AES write requires LZMA2-solid (meth 1)")
   ctx.checkCancelled()
   type SzPending = object
     arcName: string
