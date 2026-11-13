@@ -26,7 +26,6 @@ import ./szfilter
 import ./szaes
 
 type SzError* = object of ArchiveError
-type SzCodecError* = object of ArchiveError
 
 const
   szMagic* = "\x37\x7A\xBC\xAF\x27\x1C"
@@ -63,6 +62,8 @@ type Sz* = object
     ## wins). Default false preserves existing behavior and speed.
     ## (BCJ forward is a follow-up; BCJ decode already works.)
   continueOnError*: bool
+    ## Skip-and-continue on per-file handler/decode failures during
+    ## extract (mirrors zip/tar/rar); abort with SzError otherwise.
 
 proc extension*(z: Sz): ArchiveFormat = af7z
 proc mediaType*(z: Sz): MediaType = mt7z
@@ -1350,8 +1351,33 @@ proc extractSz*(z: Sz; ctx: ArchiveContext; inp: Input;
     except SzError as e:
       folderErr[fi] = e.msg
   var index = 0
+  var skipDirs: seq[string] = @[]
+  template handleSz(fi: FileInfo) =
+    ## Deliver one entry, honoring SkipAll/SkipDir/continueOnError like
+    ## the zip/tar walks. Decode failures surface inside `handle`
+    ## (lazy openers) and skip cleanly when enabled.
+    try:
+      {.gcsafe.}:
+        handle(ctx, fi)
+    except SkipAll:
+      break
+    except SkipDir:
+      if fi.isDir():
+        skipDirs.add(fi.nameInArchive)
+    except CatchableError as e:
+      if z.continueOnError and not ctx.cancelled():
+        continue
+      raise newException(SzError,
+        "7z handling file: " & fe.name & ": " & e.msg)
   for fe in arch.files:
     ctx.checkCancelled()
+    var skipped = false
+    for sd in skipDirs:
+      if fe.name.startsWith(sd):
+        skipped = true
+        break
+    if skipped:
+      continue
     ctx.reportProgress(fe.name, index, arch.files.len, fe.size)
     inc index
     var meta = FileMeta(name: baseNameV(fe.name), size: fe.size,
@@ -1361,15 +1387,13 @@ proc extractSz*(z: Sz; ctx: ArchiveContext; inp: Input;
     if fe.isDir:
       let fi = FileInfo(meta: meta, nameInArchive: fe.name,
         linkTarget: "", open: stringOpener(""))
-      {.gcsafe.}:
-        handle(ctx, fi)
+      handleSz(fi)
       continue
     if fe.folderIdx < 0:
       # Empty file: no data, no substream.
       let fi = FileInfo(meta: meta, nameInArchive: fe.name,
         linkTarget: "", open: stringOpener(""))
-      {.gcsafe.}:
-        handle(ctx, fi)
+      handleSz(fi)
       continue
     let fiIdx = fe.folderIdx
     if fiIdx < 0 or fiIdx >= arch.folders.len:
@@ -1386,22 +1410,19 @@ proc extractSz*(z: Sz; ctx: ArchiveContext; inp: Input;
           copyMem(addr target[0], sub.p, sub.len)
         let fi = FileInfo(meta: meta, nameInArchive: fe.name,
           linkTarget: target, open: stringOpener(""))
-        {.gcsafe.}:
-          handle(ctx, fi)
+        handleSz(fi)
         continue
       let opener = storeOpener(sub, inp, fe.dataCrc, fe.hasCrc,
         " (" & fe.name & ")")
       let fi = FileInfo(meta: meta, nameInArchive: fe.name,
         linkTarget: "", open: opener)
-      {.gcsafe.}:
-        handle(ctx, fi)
+      handleSz(fi)
       continue
     # Compressed folder.
     if folderDone[fiIdx] and folderErr[fiIdx] != "":
       let fi = FileInfo(meta: meta, nameInArchive: fe.name,
         linkTarget: "", open: errOpener(folderErr[fiIdx]))
-      {.gcsafe.}:
-        handle(ctx, fi)
+      handleSz(fi)
       continue
     if fe.isSymlink:
       # Target needed at walk time: decode now.
@@ -1409,8 +1430,7 @@ proc extractSz*(z: Sz; ctx: ArchiveContext; inp: Input;
       if folderErr[fiIdx] != "":
         let fi = FileInfo(meta: meta, nameInArchive: fe.name,
           linkTarget: "", open: errOpener(folderErr[fiIdx]))
-        {.gcsafe.}:
-          handle(ctx, fi)
+        handleSz(fi)
         continue
       let outp = folderOut[fiIdx]
       if fe.subOff + fe.subLen > uint64(outp.len):
@@ -1422,8 +1442,7 @@ proc extractSz*(z: Sz; ctx: ArchiveContext; inp: Input;
           int(fe.subLen))
       let fi = FileInfo(meta: meta, nameInArchive: fe.name,
         linkTarget: target, open: stringOpener(""))
-      {.gcsafe.}:
-        handle(ctx, fi)
+      handleSz(fi)
       continue
     # Regular file: lazy decode on open, cached per folder.
     let fOut = addr folderOut
@@ -1460,8 +1479,7 @@ proc extractSz*(z: Sz; ctx: ArchiveContext; inp: Input;
       openInputCopy(unsafeAddr sl[0], sl.len)
     let fi = FileInfo(meta: meta, nameInArchive: fe.name,
       linkTarget: "", open: opener)
-    {.gcsafe.}:
-      handle(ctx, fi)
+    handleSz(fi)
 
 
 # ---------- STORE-only writer ----------

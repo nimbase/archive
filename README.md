@@ -180,7 +180,8 @@ for path, e in walkFs("out.tar.gz"):
   solid, header-encrypted (`-mhe`) write, Delta auto-filter
   (`useFilters`, BCJ-forward follow-up) with kdfLg2 control;
   plain + packed + header-encrypted headers; solid folder cache with
-  lazy decode; per-substream CRC verify; registry/vfs/high-level
+  lazy decode; per-substream CRC verify; SkipDir/SkipAll/
+  continueOnError walk protocol; registry/vfs/high-level
   integration; PPMd/BCJ2 refuse cleanly)
 
 ## Credits

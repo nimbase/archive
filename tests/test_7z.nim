@@ -221,6 +221,100 @@ suite "7z encrypted":
       check bodies["sources/docs/f" & $i & ".txt"] ==
         readFile(szCases & "sources/docs/f" & $i & ".txt")
 
+suite "7z malformed inputs":
+  test "mutations fail closed without crashing":
+    # Truncations, bit flips and garbage headers must raise SzError
+    # (or still decode when the mutation is benign, e.g. mtime bits),
+    # never a Defect, hang, or unbounded allocation. Tight caps keep
+    # every mutant fast and bounded.
+    let base = readFile(szCases & "store_plain.7z")
+    var ctx = ArchiveContext(max7zHeaderBytes: 1 * 1024 * 1024,
+      max7zUnpackedBytes: 16 * 1024 * 1024, max7zDictBytes: 4 * 1024 * 1024)
+    var mutants: seq[string] = @[]
+    for cut in [0, 1, 10, 31, 32, 33, 40, 100, 1000, base.len - 1]:
+      if cut < base.len:
+        mutants.add(base[0 ..< cut])
+    for pos in [0, 6, 12, 20, 32, 40, 100, base.len - 1]:
+      if pos < base.len:
+        var m = base
+        m[pos] = chr(ord(m[pos]) xor 0xFF)
+        mutants.add(m)
+        var m2 = base
+        m2[pos] = chr(ord(m2[pos]) xor 0x01)
+        mutants.add(m2)
+    mutants.add("")
+    mutants.add("7z\xBC\xAF\x27\x1C" & repeat(chr(0), 100))
+    var ran = 0
+    for mut in mutants:
+      inc ran
+      try:
+        extractSz(Sz(), ctx, openInputString(mut)) do (
+            c: ArchiveContext; info: FileInfo):
+          if info.isRegular():
+            discard readAll(info.open())
+      except SzError:
+        discard # fail-closed: the expected outcome
+      except CatchableError as e:
+        checkpoint("non-SzError on mutant: " & e.msg)
+        fail()
+    check ran == mutants.len
+
+suite "7z walk control":
+  test "skipdir prunes a subtree":
+    var ctx: ArchiveContext
+    let data = readFile(szCases & "lzma2-solid_plain.7z")
+    var names: seq[string] = @[]
+    extractSz(Sz(), ctx, openInputString(data)) do (
+        c: ArchiveContext; info: FileInfo):
+      names.add(info.nameInArchive)
+      if info.isDir() and info.nameInArchive == "sources/docs/":
+        raise newException(SkipDir, "prune")
+    check "sources/docs/" in names
+    check "sources/docs/f0.txt" notin names
+    check "sources/lorem.txt" in names
+
+  test "skipall stops the walk":
+    var ctx: ArchiveContext
+    let data = readFile(szCases & "lzma2-solid_plain.7z")
+    var count = 0
+    extractSz(Sz(), ctx, openInputString(data)) do (
+        c: ArchiveContext; info: FileInfo):
+      inc count
+      raise newException(SkipAll, "stop")
+    check count == 1
+
+  test "continue on error skips bad entries":
+    var ctx: ArchiveContext
+    var data = readFile(szCases & "solid-1k_plain.7z")
+    data[40] = chr(ord(data[40]) xor 0xFF) # corrupt first pack stream
+    var seen: seq[string] = @[]
+    var failed = false
+    try:
+      extractSz(Sz(), ctx, openInputString(data)) do (
+          c: ArchiveContext; info: FileInfo):
+        if info.isRegular():
+          try:
+            discard readAll(info.open())
+            seen.add(info.nameInArchive)
+          except SzError:
+            raise newException(ArchiveError, "bad entry")
+    except SzError:
+      failed = true
+    check failed
+    var seen2: seq[string] = @[]
+    extractSz(Sz(continueOnError: true), ctx,
+        openInputString(data)) do (
+        c: ArchiveContext; info: FileInfo):
+      if info.isRegular():
+        try:
+          discard readAll(info.open())
+          seen2.add(info.nameInArchive)
+        except CatchableError:
+          raise newException(ArchiveError, "bad entry")
+    check seen2.len == 6
+    check "sources/docs/f0.txt" notin seen2
+    check "sources/lorem.txt" in seen2
+
 suite "7z registry":
   test "archive and extract through dispatch":
     var ctx: ArchiveContext
