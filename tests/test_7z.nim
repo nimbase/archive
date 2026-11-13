@@ -553,3 +553,19 @@ suite "7z filter write":
     let d2 = newOutput()
     archiveSz(Sz(meth: 1, useFilters: true), ctx, d2, files)
     check take(d1) == take(d2)
+
+  test "filter plus aes composes":
+    var ctx: ArchiveContext
+    var audio = newString(2000)
+    for i in 0 ..< 2000:
+      audio[i] = chr((i div 4) and 0xFF)
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.pcm", meta: FileMeta(name: "a.pcm",
+        size: audio.len, isRegular: true), data: audio),
+    ], ".", "")
+    let dst = newOutput()
+    archiveSz(Sz(meth: 1, useFilters: true, password: "password",
+      kdfLg2: 14), ctx, dst, files)
+    let bodies = szReadAllFrom(take(dst),
+      Sz(password: "password"), ctx)
+    check bodies["a.pcm"] == audio
