@@ -101,20 +101,28 @@ proc openInputFile*(path: string): Input =
 
 proc openInputString*(s: string): Input =
   ## Input sharing `s` (no copy; string is refcounted).
-  Input(str: s, base: baseOf(s), len: s.len, pos: 0)
+  ## NOTE: assign-then-derive (never derive base from a dying local):
+  ## the retained field is the single source of truth for `base`.
+  result = Input(len: s.len, pos: 0)
+  result.str = s
+  result.base = baseOf(result.str)
 
 proc openInputCopy*(p: pointer; length: int): Input =
   ## Input owning a copy of [p, p+length).
-  var s = newString(length)
+  result = Input(len: length, pos: 0)
   if length > 0:
+    var s = newString(length)
     copyMem(addr s[0], p, length)
-  openInputString(s)
+    result.str = s
+    result.base = baseOf(result.str)
 
 proc openInputBytes*(data: openArray[byte]): Input =
-  var s = newString(data.len)
+  result = Input(len: data.len, pos: 0)
   if data.len > 0:
+    var s = newString(data.len)
     copyMem(addr s[0], unsafeAddr data[0], data.len)
-  openInputString(s)
+    result.str = s
+    result.base = baseOf(result.str)
 
 proc openInputBorrowed*(p: pointer; length: int): Input =
   ## Input borrowing [p, p+length) without copying or retaining.
