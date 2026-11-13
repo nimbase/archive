@@ -386,3 +386,43 @@ suite "7z aes write":
     except SzError as e:
       failed = "AES" in e.msg
     check failed
+
+suite "7z header-encrypted write":
+  test "store and solid headers need password then decrypt":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: 5,
+        isRegular: true), data: "hello"),
+      FsEntry(path: "lorem.txt", meta: FileMeta(name: "lorem.txt",
+        size: 11400, isRegular: true),
+        data: readFile(szCases & "sources/lorem.txt")),
+    ], ".", "")
+    for m in [0, 1]:
+      let dst = newOutput()
+      archiveSz(Sz(meth: m, password: "password", kdfLg2: 14,
+        encHeaders: true), ctx, dst, files)
+      let blob = take(dst)
+      check blob.len > 0
+      var failed = false
+      try:
+        extractSz(Sz(), ctx, openInputString(blob)) do (
+            c: ArchiveContext; info: FileInfo):
+          discard
+      except SzError as e:
+        failed = "password" in e.msg
+      check failed
+      let bodies = szReadAllFrom(blob,
+        Sz(password: "password"), ctx)
+      check bodies["a.txt"] == "hello"
+      check bodies["lorem.txt"] ==
+        readFile(szCases & "sources/lorem.txt")
+
+  test "header encryption without password refused":
+    var ctx: ArchiveContext
+    let dst = newOutput()
+    var failed = false
+    try:
+      archiveSz(Sz(meth: 1, encHeaders: true), ctx, dst, @[])
+    except SzError as e:
+      failed = "password" in e.msg
+    check failed

@@ -38,7 +38,8 @@ Oracle matrix (all verified 2026-11-13, decode verified 2026-11-14):
   (`Sz(meth: 1)`: shared LZMA2 folders, 1MiB dict, fast greedy matches,
   ≤8MiB solid groups, plain headers) — both validated by `bsdtar -xf`
   and `7z x` byte-identical, incl. symlinks, dirs, empty files.
-  Encrypted solid (`password`, `kdfLg2`, default 2^19) verified with
+  Encrypted solid (`password`, `kdfLg2`, default 2^19) and
+  header-encrypted write (`encHeaders`, STORE or solid) verified with
   `7z x -ppassword` and round-trips.
 
 Wire notes that override the stale docs page:

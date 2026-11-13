@@ -20,6 +20,7 @@ import archive/files
 import archive/formats/tar
 import archive/formats/zip
 import archive/formats/rar
+import archive/formats/sevenz
 
 let scaleFull = paramCount() >= 1 and paramStr(1) == "full"
 let reps = if scaleFull: 3 else: 2
@@ -161,6 +162,12 @@ proc collectBodies(op: string; ctx: ArchiveContext; inp: Input;
         let b = readAll(info.open())
         doAssert b == expect[info.nameInArchive], "rar body: " & info.nameInArchive
         seen += b.len
+  of "7z-store", "7z-solid":
+    extractSz(Sz(), ctx, inp) do (c: ArchiveContext; info: FileInfo):
+      if info.isRegular():
+        let b = readAll(info.open())
+        doAssert b == expect[info.nameInArchive], "7z body: " & info.nameInArchive
+        seen += b.len
   else:
     doAssert false, "unknown op: " & op
   seen
@@ -216,6 +223,12 @@ proc main() =
     proc(c: ArchiveContext; dst: Output) =
       CompressedArchive(archival: afTar, compression: cfGz).archiveTo(c,
         dst, files))
+  benchArchive("7z-store", "files", files, entries,
+    proc(c: ArchiveContext; dst: Output) =
+      archiveSz(Sz(meth: 0), c, dst, files))
+  benchArchive("7z-solid", "files", files, entries,
+    proc(c: ArchiveContext; dst: Output) =
+      archiveSz(Sz(meth: 1), c, dst, files))
 
   section("archive/extract single text (rar)")
   var rctx: ArchiveContext
@@ -232,6 +245,14 @@ proc main() =
   benchArchive("rar-m3", "text", rarFiles, rarEntries,
     proc(c: ArchiveContext; dst: Output) =
       archiveRar(Rar(meth: 3), c, dst, rarFiles))
+
+  section("archive/extract single text (7z)")
+  benchArchive("7z-store", "text", rarFiles, rarEntries,
+    proc(c: ArchiveContext; dst: Output) =
+      archiveSz(Sz(meth: 0), c, dst, rarFiles))
+  benchArchive("7z-solid", "text", rarFiles, rarEntries,
+    proc(c: ArchiveContext; dst: Output) =
+      archiveSz(Sz(meth: 1), c, dst, rarFiles))
 
   section("file streaming (bounded memory)")
   let tmp = getTempDir() / "bench_archive"

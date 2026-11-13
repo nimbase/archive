@@ -177,9 +177,10 @@ for path, e in walkFs("out.tar.gz"):
   80-symbol distance path; recovery records skipped)
 - [x] 7z read + write (container + STORE/LZMA/LZMA2 + Delta/BCJ-x86 +
   7zAES read; STORE + LZMA2-solid fast-level write incl. AES-encrypted
-  solid with kdfLg2 control; plain + packed + header-encrypted headers;
-  solid folder cache with lazy decode; per-substream CRC verify;
-  registry/vfs/high-level integration; PPMd/BCJ2 refuse cleanly)
+  solid and header-encrypted (`-mhe`) write with kdfLg2 control;
+  plain + packed + header-encrypted headers; solid folder cache with
+  lazy decode; per-substream CRC verify; registry/vfs/high-level
+  integration; PPMd/BCJ2 refuse cleanly)
 
 ## Credits
 

@@ -52,6 +52,10 @@ type Sz* = object
   meth*: int
   password*: string
   kdfLg2*: int
+  encHeaders*: bool
+    ## Header-encrypted write (`-mhe=on` equivalent): the writer
+    ## compresses (LZMA2) and AES-encrypts the header; readers need the
+    ## password to list, like RAR HEAD_CRYPT. Requires `password`.
   continueOnError*: bool
 
 proc extension*(z: Sz): ArchiveFormat = af7z
@@ -1607,6 +1611,78 @@ proc writeSzSignature(dst: Output; packBytes, hstr: string) =
     var hs = hstr
     writeBytes(dst, addr hs[0], hs.len)
 
+proc writeSzSignatureEnc(dst: Output; packBytes, hstr: string; z: Sz;
+    ctx: ArchiveContext) =
+  ## Header-encrypted write: LZMA2-compress + AES-encrypt the plain
+  ## header, then emit an 0x17 EncodedHeader pointing at the header
+  ## pack stream. Requires `password`.
+  if z.password == "":
+    raise newException(SzError, "7z: header encryption requires password")
+  var power = 19
+  if z.kdfLg2 != 0:
+    if z.kdfLg2 < 0 or z.kdfLg2 > 30:
+      raise newException(SzError, "7z: bad kdf length")
+    power = z.kdfLg2
+  var lzmaHdr: string
+  try:
+    lzmaHdr = lzma2EncodeSolid(hstr, byte(0x10), ctx.max7zDictBytes)
+  except CatchableError as e:
+    raise newException(SzError, "7z: header compress failed: " & e.msg)
+  let (salt, iv) = randomAesSaltIv()
+  var key: array[32, byte]
+  var aprops: string
+  try:
+    key = deriveAesKey(z.password, salt, power)
+    aprops = buildAesProps(salt, iv, power)
+  except CatchableError as e:
+    raise newException(SzError, "7z: " & e.msg)
+  var ivArr: array[16, byte]
+  for i in 0 ..< 16:
+    ivArr[i] = iv[i]
+  var cipher: string
+  try:
+    cipher = aesCbcEncryptPad(key, ivArr, lzmaHdr)
+  except CatchableError as e:
+    raise newException(SzError, "7z: header encrypt failed: " & e.msg)
+  # Encoded header: 0x17 PackInfo UnpackInfo 0x00.
+  var enc = newOutput()
+  writeByte(enc, char(0x17))
+  writeByte(enc, char(0x06))
+  writeNum(enc, packBytes.len.uint64) # PackPos: after main packs
+  writeNum(enc, 1)
+  writeByte(enc, char(0x09))
+  writeNum(enc, cipher.len.uint64)
+  writeByte(enc, char(0x00))
+  writeByte(enc, char(0x07))
+  writeByte(enc, char(0x0B))
+  writeNum(enc, 1)
+  writeByte(enc, char(0x00))
+  writeNum(enc, 2)
+  writeByte(enc, char(0x24))
+  writeByte(enc, char(0x06))
+  writeByte(enc, char(0xF1))
+  writeByte(enc, char(0x07))
+  writeByte(enc, char(0x01))
+  writeNum(enc, aprops.len.uint64)
+  var ap = aprops
+  writeBytes(enc, addr ap[0], ap.len)
+  writeByte(enc, char(0x21))
+  writeByte(enc, char(0x21))
+  writeNum(enc, 1)
+  writeByte(enc, char(0x10))
+  writeNum(enc, 1)
+  writeNum(enc, 0)
+  writeByte(enc, char(0x0C))
+  writeNum(enc, lzmaHdr.len.uint64)
+  writeNum(enc, hstr.len.uint64)
+  writeByte(enc, char(0x00))
+  writeByte(enc, char(0x00))
+  let eb = outputBytes(enc)
+  var estr = newString(eb.len)
+  if eb.len > 0:
+    copyMem(addr estr[0], eb.p, eb.len)
+  writeSzSignature(dst, packBytes & cipher, estr)
+
 proc curLenOf(pend: seq[SzPend]; g: seq[int]): int =
   result = 0
   for ei in g:
@@ -1771,8 +1847,10 @@ proc archiveSzLzma2*(z: Sz; ctx: ArchiveContext; dst: Output;
   var hstr = newString(hb.len)
   if hb.len > 0:
     copyMem(addr hstr[0], hb.p, hb.len)
-  writeSzSignature(dst, packBytes, hstr)
-  discard z
+  if z.encHeaders:
+    writeSzSignatureEnc(dst, packBytes, hstr, z, ctx)
+  else:
+    writeSzSignature(dst, packBytes, hstr)
 
 proc archiveSz*(z: Sz; ctx: ArchiveContext; dst: Output;
     files: seq[FileInfo]) =
@@ -1785,9 +1863,9 @@ proc archiveSz*(z: Sz; ctx: ArchiveContext; dst: Output;
     return
   elif z.meth != 0:
     raise newException(SzError, "7z: unknown write method")
-  if z.password != "":
+  if z.password != "" and not z.encHeaders:
     raise newException(SzError,
-      "7z: AES write requires LZMA2-solid (meth 1)")
+      "7z: AES content write requires LZMA2-solid (meth 1)")
   ctx.checkCancelled()
   type SzPending = object
     arcName: string
@@ -1961,28 +2039,16 @@ proc archiveSz*(z: Sz; ctx: ArchiveContext; dst: Output;
       wrU32le(hdr, (p.mode.uint32 shl 16) or win)
   writeByte(hdr, char(0x00)) # end FilesInfo
   writeByte(hdr, char(0x00)) # end header
-  # Assemble: signature + packs + header.
+  # Assemble: signature + packs + header (optionally header-encrypted).
   let hb = outputBytes(hdr)
   var hstr = newString(hb.len)
   if hb.len > 0:
     copyMem(addr hstr[0], hb.p, hb.len)
-  let hCrc = crc32Update(0xFFFFFFFF'u32, hstr) xor 0xFFFFFFFF'u32
-  var start = newOutput()
-  wrU64le(start, packBytes.len.uint64)
-  wrU64le(start, hstr.len.uint64)
-  wrU32le(start, hCrc)
-  let sb = outputBytes(start)
-  var startBytes = newString(sb.len)
-  copyMem(addr startBytes[0], sb.p, sb.len)
-  let sCrc = crc32Update(0xFFFFFFFF'u32, startBytes) xor 0xFFFFFFFF'u32
-  for c in szMagic:
-    writeByte(dst, c)
-  writeByte(dst, char(0))
-  writeByte(dst, char(4))
-  wrU32le(dst, sCrc)
-  writeBytes(dst, unsafeAddr startBytes[0], startBytes.len)
-  if packBytes.len > 0:
-    writeBytes(dst, packBytes.p, packBytes.len)
-  if hstr.len > 0:
-    writeBytes(dst, unsafeAddr hstr[0], hstr.len)
-    discard z
+  let pb = outputBytes(packOut)
+  var packStr = newString(pb.len)
+  if pb.len > 0:
+    copyMem(addr packStr[0], pb.p, pb.len)
+  if z.encHeaders:
+    writeSzSignatureEnc(dst, packStr, hstr, z, ctx)
+  else:
+    writeSzSignature(dst, packStr, hstr)

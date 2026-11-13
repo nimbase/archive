@@ -15,9 +15,10 @@ What it measures:
 
 - One-shot `compress`/`decompress` per `CompressionFormat` (default level)
   on text-like and incompressible input: ratio, encode/decode ms + MB/s.
-- `archiveTar`/`archiveZip`/`CompressedArchive(tar.gz)`/`archiveRar`
-  plus matching extract walks over many small files and single text:
-  container overhead, per-file codec cost, solid-group RAR (`m1`/`m3`).
+- `archiveTar`/`archiveZip`/`CompressedArchive(tar.gz)`/`archiveRar`/
+  `archiveSz` plus matching extract walks over many small files and
+  single text: container overhead, per-file codec cost, solid-group RAR
+  (`m1`/`m3`), STORE + LZMA2-solid 7z (`meth 0`/`1`).
 - File streaming (`compressFile`/`decompressFile`) on a temp file to show
   bounded memory vs the one-shot path.
 
