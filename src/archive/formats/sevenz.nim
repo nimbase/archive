@@ -2,21 +2,28 @@
 ##
 ## Covers the 7z container from the public 7zFormat.txt / Methods.txt spec
 ## plus the zesven specification pages as oracle (no 7-Zip sources used):
-## signature, plain headers, property-ID walk, Pack/Unpack/SubStreams/
-## Files info, folder/coder/bind-pair validation, substream slicing, and
-## the Copy coder. LZMA/LZMA2 decode, filters and AES arrive in follow-ups
-## (explicit unsupported-method / password-required errors meanwhile).
-## The writer emits STORE-only archives with plain headers (one Copy
-## folder per file); bsdtar and 7zz both extract its output.
+## signature, plain + encoded headers, property-ID walk, Pack/Unpack/
+## SubStreams/Files info, folder/coder/bind-pair validation, substream
+## slicing, and folder decode for Copy, LZMA, LZMA2, Delta, BCJ-x86 and
+## 7zAES. PPMd and BCJ2 refuse cleanly with explicit errors.
+## The writer emits STORE archives (meth 0, default: one Copy folder per
+## data file) or LZMA2-solid archives (meth 1: shared LZMA2 folders up to
+## 8MiB solid data each, fast greedy match finder, 1MiB dictionary).
+## Plain headers; bsdtar and 7zz both extract either output.
 ##
 ## Memory: header parsing is bounded (64MB header cap); STORE bodies are
-## borrowed spans, never copied. No globals, all state on the stack or
-## per-call. Passwords flow per call (the `Sz` value is per-call).
+## borrowed spans, never copied. Decoded folders are owned per-call
+## strings bounded by max7zUnpackedBytes. No globals, all state on the
+## stack or per-call. Passwords flow per call (the `Sz` value is per-call).
 
 import std/[times, strutils]
 from std/os import splitFile
 import ../types
 import ../crc32
+import ./szlzma
+import ./szlzmenc
+import ./szfilter
+import ./szaes
 
 type SzError* = object of ArchiveError
 type SzCodecError* = object of ArchiveError
@@ -33,9 +40,12 @@ const
     ## Max nested encoded headers (spec MUST reject beyond 4).
 
 type Sz* = object
-  ## 7z archive options. `password` enables AES-256 decryption on read
-  ## once the AES phase lands; for now encrypted entries raise an
-  ## explicit error. The value itself is per-call, never global.
+  ## 7z archive options. `password` enables 7zAES decryption on read
+  ## (content and headers); empty means no encryption. `meth` selects
+  ## the file codec on write: 0 = STORE (default, one Copy folder per
+  ## data file), 1 = LZMA2-solid (fast level, files share one LZMA2
+  ## folder per ≤8MiB group). The value itself is per-call, never global.
+  meth*: int
   password*: string
   continueOnError*: bool
 
@@ -678,7 +688,7 @@ proc parseSubStreams(inp: Input; arch: SzArchive): seq[seq[SzSubAssign]] =
         crc: crcsPerFolder[fi][si].crc))
       off += sizesPerFolder[fi][si]
 
-# ---------- folder decode (Copy only in this phase) ----------
+# ---------- folder decode ----------
 
 proc folderPackedCount(f: SzFolder): int =
   var totalIn = 0
@@ -715,28 +725,185 @@ proc resolvePackSpan(inp: Input; arch: SzArchive; fi: int): Span =
     raise newException(SzError, "7z: pack stream out of range")
   spanAt(inp, int(off), int(size))
 
+proc packBytesOf(inp: Input; arch: SzArchive; fi: int): string =
+  ## Owned copy of a folder's single pack stream (for decoders).
+  let f = arch.folders[fi]
+  if folderPackedCount(f) != 1:
+    raise newException(SzError, "7z: multi-stream folder unsupported")
+  var packIdx: int
+  if f.packIdx.len > 0:
+    if f.packIdx.len != 1:
+      raise newException(SzError, "7z: bad packed indices")
+    packIdx = f.packIdx[0]
+  else:
+    packIdx = folderPackBase(arch, fi)
+  if packIdx < 0 or packIdx >= arch.packOff.len:
+    raise newException(SzError, "7z: pack index out of range")
+  let off = arch.packOff[packIdx]
+  let size = arch.packSizes[packIdx]
+  if off + size > uint64(inputLen(inp)) or off < 32:
+    raise newException(SzError, "7z: pack stream out of range")
+  if size > uint64(high(int)):
+    raise newException(SzError, "7z: pack stream too large")
+  let s = spanAt(inp, int(off), int(size))
+  result = newString(int(size))
+  if size > 0:
+    copyMem(addr result[0], s.p, int(size))
+  if arch.packHasCrc[packIdx] and size > 0:
+    let got = crc32Update(0xFFFFFFFF'u32, result) xor 0xFFFFFFFF'u32
+    if got != arch.packCrcs[packIdx]:
+      raise newException(SzError, "7z: data crc mismatch (pack stream)")
+
+proc isCopyId(id: string): bool = id == "\x00"
+proc isLzmaId(id: string): bool =
+  id.len == 3 and ord(id[0]) == 0x03 and ord(id[1]) == 0x01 and
+    ord(id[2]) == 0x01
+proc isLzma2Id(id: string): bool = id == "\x21"
+proc isDeltaId(id: string): bool = id == "\x03"
+proc isBcjId(id: string): bool =
+  id == "\x04" or (id.len == 4 and ord(id[0]) == 0x03 and
+    ord(id[1]) == 0x03 and ord(id[2]) == 0x01 and ord(id[3]) == 0x03)
+
 proc classifyFolder(f: SzFolder; z: Sz): string =
-  ## "" when this folder is directly decodable (single Copy coder);
-  ## otherwise the open-time error message (AES vs unsupported coder).
+  ## "" when this folder's chain is decodable in v1 (Copy, LZMA, LZMA2,
+  ## Delta, BCJ-x86, AES); otherwise the open-time error message.
   ## Structural problems still raise immediately.
   var totalOut = 0
+  var totalIn = 0
   for c in f.coders:
+    if c.complex or c.numIn != 1 or c.numOut != 1:
+      return "7z: unsupported method " & coderIdName(c.id)
     totalOut += c.numOut
+    totalIn += c.numIn
   if f.unpackSizes.len != totalOut:
     raise newException(SzError, "7z: bad folder unpack sizes")
+  if totalIn - (totalOut - 1) != 1:
+    return "7z: unsupported coder chain"
+  # linear binds check: (1,0),(2,1),...
+  if f.coders.len > 1:
+    if f.binds.len != f.coders.len - 1:
+      raise newException(SzError, "7z: bad bind pairs")
+    for i in 0 ..< f.binds.len:
+      if f.binds[i].inIdx != i + 1 or f.binds[i].outIdx != i:
+        return "7z: unsupported coder chain"
   for c in f.coders:
     if isAesCoder(c.id):
       if z.password == "":
         return "7z: password required"
-      return "7z: AES decryption not supported yet"
-  if f.coders.len == 1 and not f.coders[0].complex and
-      f.coders[0].id == "\x00" and f.coders[0].props.len == 0 and
-      f.coders[0].numIn == 1 and f.coders[0].numOut == 1:
-    return ""
-  for c in f.coders:
-    if c.id != "\x00":
+      continue
+    elif isCopyId(c.id) or isLzmaId(c.id) or isLzma2Id(c.id) or
+        isDeltaId(c.id) or isBcjId(c.id):
+      continue
+    else:
       return "7z: unsupported method " & coderIdName(c.id)
-  return "7z: unsupported coder chain"
+  ""
+
+proc decodeFolder(inp: Input; arch: SzArchive; fi: int; z: Sz;
+    ctx: ArchiveContext): string =
+  ## Decode one folder to an owned string. Validates linear binds,
+  ## applies coders in order, enforces caps, verifies folder CRC.
+  let f = arch.folders[fi]
+  for c in f.coders:
+    if c.complex or c.numIn != 1 or c.numOut != 1:
+      raise newException(SzError, "7z: unsupported method " &
+        coderIdName(c.id))
+  if f.unpackSizes.len != f.coders.len:
+    raise newException(SzError, "7z: bad folder unpack sizes")
+  if f.coders.len > 1:
+    if f.binds.len != f.coders.len - 1:
+      raise newException(SzError, "7z: bad bind pairs")
+    for i in 0 ..< f.binds.len:
+      if f.binds[i].inIdx != i + 1 or f.binds[i].outIdx != i:
+        raise newException(SzError, "7z: unsupported coder chain")
+  if folderPackedCount(f) != 1:
+    raise newException(SzError, "7z: multi-stream folder unsupported")
+  var data = packBytesOf(inp, arch, fi)
+  for ci, c in f.coders:
+    let want = int64(f.unpackSizes[ci])
+    if want < 0:
+      raise newException(SzError, "7z: bad unpack size")
+    if ctx.max7zUnpackedBytes != 0 and want > ctx.max7zUnpackedBytes:
+      raise newException(SzError, "7z: entry exceeds unpack cap")
+    if isCopyId(c.id):
+      if c.props.len != 0:
+        raise newException(SzError, "7z: bad copy props")
+      if data.len.int64 != want:
+        raise newException(SzError, "7z: copy size mismatch")
+    elif isAesCoder(c.id):
+      if z.password == "":
+        raise newException(SzError, "7z: password required")
+      var salt: seq[byte]
+      var iv: array[16, byte]
+      var power: int
+      try:
+        let p = parseAesProps(c.props)
+        salt = p.salt
+        iv = p.iv
+        power = p.power
+      except CatchableError as e:
+        raise newException(SzError, "7z: bad aes props: " & e.msg)
+      var key: array[32, byte]
+      try:
+        key = deriveAesKey(z.password, salt, power)
+      except CatchableError as e:
+        raise newException(SzError, "7z: " & e.msg)
+      try:
+        data = aesCbcDecryptTrunc(key, iv, data, int(want))
+      except CatchableError as e:
+        raise newException(SzError, "7z: aes decrypt failed: " & e.msg)
+    elif isLzma2Id(c.id):
+      if c.props.len != 1:
+        raise newException(SzError, "7z: bad lzma2 props")
+      try:
+        data = lzma2Decode(data, int(want), byte(ord(c.props[0])),
+          ctx.max7zDictBytes)
+      except LzmaError as e:
+        raise newException(SzError, e.msg)
+      except CatchableError as e:
+        raise newException(SzError, "7z: lzma2 failed: " & e.msg)
+    elif isLzmaId(c.id):
+      try:
+        data = lzma1Decode(c.props, data, int(want),
+          ctx.max7zDictBytes)
+      except LzmaError as e:
+        raise newException(SzError, e.msg)
+      except CatchableError as e:
+        raise newException(SzError, "7z: lzma failed: " & e.msg)
+    elif isDeltaId(c.id):
+      var dist = 1
+      try:
+        dist = deltaDistance(c.props)
+      except CatchableError as e:
+        raise newException(SzError, "7z: " & e.msg)
+      if data.len.int64 != want:
+        raise newException(SzError, "7z: delta size mismatch")
+      try:
+        deltaDecode(data, dist)
+      except CatchableError as e:
+        raise newException(SzError, "7z: " & e.msg)
+    elif isBcjId(c.id):
+      var startOff = 0'u32
+      try:
+        startOff = bcjStartOffset(c.props)
+      except CatchableError as e:
+        raise newException(SzError, "7z: " & e.msg)
+      if data.len.int64 != want:
+        raise newException(SzError, "7z: bcj size mismatch")
+      try:
+        bcjX86Decode(data, startOff)
+      except CatchableError as e:
+        raise newException(SzError, "7z: " & e.msg)
+    else:
+      raise newException(SzError, "7z: unsupported method " &
+        coderIdName(c.id))
+  if f.hasCrc and data.len > 0:
+    let got = crc32Update(0xFFFFFFFF'u32, data) xor 0xFFFFFFFF'u32
+    if got != f.folderCrc:
+      raise newException(SzError, "7z: data crc mismatch (folder)")
+  elif f.hasCrc and data.len == 0:
+    if 0'u32 != f.folderCrc:
+      raise newException(SzError, "7z: data crc mismatch (folder)")
+  data
 
 proc verifySpanCrc(s: Span; expect: uint32; what: string) =
   let got = if s.len == 0: 0x00000000'u32
@@ -744,9 +911,21 @@ proc verifySpanCrc(s: Span; expect: uint32; what: string) =
   if got != expect:
     raise newException(SzError, "7z: data crc mismatch" & what)
 
+proc verifyStringCrc(data: string; subOff, subLen: int; expect: uint32;
+    what: string) =
+  let got =
+    if subLen == 0: 0x00000000'u32
+    elif subOff < 0 or subLen < 0 or subOff + subLen > data.len:
+      raise newException(SzError, "7z: substream out of range")
+    else:
+      var d = data
+      crc32Update(0xFFFFFFFF'u32,
+        addr d[subOff], subLen) xor 0xFFFFFFFF'u32
+  if got != expect:
+    raise newException(SzError, "7z: data crc mismatch" & what)
+
 proc errOpener(msg: string): proc(): Input {.closure.} =
-  ## Opener factory that fails explicitly on open (decoder lands in a
-  ## later phase; listing stays cheap). Fresh bindings per call.
+  ## Opener factory that fails explicitly on open (listing stays cheap).
   let m = msg
   result = proc(): Input {.closure.} =
     raise newException(SzError, m)
@@ -759,23 +938,6 @@ proc storeOpener(s: Span; keep: Input; crc: uint32; hasCrc: bool;
     if hasCrc:
       verifySpanCrc(sp, crc, what)
     openInputView(sp, kp)
-
-proc folderSpan(inp: Input; arch: SzArchive; fi: int; z: Sz): Span =
-  ## Decoded folder output as a borrowed span. Only Copy folders decode
-  ## in this phase; anything else raises the classifier message.
-  let f = arch.folders[fi]
-  let err = classifyFolder(f, z)
-  if err != "":
-    raise newException(SzError, err)
-  let pspan = resolvePackSpan(inp, arch, fi)
-  let packIdx =
-    if f.packIdx.len > 0: f.packIdx[0]
-    else: folderPackBase(arch, fi)
-  if arch.packHasCrc[packIdx] and pspan.len > 0:
-    verifySpanCrc(pspan, arch.packCrcs[packIdx], " (pack stream)")
-  if uint64(pspan.len) != f.unpackSizes[0]:
-    raise newException(SzError, "7z: copy size mismatch")
-  pspan
 
 proc assignSubstreams(entries: var seq[SzFileEntry]; dataIdx: seq[int];
     subs: seq[seq[SzSubAssign]]; ctx: ArchiveContext) =
@@ -1058,38 +1220,120 @@ proc walkHeader(inp: Input; ctx: ArchiveContext; base: uint64): SzArchive =
   elif result.folders.len > 0:
     raise newException(SzError, "7z: files info missing")
   # else: empty archive (no files, no folders).
+proc parseEncodedHeaderFolder(inp: Input; hinp: Input; ctx: ArchiveContext;
+    z: Sz): string =
+  ## Parse 0x17 PackInfo/UnpackInfo after the marker, decode the single
+  ## folder to owned header bytes. `inp` is the whole file (pack source).
+  var tmp = SzArchive()
+  if remaining(hinp) <= 0:
+    raise newException(SzError, "7z: truncated encoded header")
+  if readByte(hinp) != 0x06:
+    raise newException(SzError, "7z: bad encoded header")
+  parsePackInfo(hinp, 32, tmp)
+  if remaining(hinp) <= 0 or readByte(hinp) != 0x07:
+    raise newException(SzError, "7z: bad encoded header")
+  parseUnpackInfo(hinp, tmp)
+  if remaining(hinp) <= 0 or readByte(hinp) != 0x00:
+    raise newException(SzError, "7z: bad encoded header terminator")
+  if tmp.folders.len != 1:
+    raise newException(SzError, "7z: unsupported encoded header")
+  # Bound decoded header size before allocating (last unpack size is
+  # the folder output; AES chains have 2).
+  if tmp.folders[0].unpackSizes.len == 0:
+    raise newException(SzError, "7z: bad encoded header sizes")
+  let want = tmp.folders[0].unpackSizes[^1]
+  if want == 0 or want > uint64(szMaxHeaderBytes):
+    raise newException(SzError, "7z: bad header size")
+  if ctx.max7zHeaderBytes != 0 and want > uint64(ctx.max7zHeaderBytes):
+    raise newException(SzError, "7z: header exceeds cap")
+  try:
+    result = decodeFolder(inp, tmp, 0, z, ctx)
+  except SzError as e:
+    # Missing password surfaces as password-required, not generic.
+    raise e
+  if result.len.uint64 != want:
+    raise newException(SzError, "7z: header size mismatch")
+
+proc parseHeaderFromInput(hinp: Input; inp: Input; ctx: ArchiveContext;
+    z: Sz; depth: int): SzArchive =
+  ## Parse header bytes (plain or encoded-recursive). `hinp` is the
+  ## header view, `inp` the whole file for encoded pack resolution.
+  if depth > szMaxFolderDepth:
+    raise newException(SzError, "7z: header nesting too deep")
+  if remaining(hinp) <= 0:
+    raise newException(SzError, "7z: truncated header")
+  let first = readByte(hinp)
+  if first == 0x01:
+    seek(hinp, 0)
+    result = walkHeader(hinp, ctx, 32)
+    if inputPos(hinp) != inputLen(hinp):
+      discard # trailing tolerated (forward compat)
+  elif first == 0x17:
+    let inner = parseEncodedHeaderFolder(inp, hinp, ctx, z)
+    let innerInp = openInputString(inner)
+    result = parseHeaderFromInput(innerInp, inp, ctx, z, depth + 1)
+  else:
+    raise newException(SzError, "7z: bad header id")
+
 # ---------- extraction walk ----------
 
 proc extractSz*(z: Sz; ctx: ArchiveContext; inp: Input;
     handle: FileHandler) =
-  ## Walk entries in archive order. Compressed (non-Copy) folders raise
-  ## unsupported-method until the LZMA phases land; AES raises
-  ## password-required / unsupported. Symlink targets resolve from the
-  ## folder stream at walk time (STORE only for now).
+  ## Walk entries in archive order. Folders decode on first use and are
+  ## cached per call (solid sharing); decode failures surface on open
+  ## with explicit unsupported-method / password-required errors.
+  ## Symlink targets resolve from the folder output at walk time.
   ctx.checkCancelled()
   if remaining(inp) < 32:
     raise newException(SzError, "7z: truncated signature")
   let (headOff, headSize, headCrc) = parseSignature(inp, ctx)
-  let hinp = headerInput(inp, headOff, headSize)
-  if remaining(hinp) <= 0:
-    raise newException(SzError, "7z: truncated header")
-  let first = readByte(hinp)
-  if first == 0x17:
-    raise newException(SzError,
-      "7z: packed headers unsupported (need LZMA2 phase)")
-  elif first != 0x01:
-    raise newException(SzError, "7z: bad header id")
-  seek(hinp, 0)
-  var arch = walkHeader(hinp, ctx, 32)
-  if inputPos(hinp) != inputLen(hinp):
-    # Trailing bytes after 0x00 end marker: tolerated (forward compat).
-    discard
-  # NextHeaderCRC from the signature covers the raw header bytes.
+  let hout = headerInput(inp, headOff, headSize)
+  # Verify outer header CRC before any decode (fail fast).
   let hs = spanAt(inp, int(32 + headOff), int(headSize))
   let hgot = if hs.len == 0: 0x00000000'u32
     else: crc32Update(0xFFFFFFFF'u32, hs.p, hs.len) xor 0xFFFFFFFF'u32
   if hgot != headCrc.uint32:
     raise newException(SzError, "7z: header CRC mismatch")
+  var arch = parseHeaderFromInput(hout, inp, ctx, z, 0)
+  # Folder cache: decoded outputs + open-time errors.
+  var folderOut = newSeq[string](arch.folders.len)
+  var folderErr = newSeq[string](arch.folders.len)
+  var folderDone = newSeq[bool](arch.folders.len)
+  var folderIsStore = newSeq[bool](arch.folders.len)
+  var folderStoreSpan = newSeq[Span](arch.folders.len)
+  for fi in 0 ..< arch.folders.len:
+    let err = classifyFolder(arch.folders[fi], z)
+    if err != "":
+      folderErr[fi] = err
+      folderDone[fi] = true
+      continue
+    # Single Copy folder stays zero-copy; others decode on first use.
+    let f = arch.folders[fi]
+    if f.coders.len == 1 and isCopyId(f.coders[0].id):
+      try:
+        let ps = resolvePackSpan(inp, arch, fi)
+        var packIdx =
+          if f.packIdx.len > 0: f.packIdx[0]
+          else: folderPackBase(arch, fi)
+        if arch.packHasCrc[packIdx] and ps.len > 0:
+          verifySpanCrc(ps, arch.packCrcs[packIdx], " (pack stream)")
+        if uint64(ps.len) != f.unpackSizes[0]:
+          raise newException(SzError, "7z: copy size mismatch")
+        folderIsStore[fi] = true
+        folderStoreSpan[fi] = ps
+        folderDone[fi] = true
+      except SzError as e:
+        folderErr[fi] = e.msg
+        folderDone[fi] = true
+    # else: lazy decode below
+  proc ensureFolder(fi: int) =
+    if folderDone[fi]:
+      return
+    folderDone[fi] = true
+    try:
+      folderOut[fi] = decodeFolder(inp, arch, fi, z, ctx)
+    except SzError as e:
+      folderErr[fi] = e.msg
   var index = 0
   for fe in arch.files:
     ctx.checkCancelled()
@@ -1112,32 +1356,93 @@ proc extractSz*(z: Sz; ctx: ArchiveContext; inp: Input;
       {.gcsafe.}:
         handle(ctx, fi)
       continue
-    let coderErr = classifyFolder(arch.folders[fe.folderIdx], z)
-    if coderErr != "":
-      # Decoder lands later: listing works, opening fails explicitly.
-      # Symlink targets of compressed folders are unknown until decode.
+    let fiIdx = fe.folderIdx
+    if fiIdx < 0 or fiIdx >= arch.folders.len:
+      raise newException(SzError, "7z: folder index out of range")
+    if folderIsStore[fiIdx]:
+      let fspan = folderStoreSpan[fiIdx]
+      if fe.subOff + fe.subLen > uint64(fspan.len):
+        raise newException(SzError, "7z: substream out of range")
+      let sub = Span(p: cast[pointer](cast[int](fspan.p) + int(fe.subOff)),
+        len: int(fe.subLen))
+      if fe.isSymlink:
+        var target = newString(sub.len)
+        if sub.len > 0:
+          copyMem(addr target[0], sub.p, sub.len)
+        let fi = FileInfo(meta: meta, nameInArchive: fe.name,
+          linkTarget: target, open: stringOpener(""))
+        {.gcsafe.}:
+          handle(ctx, fi)
+        continue
+      let opener = storeOpener(sub, inp, fe.dataCrc, fe.hasCrc,
+        " (" & fe.name & ")")
       let fi = FileInfo(meta: meta, nameInArchive: fe.name,
-        linkTarget: "", open: errOpener(coderErr))
+        linkTarget: "", open: opener)
       {.gcsafe.}:
         handle(ctx, fi)
       continue
-    let fspan = folderSpan(inp, arch, fe.folderIdx, z)
-    if fe.subOff + fe.subLen > uint64(fspan.len):
-      raise newException(SzError, "7z: substream out of range")
-    let sub = Span(p: cast[pointer](cast[int](fspan.p) + int(fe.subOff)),
-      len: int(fe.subLen))
+    # Compressed folder.
+    if folderDone[fiIdx] and folderErr[fiIdx] != "":
+      let fi = FileInfo(meta: meta, nameInArchive: fe.name,
+        linkTarget: "", open: errOpener(folderErr[fiIdx]))
+      {.gcsafe.}:
+        handle(ctx, fi)
+      continue
     if fe.isSymlink:
-      # Target path is the file data (UTF-8).
-      var target = newString(sub.len)
-      if sub.len > 0:
-        copyMem(addr target[0], sub.p, sub.len)
+      # Target needed at walk time: decode now.
+      ensureFolder(fiIdx)
+      if folderErr[fiIdx] != "":
+        let fi = FileInfo(meta: meta, nameInArchive: fe.name,
+          linkTarget: "", open: errOpener(folderErr[fiIdx]))
+        {.gcsafe.}:
+          handle(ctx, fi)
+        continue
+      let outp = folderOut[fiIdx]
+      if fe.subOff + fe.subLen > uint64(outp.len):
+        raise newException(SzError, "7z: substream out of range")
+      var target = newString(int(fe.subLen))
+      if fe.subLen > 0:
+        var o = outp
+        copyMem(addr target[0], addr o[int(fe.subOff)],
+          int(fe.subLen))
       let fi = FileInfo(meta: meta, nameInArchive: fe.name,
         linkTarget: target, open: stringOpener(""))
       {.gcsafe.}:
         handle(ctx, fi)
       continue
-    let opener = storeOpener(sub, inp, fe.dataCrc, fe.hasCrc,
-      " (" & fe.name & ")")
+    # Regular file: lazy decode on open, cached per folder.
+    let fOut = addr folderOut
+    let fErr = addr folderErr
+    let fDone = addr folderDone
+    let subOff = int(fe.subOff)
+    let subLen = int(fe.subLen)
+    let dcrc = fe.dataCrc
+    let dhas = fe.hasCrc
+    let wmsg = " (" & fe.name & ")"
+    let whatArch = addr arch
+    let opener = proc(): Input {.closure.} =
+      if not fDone[][fiIdx]:
+        fDone[][fiIdx] = true
+        try:
+          fOut[][fiIdx] = decodeFolder(inp, whatArch[] , fiIdx, z, ctx)
+        except SzError as e:
+          fErr[][fiIdx] = e.msg
+      if fErr[][fiIdx] != "":
+        raise newException(SzError, fErr[][fiIdx])
+      let outp = fOut[][fiIdx]
+      if subOff < 0 or subLen < 0 or subOff + subLen > outp.len:
+        raise newException(SzError, "7z: substream out of range")
+      if dhas:
+        verifyStringCrc(outp, subOff, subLen, dcrc, wmsg)
+      if subLen == 0:
+        return openInputString("")
+      # Owned copy via intermediate var (addr on var is stable;
+      # unsafeAddr on a let index can yield a temporary). One extra
+      # copy per open, bounded by entry size.
+      var sl = newString(subLen)
+      var o = outp
+      copyMem(addr sl[0], addr o[subOff], subLen)
+      openInputCopy(unsafeAddr sl[0], sl.len)
     let fi = FileInfo(meta: meta, nameInArchive: fe.name,
       linkTarget: "", open: opener)
     {.gcsafe.}:
@@ -1156,11 +1461,273 @@ proc modeForWrite(f: FileInfo; isDir, isSymlink: bool): int =
       m = m or (if isDir: 0o40000 elif isSymlink: 0o120000 else: 0o100000)
   m
 
+type SzPend = object
+  arcName: string
+  mode: int
+  modTime: Time
+  isDir: bool
+  isSymlink: bool
+  isRegular: bool
+  raw: string
+  crc: uint32
+
+proc collectSzPend(ctx: ArchiveContext;
+    files: seq[FileInfo]): seq[SzPend] =
+  var keeps: seq[Input] = @[]
+  for i, f in files:
+    ctx.checkCancelled()
+    var arcName = f.nameInArchive
+    if arcName == "":
+      arcName = f.name
+    arcName = arcName.replace('\\', '/')
+    while arcName.startsWith("/"):
+      arcName = arcName[1 .. ^1]
+    while arcName.startsWith("./"):
+      arcName = arcName[2 .. ^1]
+    if arcName == "" or arcName == ".":
+      continue
+    if f.meta.isDir:
+      while arcName.endsWith("/") and arcName.len > 1:
+        arcName = arcName[0 ..< ^1]
+      result.add(SzPend(arcName: arcName & "/", mode: modeForWrite(f,
+        true, false), modTime: f.meta.modTime, isDir: true))
+    elif f.meta.isSymlink:
+      result.add(SzPend(arcName: arcName, mode: modeForWrite(f, false,
+        true), modTime: f.meta.modTime, isSymlink: true,
+        raw: f.linkTarget,
+        crc: crc32Update(0xFFFFFFFF'u32, f.linkTarget) xor
+          0xFFFFFFFF'u32))
+    elif f.meta.isRegular:
+      var fr: Input
+      {.gcsafe.}:
+        fr = f.open()
+      keeps.add(fr)
+      let content = readSpan(fr, remaining(fr))
+      var raw = newString(content.len)
+      if content.len > 0:
+        copyMem(addr raw[0], content.p, content.len)
+      let c = if raw.len == 0: 0'u32
+        else: crc32Update(0xFFFFFFFF'u32, unsafeAddr raw[0],
+          raw.len) xor 0xFFFFFFFF'u32
+      result.add(SzPend(arcName: arcName, mode: modeForWrite(f, false,
+        false), modTime: f.meta.modTime, isRegular: true, raw: raw,
+        crc: c))
+    else:
+      continue # hardlinks/fifos: skipped like the generic extractor
+    ctx.reportProgress(arcName, i, files.len,
+      if result[^1].isRegular: result[^1].raw.len.int64 else: 0)
+
+proc writeSzFilesInfo(hdr: Output; pend: seq[SzPend]) =
+  ## Shared FilesInfo writer (names, mtimes, attrs, empty bitmaps).
+  writeByte(hdr, char(0x05))
+  writeNum(hdr, pend.len.uint64)
+  var hasEmpty = false
+  for p in pend:
+    if p.isDir or p.raw.len == 0:
+      hasEmpty = true
+      break
+  if hasEmpty:
+    var bits = newSeq[byte]((pend.len + 7) div 8)
+    for i, p in pend:
+      if p.isDir or p.raw.len == 0:
+        bits[i div 8] = bits[i div 8] or byte(1 shl (7 - (i mod 8)))
+    writeByte(hdr, char(0x0E))
+    writeNum(hdr, bits.len.uint64)
+    for b in bits:
+      writeByte(hdr, char(b))
+    var ecount = 0
+    for p in pend:
+      if p.isDir or p.raw.len == 0:
+        inc ecount
+    var ebits = newSeq[byte]((ecount + 7) div 8)
+    var ei = 0
+    for p in pend:
+      if p.isDir or p.raw.len == 0:
+        if p.isRegular:
+          ebits[ei div 8] = ebits[ei div 8] or byte(1 shl (7 - (ei mod 8)))
+        inc ei
+    writeByte(hdr, char(0x0F))
+    writeNum(hdr, ebits.len.uint64)
+    for b in ebits:
+      writeByte(hdr, char(b))
+  if pend.len > 0:
+    var nout = newOutput()
+    for p in pend:
+      let u16 = utf8ToUtf16le(p.arcName)
+      if u16.len > 0:
+        writeBytes(nout, unsafeAddr u16[0], u16.len)
+      wrU16le(nout, 0)
+    let nb = outputBytes(nout)
+    writeByte(hdr, char(0x11))
+    writeNum(hdr, (nb.len + 1).uint64)
+    writeByte(hdr, char(0x00))
+    if nb.len > 0:
+      writeBytes(hdr, nb.p, nb.len)
+    writeByte(hdr, char(0x14))
+    writeNum(hdr, (2 + 8 * pend.len).uint64)
+    writeByte(hdr, char(0x01))
+    writeByte(hdr, char(0x00))
+    for p in pend:
+      wrU64le(hdr, timeToFiletime(p.modTime))
+    writeByte(hdr, char(0x15))
+    writeNum(hdr, (2 + 4 * pend.len).uint64)
+    writeByte(hdr, char(0x01))
+    writeByte(hdr, char(0x00))
+    for p in pend:
+      let win = if p.isDir: 0x8010'u32 else: 0x8020'u32
+      wrU32le(hdr, (p.mode.uint32 shl 16) or win)
+  writeByte(hdr, char(0x00))
+  writeByte(hdr, char(0x00))
+
+proc writeSzSignature(dst: Output; packBytes, hstr: string) =
+  let hCrc = crc32Update(0xFFFFFFFF'u32, hstr) xor 0xFFFFFFFF'u32
+  var start = newOutput()
+  wrU64le(start, packBytes.len.uint64)
+  wrU64le(start, hstr.len.uint64)
+  wrU32le(start, hCrc)
+  let sb = outputBytes(start)
+  var startBytes = newString(sb.len)
+  copyMem(addr startBytes[0], sb.p, sb.len)
+  let sCrc = crc32Update(0xFFFFFFFF'u32, startBytes) xor 0xFFFFFFFF'u32
+  for c in szMagic:
+    writeByte(dst, c)
+  writeByte(dst, char(0))
+  writeByte(dst, char(4))
+  wrU32le(dst, sCrc)
+  writeBytes(dst, unsafeAddr startBytes[0], startBytes.len)
+  if packBytes.len > 0:
+    var pb = packBytes
+    writeBytes(dst, addr pb[0], pb.len)
+  if hstr.len > 0:
+    var hs = hstr
+    writeBytes(dst, addr hs[0], hs.len)
+
+proc curLenOf(pend: seq[SzPend]; g: seq[int]): int =
+  result = 0
+  for ei in g:
+    result += pend[ei].raw.len
+
+proc archiveSzLzma2*(z: Sz; ctx: ArchiveContext; dst: Output;
+    files: seq[FileInfo]) =
+  ## LZMA2-solid writer: data files share LZMA2 folders (≤8MiB solid
+  ## data each, file-aligned). Plain headers, per-substream CRCs.
+  ctx.checkCancelled()
+  let pend = collectSzPend(ctx, files)
+  # Group consecutive data entries (raw.len > 0) into ≤8MiB folders.
+  const maxGroup = 8 * 1024 * 1024
+  var groups: seq[seq[int]] = @[]
+  var cur: seq[int] = @[]
+  var curLen = 0
+  for i, p in pend:
+    if p.raw.len == 0:
+      continue
+    if cur.len > 0 and curLen + p.raw.len > maxGroup:
+      groups.add(cur)
+      cur = @[]
+      curLen = 0
+    cur.add(i)
+    curLen += p.raw.len
+  if cur.len > 0:
+    groups.add(cur)
+  # Encode groups.
+  var packOut = newOutput()
+  var groupPack: seq[string] = @[]
+  var groupSolid: seq[int] = @[]
+  for gi, g in groups:
+    var solid = newString(curLenOf(pend, g))
+    var o = 0
+    for ei in g:
+      if pend[ei].raw.len > 0:
+        var src = pend[ei].raw
+        copyMem(addr solid[o], addr src[0], src.len)
+        o += src.len
+    var pack: string
+    try:
+      pack = lzma2EncodeSolid(solid, byte(0x10),
+        ctx.max7zDictBytes)
+    except CatchableError as e:
+      raise newException(SzError, "7z: lzma2 encode failed: " & e.msg)
+    groupPack.add(pack)
+    groupSolid.add(solid.len)
+    if pack.len > 0:
+      var pp = pack
+      writeBytes(packOut, addr pp[0], pp.len)
+    ctx.reportProgress(pend[g[0]].arcName, gi, groups.len,
+      solid.len.int64)
+  let packSpan = outputBytes(packOut)
+  var packBytes = newString(packSpan.len)
+  if packSpan.len > 0:
+    copyMem(addr packBytes[0], packSpan.p, packSpan.len)
+  # Header.
+  var hdr = newOutput()
+  writeByte(hdr, char(0x01))
+  if groups.len > 0:
+    writeByte(hdr, char(0x04))
+    writeByte(hdr, char(0x06))
+    writeNum(hdr, 0)
+    writeNum(hdr, groups.len.uint64)
+    writeByte(hdr, char(0x09))
+    for p in groupPack:
+      writeNum(hdr, p.len.uint64)
+    writeByte(hdr, char(0x00))
+    writeByte(hdr, char(0x07))
+    writeByte(hdr, char(0x0B))
+    writeNum(hdr, groups.len.uint64)
+    writeByte(hdr, char(0x00))
+    for gi in 0 ..< groups.len:
+      writeNum(hdr, 1)
+      writeByte(hdr, char(0x21))
+      writeByte(hdr, char(0x21))
+      writeNum(hdr, 1)
+      writeByte(hdr, char(0x10))
+    writeByte(hdr, char(0x0C))
+    for s in groupSolid:
+      writeNum(hdr, s.uint64)
+    writeByte(hdr, char(0x00))
+    # SubStreams: counts (only when a folder holds >1 file), sizes,
+    # and one AllAreDefined CRC list (mirrors 7z's own layout).
+    writeByte(hdr, char(0x08))
+    var needCounts = false
+    for g in groups:
+      if g.len > 1:
+        needCounts = true
+        break
+    if needCounts:
+      writeByte(hdr, char(0x0D))
+      for g in groups:
+        writeNum(hdr, g.len.uint64)
+      writeByte(hdr, char(0x09))
+      for g in groups:
+        for k in 0 ..< g.len - 1:
+          writeNum(hdr, pend[g[k]].raw.len.uint64)
+    writeByte(hdr, char(0x0A))
+    writeByte(hdr, char(0x01))
+    for g in groups:
+      for ei in g:
+        wrU32le(hdr, pend[ei].crc)
+    writeByte(hdr, char(0x00))
+    writeByte(hdr, char(0x00))
+  writeSzFilesInfo(hdr, pend)
+  # FilesInfo writer ends with FilesInfo 0x00 + header 0x00;
+  # MainStreamsInfo was already closed above.
+  let hb = outputBytes(hdr)
+  var hstr = newString(hb.len)
+  if hb.len > 0:
+    copyMem(addr hstr[0], hb.p, hb.len)
+  writeSzSignature(dst, packBytes, hstr)
+  discard z
+
 proc archiveSz*(z: Sz; ctx: ArchiveContext; dst: Output;
     files: seq[FileInfo]) =
-  ## STORE-only writer: one Copy folder + one pack stream per data file,
-  ## plain headers. Dirs and empty files carry no streams. Symlinks store
-  ## the UTF-8 target as file data with a symlink mode.
+  ## Writer dispatcher: meth 0 = STORE (one Copy folder per data file),
+  ## meth 1 = LZMA2-solid (fast level, shared folders). Plain headers.
+  ## Dirs and empty files carry no streams. Symlinks store the UTF-8
+  ## target as file data with a symlink mode.
+  if z.meth == 1:
+    archiveSzLzma2(z, ctx, dst, files)
+    return
+  elif z.meth != 0:
+    raise newException(SzError, "7z: unknown write method")
   ctx.checkCancelled()
   type SzPending = object
     arcName: string
