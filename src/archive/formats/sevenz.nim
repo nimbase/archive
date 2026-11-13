@@ -56,6 +56,12 @@ type Sz* = object
     ## Header-encrypted write (`-mhe=on` equivalent): the writer
     ## compresses (LZMA2) and AES-encrypts the header; readers need the
     ## password to list, like RAR HEAD_CRYPT. Requires `password`.
+  useFilters*: bool
+    ## Auto filters on write: when true, the LZMA2-solid writer tries
+    ## Delta forward transforms (distances 1 and 4) per solid group and
+    ## keeps the smallest packing (fallback to filter-free when nothing
+    ## wins). Default false preserves existing behavior and speed.
+    ## (BCJ forward is a follow-up; BCJ decode already works.)
   continueOnError*: bool
 
 proc extension*(z: Sz): ArchiveFormat = af7z
@@ -1710,7 +1716,8 @@ proc archiveSzLzma2*(z: Sz; ctx: ArchiveContext; dst: Output;
     curLen += p.raw.len
   if cur.len > 0:
     groups.add(cur)
-  # Encode groups (optionally AES-wrapped per folder).
+  # Encode groups: optional Delta pre-filter (auto-tried), LZMA2,
+  # optional AES wrap. Per-group coder chain in decode order.
   let useAes = z.password != ""
   if useAes and z.meth != 1:
     raise newException(SzError,
@@ -1723,8 +1730,8 @@ proc archiveSzLzma2*(z: Sz; ctx: ArchiveContext; dst: Output;
   var packOut = newOutput()
   var groupPack: seq[string] = @[]
   var groupSolid: seq[int] = @[]
-  var groupAes: seq[string] = @[] # props per group, "" when clear
-  var groupLzma: seq[int] = @[] # AES unpack sizes (pre-encryption)
+  var groupCoders: seq[seq[tuple[id, props: string]]] = @[]
+  var groupUnpack: seq[seq[uint64]] = @[]
   for gi, g in groups:
     var solid = newString(curLenOf(pend, g))
     var o = 0
@@ -1733,17 +1740,44 @@ proc archiveSzLzma2*(z: Sz; ctx: ArchiveContext; dst: Output;
         var src = pend[ei].raw
         copyMem(addr solid[o], addr src[0], src.len)
         o += src.len
-    var pack: string
-    try:
-      pack = lzma2EncodeSolid(solid, byte(0x10),
-        ctx.max7zDictBytes)
-    except CatchableError as e:
-      raise newException(SzError, "7z: lzma2 encode failed: " & e.msg)
-    var aprops = ""
-    var lzmaLen = pack.len
+    # Filter candidates: plain, Delta(1), Delta(4). Delta preserves
+    # length, so substream sizes never change.
+    var bestPack = ""
+    var bestDelta = ""
+    var bestDist = 0
+    var tried = 0
+    var cands: seq[tuple[props: string; data: string]] = @[]
+    cands.add(("", solid))
+    if z.useFilters and solid.len > 0:
+      for dist in [1, 4]:
+        var f = solid
+        try:
+          deltaEncode(f, dist)
+        except CatchableError as e:
+          raise newException(SzError, "7z: " & e.msg)
+        var pc = newString(1)
+        pc[0] = chr(dist - 1)
+        cands.add((props: pc, data: f))
+    for c in cands:
+      var pack: string
+      try:
+        pack = lzma2EncodeSolid(c.data, byte(0x10),
+          ctx.max7zDictBytes)
+      except CatchableError as e:
+        raise newException(SzError, "7z: lzma2 encode failed: " & e.msg)
+      inc tried
+      if bestPack == "" or pack.len < bestPack.len:
+        bestPack = pack
+        bestDelta = c.props
+        bestDist = tried
+    discard bestDist
+    var coders: seq[tuple[id, props: string]] = @[]
+    var unpacks: seq[uint64] = @[]
+    var lzmaLen = bestPack.len
     if useAes:
       let (salt, iv) = randomAesSaltIv()
       var key: array[32, byte]
+      var aprops = ""
       try:
         key = deriveAesKey(z.password, salt, power)
         aprops = buildAesProps(salt, iv, power)
@@ -1753,15 +1787,22 @@ proc archiveSzLzma2*(z: Sz; ctx: ArchiveContext; dst: Output;
       for i in 0 ..< 16:
         ivArr[i] = iv[i]
       try:
-        pack = aesCbcEncryptPad(key, ivArr, pack)
+        bestPack = aesCbcEncryptPad(key, ivArr, bestPack)
       except CatchableError as e:
         raise newException(SzError, "7z: aes encrypt failed: " & e.msg)
-    groupPack.add(pack)
+      coders.add((id: "\x06\xF1\x07\x01", props: aprops))
+      unpacks.add(lzmaLen.uint64)
+    coders.add((id: "\x21", props: "\x10"))
+    unpacks.add(solid.len.uint64)
+    if bestDelta != "":
+      coders.add((id: "\x03", props: bestDelta))
+      unpacks.add(solid.len.uint64)
+    groupPack.add(bestPack)
     groupSolid.add(solid.len)
-    groupAes.add(aprops)
-    groupLzma.add(lzmaLen)
-    if pack.len > 0:
-      var pp = pack
+    groupCoders.add(coders)
+    groupUnpack.add(unpacks)
+    if bestPack.len > 0:
+      var pp = bestPack
       writeBytes(packOut, addr pp[0], pp.len)
     ctx.reportProgress(pend[g[0]].arcName, gi, groups.len,
       solid.len.int64)
@@ -1786,36 +1827,27 @@ proc archiveSzLzma2*(z: Sz; ctx: ArchiveContext; dst: Output;
     writeNum(hdr, groups.len.uint64)
     writeByte(hdr, char(0x00))
     for gi in 0 ..< groups.len:
-      if groupAes[gi] == "":
-        writeNum(hdr, 1)
-        writeByte(hdr, char(0x21))
-        writeByte(hdr, char(0x21))
-        writeNum(hdr, 1)
-        writeByte(hdr, char(0x10))
-      else:
-        writeNum(hdr, 2)
-        writeByte(hdr, char(0x24))
-        writeByte(hdr, char(0x06))
-        writeByte(hdr, char(0xF1))
-        writeByte(hdr, char(0x07))
-        writeByte(hdr, char(0x01))
-        writeNum(hdr, groupAes[gi].len.uint64)
-        var ap = groupAes[gi]
-        writeBytes(hdr, addr ap[0], ap.len)
-        writeByte(hdr, char(0x21))
-        writeByte(hdr, char(0x21))
-        writeNum(hdr, 1)
-        writeByte(hdr, char(0x10))
-        # bind: LZMA2 input (1) <- AES output (0)
-        writeNum(hdr, 1)
-        writeNum(hdr, 0)
+      let coders = groupCoders[gi]
+      writeNum(hdr, coders.len.uint64)
+      for c in coders:
+        var flags = c.id.len
+        if c.props.len > 0:
+          flags = flags or 0x20
+        writeByte(hdr, char(flags))
+        var mid = c.id
+        writeBytes(hdr, addr mid[0], mid.len)
+        if c.props.len > 0:
+          writeNum(hdr, c.props.len.uint64)
+          var mp = c.props
+          writeBytes(hdr, addr mp[0], mp.len)
+      if coders.len > 1:
+        for i in 1 ..< coders.len:
+          writeNum(hdr, i.uint64)
+          writeNum(hdr, (i - 1).uint64)
     writeByte(hdr, char(0x0C))
     for gi in 0 ..< groups.len:
-      if groupAes[gi] == "":
-        writeNum(hdr, groupSolid[gi].uint64)
-      else:
-        writeNum(hdr, groupLzma[gi].uint64)
-        writeNum(hdr, groupSolid[gi].uint64)
+      for v in groupUnpack[gi]:
+        writeNum(hdr, v)
     writeByte(hdr, char(0x00))
     # SubStreams: counts (only when a folder holds >1 file), sizes,
     # and one AllAreDefined CRC list (mirrors 7z's own layout).

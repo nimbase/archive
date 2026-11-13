@@ -40,7 +40,9 @@ Oracle matrix (all verified 2026-11-13, decode verified 2026-11-14):
   and `7z x` byte-identical, incl. symlinks, dirs, empty files.
   Encrypted solid (`password`, `kdfLg2`, default 2^19) and
   header-encrypted write (`encHeaders`, STORE or solid) verified with
-  `7z x -ppassword` and round-trips.
+  `7z x -ppassword` and round-trips. Opt-in Delta auto-filter
+  (`useFilters`: tries distances 1/4 per solid group, keeps smallest;
+  4.8x win on gradual data, 7z interop verified).
 
 Wire notes that override the stale docs page:
 - 7z NUMBER = `(value_bits << 8*extra) + extraLE` (spec formula confirmed).

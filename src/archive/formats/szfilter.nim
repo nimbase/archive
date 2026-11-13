@@ -26,6 +26,16 @@ proc deltaDecode*(data: var string; distance: int) =
       data[i] = chr((ord(data[i]) + ord(data[i - distance])) and 0xFF)
     inc i
 
+proc deltaEncode*(data: var string; distance: int) =
+  ## Forward Delta (encode): out[i] = in[i] - in[i-dist], first
+  ## `distance` bytes unchanged. Exact inverse of deltaDecode.
+  if distance <= 0 or distance > 256:
+    raise newException(FilterError, "7z: bad delta distance")
+  var i = data.len - 1
+  while i >= distance:
+    data[i] = chr((ord(data[i]) - ord(data[i - distance])) and 0xFF)
+    dec i
+
 proc bcjStartOffset*(props: string): uint32 =
   if props.len == 0:
     return 0

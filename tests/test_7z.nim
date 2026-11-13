@@ -426,3 +426,36 @@ suite "7z header-encrypted write":
     except SzError as e:
       failed = "password" in e.msg
     check failed
+
+suite "7z filter write":
+  test "delta auto-filter wins on gradual data":
+    var ctx: ArchiveContext
+    var audio = newString(20000)
+    for i in 0 ..< 20000:
+      audio[i] = chr((i div 4) and 0xFF)
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.pcm", meta: FileMeta(name: "a.pcm",
+        size: audio.len, isRegular: true), data: audio),
+    ], ".", "")
+    var plainLen = 0
+    var filtLen = 0
+    for uf in [false, true]:
+      let dst = newOutput()
+      archiveSz(Sz(meth: 1, useFilters: uf), ctx, dst, files)
+      let blob = take(dst)
+      if uf: filtLen = blob.len else: plainLen = blob.len
+      let bodies = szReadAllFrom(blob, Sz(), ctx)
+      check bodies["a.pcm"] == audio
+    check filtLen < plainLen
+
+  test "filtered encode is deterministic":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: 5,
+        isRegular: true), data: "hello"),
+    ], ".", "")
+    let d1 = newOutput()
+    archiveSz(Sz(meth: 1, useFilters: true), ctx, d1, files)
+    let d2 = newOutput()
+    archiveSz(Sz(meth: 1, useFilters: true), ctx, d2, files)
+    check take(d1) == take(d2)
