@@ -611,6 +611,116 @@ suite "rar5 unpack70":
     let ciF = rarCompInfo70(3, (1 shl 20) + (1 shl 15))
     check ((ciF shr 15) and 0x1F) != 0
 
+proc putBitsMSBT(buf: var seq[byte]; acc: var uint64; nbits: var int;
+    v: uint64; n: int) =
+  ## Test-local MSB-first bit writer (mirrors rarenc BitWriter).
+  doAssert n >= 0 and n <= 32
+  let mask =
+    if n == 0: 0'u64
+    elif n == 32: 0xFFFFFFFF'u64
+    else: (1'u64 shl n) - 1
+  acc = (acc shl n) or (v and mask)
+  nbits += n
+  while nbits >= 8:
+    nbits -= 8
+    buf.add(byte((acc shr nbits) and 0xFF))
+
+proc putBitsWideT(buf: var seq[byte]; acc: var uint64; nbits: var int;
+    v: uint64; n: int) =
+  ## Test-local 16-bit-chunked wide emit (mirrors putBitsWide).
+  var left = n
+  while left > 0:
+    let take = min(left, 16)
+    let sh = left - take
+    putBitsMSBT(buf, acc, nbits, (v shr sh) and
+      ((1'u64 shl take) - 1), take)
+    left -= take
+
+proc buildFarBlock(dslot: int; dextra: uint64; nbits: int): string =
+  ## Synthetic Unpack70 block: literals A B, a 300-byte match at distance
+  ## slot `dslot` (extra `dextra`/`nbits`), trailing literal C, all tables
+  ## inline, last-block set. The distance is astronomic so the decoder
+  ## must zero-fill; the trailing C proves the wide extra bits consumed
+  ## exactly `nbits` (any bit shift corrupts it). New matches carry the
+  ## length slot in the main symbol (262 + slot), so no len-table code is
+  ## emitted for them (reps only use the len table).
+  var mainLens = newSeq[int](rarMainSyms)
+  mainLens[65] = 2
+  mainLens[66] = 2
+  mainLens[67] = 2
+  mainLens[290] = 2 # 262 + length slot 28 (encoder length 297)
+  var distLens = newSeq[int](rarDistSyms70)
+  distLens[0] = 1
+  distLens[dslot] = 1
+  var alen = newSeq[int](rarAlignSyms)
+  for i in 0 ..< rarAlignSyms:
+    alen[i] = 4 # raw direct-bit path (alignMode off)
+  var lenLens = newSeq[int](rarLenSyms)
+  lenLens[0] = 1
+  lenLens[1] = 1 # unused by new matches (reps only); kept Kraft-valid
+  var lvlLens = newSeq[int](20)
+  lvlLens[0] = 1
+  lvlLens[1] = 3
+  lvlLens[2] = 4
+  lvlLens[4] = 4
+  let mainC = assignCodes(mainLens)
+  let distC = assignCodes(distLens)
+  let lvlC = assignCodes(lvlLens)
+  var pay: seq[byte] = @[]
+  var acc = 0'u64
+  var nb = 0
+  for L in lvlLens:
+    putBitsMSBT(pay, acc, nb, L.uint64, 4)
+  template emitLen(L: int) =
+    let ec = lvlC[L]
+    putBitsMSBT(pay, acc, nb, ec.code.uint64, ec.len)
+  for L in mainLens: emitLen(L)
+  for L in distLens: emitLen(L)
+  for L in alen: emitLen(L)
+  for L in lenLens: emitLen(L)
+  template tok(sym: int) =
+    let tc = mainC[sym]
+    putBitsMSBT(pay, acc, nb, tc.code.uint64, tc.len)
+  tok(65)
+  tok(66)
+  tok(290)
+  putBitsMSBT(pay, acc, nb, 39, 6) # 297 = ((4 or 0) shl 6 or 39) + 2
+  let dc = distC[dslot]
+  putBitsMSBT(pay, acc, nb, dc.code.uint64, dc.len)
+  putBitsWideT(pay, acc, nb, dextra, nbits)
+  tok(67)
+  if nb > 0:
+    pay.add(byte((acc shl (8 - nb)) and 0xFF))
+  doAssert pay.len <= 255
+  let flags = 0xC7'u8 # tables + last + 1 size byte + 8 final bits
+  let sizeb = byte(pay.len)
+  let chk = byte(0x5Au8 xor flags xor sizeb)
+  result = newString(3 + pay.len)
+  result[0] = chr(int(flags))
+  result[1] = chr(int(chk))
+  result[2] = chr(int(sizeb))
+  for i, b in pay:
+    result[3 + i] = chr(int(b))
+
+suite "rar5 unpack70 far distances":
+  test "far slots decode via zero fill with wide extra bits":
+    # Slot -> extra-bit count: 64 -> 31, 70 -> 34, 79 -> 38. The last
+    # two exceed 32 bits and exercise the 16-bit-chunked wide path.
+    for (dslot, nbits) in [(64, 31), (70, 34), (79, 38)]:
+      let blk = buildFarBlock(dslot, 0, nbits)
+      var st = UnpackState()
+      resetUnpack(st, rarEncDict, 1)
+      let dec = decodeMember(st, unsafeAddr blk[0], blk.len, 303, 1)
+      check dec == "AB" & '\0'.repeat(300) & "C"
+
+  test "far slot nonzero extra bits stay aligned":
+    # Extra pattern spans all three 16-bit chunks of the 38-bit field.
+    let blk = buildFarBlock(79, 0x2AAAAAAAAA'u64, 38)
+    var st = UnpackState()
+    resetUnpack(st, rarEncDict, 1)
+    let dec = decodeMember(st, unsafeAddr blk[0], blk.len, 303, 1)
+    check dec == "AB" & '\0'.repeat(300) & "C"
+
 suite "rar5 solid":
   test "solid single volume round trips and wins on shared data":
     var ctx: ArchiveContext
