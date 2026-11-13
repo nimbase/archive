@@ -85,50 +85,75 @@ proc huffmanLengths*(freqs: openArray[int]; maxLen = 15): seq[int] =
     if d < n:
       result[d] = 1
     return
-  # Optimal tree via repeated pairing (O(n^2), n <= 446).
+  # Optimal tree via a binary heap on (weight, node index). The key is
+  # unique per node, so this pops exactly the same minima the repeated
+  # linear scan did (O(n log n) instead of O(n^2)); output lengths are
+  # bit-identical, only built faster.
   type Node = object
     weight: int64
     sym: int     # >= 0 leaf, -1 internal
     left, right: int
   var nodes: seq[Node] = @[]
-  var active: seq[int] = @[]
+  var leafOf = newSeq[int](n)
+  for i in 0 ..< n:
+    leafOf[i] = -1
+  var heap: seq[int] = @[]
+  template heapPush(ni: int) =
+    heap.add(ni)
+    var k = heap.len - 1
+    while k > 0:
+      let par = (k - 1) shr 1
+      if (nodes[heap[k]].weight, heap[k]) <
+          (nodes[heap[par]].weight, heap[par]):
+        swap(heap[k], heap[par])
+        k = par
+      else:
+        break
+  template heapPop(): int =
+    let top = heap[0]
+    let last = heap.pop()
+    if heap.len > 0:
+      heap[0] = last
+      var k = 0
+      while true:
+        let l = k * 2 + 1
+        if l >= heap.len:
+          break
+        var m = l
+        let r = l + 1
+        if r < heap.len and (nodes[heap[r]].weight, heap[r]) <
+            (nodes[heap[l]].weight, heap[l]):
+          m = r
+        if (nodes[heap[m]].weight, heap[m]) <
+            (nodes[heap[k]].weight, heap[k]):
+          swap(heap[m], heap[k])
+          k = m
+        else:
+          break
+    top
   for s in used:
     nodes.add(Node(weight: freqs[s].int64, sym: s, left: -1, right: -1))
-    active.add(nodes.len - 1)
-  while active.len > 1:
-    var b1 = 0
-    for i in 1 ..< active.len:
-      if (nodes[active[i]].weight, active[i]) < (nodes[active[b1]].weight, active[b1]):
-        b1 = i
-    let n1 = active[b1]
-    active.del(b1)
-    var b2 = 0
-    for i in 1 ..< active.len:
-      if (nodes[active[i]].weight, active[i]) < (nodes[active[b2]].weight, active[b2]):
-        b2 = i
-    let n2 = active[b2]
-    active.del(b2)
+    leafOf[s] = nodes.len - 1
+    heapPush(nodes.len - 1)
+  while heap.len > 1:
+    let n1 = heapPop()
+    let n2 = heapPop()
     nodes.add(Node(weight: nodes[n1].weight + nodes[n2].weight, sym: -1,
       left: n1, right: n2))
-    active.add(nodes.len - 1)
-  let root = active[0]
+    heapPush(nodes.len - 1)
+  let root = heap[0]
   var depth = newSeq[int](nodes.len)
   var stack = @[root]
   depth[root] = 0
-  var order: seq[int] = @[]
   while stack.len > 0:
     let nd = stack.pop()
-    order.add(nd)
     if nodes[nd].left >= 0:
       depth[nodes[nd].left] = depth[nd] + 1
       depth[nodes[nd].right] = depth[nd] + 1
       stack.add(nodes[nd].left)
       stack.add(nodes[nd].right)
   for s in used:
-    for ni in 0 ..< nodes.len:
-      if nodes[ni].sym == s:
-        result[s] = depth[ni]
-        break
+    result[s] = depth[leafOf[s]]
   # Kraft repair: lengthen rarest first until the sum fits.
   const Full = 1 shl 15
   while true:
@@ -252,21 +277,21 @@ proc bestAt(m: Matcher; data: ptr UncheckedArray[byte]; dataLen, pos: int;
   var chain = m.head[h]
   var steps = 0
   let lo = max(m.base, pos - m.dictSize)
+  # Chain links always satisfy base <= chain < pos here: inserts only
+  # store past positions of this chunk (head reset per chunk), and the
+  # loop exits on -1, so no bounds/pos rechecks are needed per step.
+  # The byte compare stays bounded: ln < dataLen - pos and chain < pos
+  # imply chain + ln < dataLen.
   while chain >= lo and steps < m.maxChain:
-    if chain < pos:
-      var ln = 0
-      let lim = min(maxLen, dataLen - pos)
-      while ln < lim and data[chain + ln] == data[pos + ln]:
-        inc ln
-      if ln >= 2 and ln > result.len:
-        result = (ln, pos - chain)
-        if ln >= maxLen:
-          break
-    let nxt =
-      if chain - m.base >= 0 and chain - m.base < m.prev.len:
-        m.prev[chain - m.base]
-      else: -1
-    chain = nxt
+    var ln = 0
+    let lim = min(maxLen, dataLen - pos)
+    while ln < lim and data[chain + ln] == data[pos + ln]:
+      inc ln
+    if ln >= 2 and ln > result.len:
+      result = (ln, pos - chain)
+      if ln >= maxLen:
+        break
+    chain = m.prev[chain - m.base]
     inc steps
 
 # ---------- level-table RLE packing (§5.3) ----------
