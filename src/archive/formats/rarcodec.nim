@@ -72,11 +72,17 @@ proc readBitsWide(br: var BitReader; n: int): uint64 =
 
 # ---------- canonical Huffman (DEFLATE rule) ----------
 
+const rarFastBits* = 10
+  ## Prefix-lookup width for `decodeSym`. Short codes (<= 10 bits) resolve
+  ## with one table load; longer codes fall back to the bit-by-bit walk.
+
 type HuffTable = object
   counts: array[16, int] ## per length 1..15
   first: array[16, int]  ## first code per length
   base: array[16, int]   ## symbol index base per length
   syms: seq[int]         ## symbols ordered by (length, index)
+  fast: seq[int32]       ## (symbol shl 4) or length per 10-bit prefix,
+                         ## -1 = use the slow path (long or invalid code)
 
 proc buildHuff*(lengths: openArray[int]): HuffTable =
   for L in lengths:
@@ -103,8 +109,33 @@ proc buildHuff*(lengths: openArray[int]): HuffTable =
     if L != 0:
       result.syms[pos[L]] = sym
       inc pos[L]
+  # Prefix lookup for short codes. Canonical codes are prefix-free, so a
+  # short code's 2^(fast-L) entries never collide with another code's.
+  # Long codes (> fast bits) and unused prefixes stay -1 (slow path,
+  # which raises on truly invalid codes exactly as before).
+  result.fast = newSeq[int32](1 shl rarFastBits)
+  for i in 0 ..< result.fast.len:
+    result.fast[i] = -1
+  for L in 1 .. min(rarFastBits, rarMaxCodeLen):
+    if result.counts[L] == 0:
+      continue
+    for idx in 0 ..< result.counts[L]:
+      let sym = result.syms[result.base[L] + idx]
+      let prefix = (result.first[L] + idx) shl (rarFastBits - L)
+      for e in 0 ..< (1 shl (rarFastBits - L)):
+        result.fast[prefix or e] = int32((sym shl 4) or L)
 
 proc decodeSym*(t: HuffTable; br: var BitReader): int =
+  if br.bits < rarFastBits:
+    refill(br)
+  if br.bits >= rarFastBits and t.fast.len > 0:
+    let e = t.fast[int(br.cache shr (64 - rarFastBits))]
+    if e >= 0:
+      let L = int(e) and 15
+      br.cache = br.cache shl L
+      br.bits -= L
+      br.read += L
+      return int(e) shr 4
   var code = 0
   for L in 1 .. rarMaxCodeLen:
     code = (code shl 1) or int(br.readBits(1))
@@ -338,24 +369,79 @@ proc emitByte(st: UnpackState; output: var string; b: byte) =
     st.wpos = 0
   inc st.total
 
+proc windowAppend(st: UnpackState; src: pointer; n: int) =
+  ## Append n bytes from src into the circular window (wrap = 2 segments
+  ## max). Caller guarantees n >= 0 and dictSize >= 1 (decode dictionaries
+  ## are always >= 128 KiB by the size formula).
+  var off = 0
+  while off < n:
+    let seg = min(n - off, st.dictSize - st.wpos)
+    copyMem(addr st.window[st.wpos],
+      cast[pointer](cast[int](src) + off), seg)
+    st.wpos += seg
+    if st.wpos >= st.dictSize:
+      st.wpos = 0
+    off += seg
+  st.total += n.uint64
+
+proc windowZeros(st: UnpackState; n: int) =
+  ## Append n zero bytes (out-of-window match rule).
+  var off = 0
+  while off < n:
+    let seg = min(n - off, st.dictSize - st.wpos)
+    zeroMem(addr st.window[st.wpos], seg)
+    st.wpos += seg
+    if st.wpos >= st.dictSize:
+      st.wpos = 0
+    off += seg
+  st.total += n.uint64
+
 proc emitMatch(st: UnpackState; output: var string; dist, length: uint64;
     outLimit: uint64) =
   if output.len.uint64 + length > outLimit:
     raise newException(RarCodecError, "rar: match exceeds output limit")
-  for _ in 0 ..< length:
-    var b: byte = 0
-    if dist != 0 and dist <= st.dictSize.uint64 and dist <= st.total:
-      # wpos - dist lies in (-dictSize, dictSize): one add normalizes.
-      var idx = st.wpos - int(dist)
-      if idx < 0:
-        idx += st.dictSize
-      b = st.window[idx]
-    output.add(char(b))
-    st.window[st.wpos] = b
-    st.wpos += 1
-    if st.wpos >= st.dictSize:
-      st.wpos = 0
-    inc st.total
+  let totalLen = int(length)
+  let start = output.len
+  output.setLen(start + totalLen)
+  # Out-of-window bytes are zero (dist 0, beyond the dictionary, or
+  # beyond the bytes produced so far). total only grows, so once it
+  # catches up to dist the rest of the match resolves from history.
+  var zeroCount = 0
+  if dist == 0 or dist > st.dictSize.uint64:
+    zeroCount = totalLen
+  elif dist > st.total:
+    zeroCount = min(totalLen, int(dist - st.total))
+  if zeroCount > 0:
+    zeroMem(addr output[start], zeroCount)
+    st.windowZeros(zeroCount)
+  var produced = zeroCount
+  if produced < totalLen:
+    # Seed: exactly min(dist, remaining) bytes from window history.
+    # Segmented copies stay exact (every byte's source predates what this
+    # match writes); the total never exceeds dist, so source and
+    # destination cannot overlap.
+    var need = min(totalLen - produced, int(dist))
+    while need > 0:
+      var srcIdx = st.wpos - int(dist)
+      if srcIdx < 0:
+        srcIdx += st.dictSize
+      var chunk = min(need, st.dictSize - srcIdx)
+      chunk = min(chunk, st.dictSize - st.wpos)
+      copyMem(addr output[start + produced], addr st.window[srcIdx], chunk)
+      st.windowAppend(addr output[start + produced], chunk)
+      produced += chunk
+      need -= chunk
+    # Doubling: the emitted run is dist-periodic by construction and
+    # `done` stays a multiple of dist, so copying the last `done` bytes
+    # (contiguous in output) extends it exactly.
+    var done = int(dist)
+    while produced < totalLen:
+      let n = min(done, totalLen - produced)
+      copyMem(addr output[start + produced],
+        addr output[start + produced - done], n)
+      st.windowAppend(addr output[start + produced], n)
+      produced += n
+      done += n
 
 proc decodeMember*(st: UnpackState; data: pointer; dataLen: int;
     outLimit: uint64; algoVer: int): string =

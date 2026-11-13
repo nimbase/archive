@@ -1153,16 +1153,16 @@ proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
                     vf.cryptLg2, chkN, false)
                   # Packed-part CRC of this fragment's ciphertext bytes.
                   var c = 0xFFFFFFFF'u32
-                  for i in off ..< off + fragLen:
-                    c = crc32Update(c, unsafeAddr vf.fullData[i], 1)
+                  if fragLen > 0:
+                    c = crc32Update(c, unsafeAddr vf.fullData[off], fragLen)
                   sCrc = c xor 0xFFFFFFFF'u32
               else:
                 if remainingTotal - fragLen == 0:
                   sCrc = vf.rawCrc
                 else:
                   var c = 0xFFFFFFFF'u32
-                  for i in off ..< off + fragLen:
-                    c = crc32Update(c, unsafeAddr vf.fullData[i], 1)
+                  if fragLen > 0:
+                    c = crc32Update(c, unsafeAddr vf.fullData[off], fragLen)
                   sCrc = c xor 0xFFFFFFFF'u32
               let h = buildFragHdr(fragLen, isFirst,
                 remainingTotal - fragLen == 0, sCrc, eExtra)
@@ -1205,16 +1205,16 @@ proc archiveRarVolumes*(r: Rar; ctx: ArchiveContext; files: seq[FileInfo];
                 sC = rarHashMacCrc(vf.cryptHashKey, vf.rawCrc)
               else:
                 var c = 0xFFFFFFFF'u32
-                for i in off ..< off + fragLen:
-                  c = crc32Update(c, unsafeAddr vf.fullData[i], 1)
+                if fragLen > 0:
+                  c = crc32Update(c, unsafeAddr vf.fullData[off], fragLen)
                 sC = c xor 0xFFFFFFFF'u32
             else:
               if isLast:
                 sC = vf.rawCrc
               else:
                 var c = 0xFFFFFFFF'u32
-                for i in off ..< off + fragLen:
-                  c = crc32Update(c, unsafeAddr vf.fullData[i], 1)
+                if fragLen > 0:
+                  c = crc32Update(c, unsafeAddr vf.fullData[off], fragLen)
                 sC = c xor 0xFFFFFFFF'u32
             fragHdr = buildFragHdr(fragLen, isFirst, isLast, sC, eE)
           writeVolHdr(fragHdr)
