@@ -1,4 +1,4 @@
-# Encryption (src/archive/crypt.nim, src/archive.nim:137-230)
+# Encryption (src/archive/crypt.nim, src/archive.nim:137-232)
 
 Envelope encryption around whole blobs: archive, optionally compress, then encrypt. No key is retained; `AeadContext.key` is wiped in `finally`. Password keys derive per call via Argon2id. Uses XChaCha20-Poly1305 chunked AEAD via `pkg/nimcypher`.
 
@@ -31,7 +31,7 @@ Chunking: each record is `u32LE len + cipher + 16-byte MAC`. There is always at 
 
 `extractFile` and `vfs.fileSystem` refuse encrypted blobs with `use decryptExtract/decryptFile`.
 
-## Archive layer (src/archive.nim:137-230)
+## Archive layer (src/archive.nim:137-232)
 
 ```nim
 encryptArchive(afTar, files, "correct horse", ctx, compression = some(cfGz))

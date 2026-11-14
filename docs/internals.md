@@ -21,7 +21,7 @@ See `tests/test_threads.nim` for the threading smoke test.
 
 - One-shot string APIs (`compress`, `decompress`, `archiveData`) hold full contents by design.
 - File-to-file decompression (`decompressFileInto`) uses fixed buffers and never holds full contents, except Brotli which keeps the one-shot path.
-- Plain-zip `extractFile(path, outPath)` streams with a bounded pool (64 KB input + 96 KB window, 1 MB cap). Other formats use the generic handler; tar is already zero-copy via borrowed spans.
+- Plain-zip and plain-rar `extractFile(path, outPath)` stream with bounded pools (zip: 64 KB input + 96 KB window; rar: 64 KB chunks + 64 KB decode stage, solid groups decoded forward with no per-file retention). Other formats use the generic handler; tar is already zero-copy via borrowed spans.
 - `Output` reuse: pass the same `Output` across calls and `reset` it. `resetBounded` trims pools that grew past `MaxScratchCap` (1 MB).
 - `releaseSpanPages` is best-effort page release after bulk file writes; never raises.
 

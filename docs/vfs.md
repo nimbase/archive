@@ -51,7 +51,7 @@ DeepFs* = ref object
 proc fileSystem*(ctx: ArchiveContext; filename: string; inp: Input = nil): Fs
 iterator walkFs*(fsys: Fs; root = "."): tuple[path: string; entry: DirEntry]
 iterator walkFs*(path: string; root = "."): tuple[path: string; entry: DirEntry]
-proc listEntries*(fsys: Fs; root = "."): seq[string]  # in src/archive.nim:437
+proc listEntries*(fsys: Fs; root = "."): seq[string]  # in src/archive.nim:451
 ```
 
 Filename-only `fileSystem` (src/archive/vfs.nim:329):
