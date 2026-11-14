@@ -12,6 +12,8 @@
 ## bounded by the unpacked-size cap.
 
 import ../types
+import ../crc32
+import buffalo
 
 type RarCodecError* = object of ArchiveError
 
@@ -228,7 +230,10 @@ proc lengthBonus(dist: uint64): uint64 =
 type RarFilterKind = enum
   fkDelta, fkE8, fkE8E9, fkArm
 
-type RarFilter = object
+type RarFilter* = object
+  ## Post-filter region (opaque to callers outside rarcodec except as a
+  ## sequence passed back to `applyRarFiltersToFile`). Fields stay
+  ## private; the file patcher interprets them.
   start: uint64 ## file-relative region start
   len: uint64
   kind: RarFilterKind
@@ -566,3 +571,310 @@ proc decodeMember*(st: UnpackState; data: pointer; dataLen: int;
     if isLast or result.len.uint64 >= outLimit:
       break
   applyFilters(result, filters)
+
+# ---------- streaming decode to file ----------
+
+const rarFileStageCap* = 65536
+  ## Staging buffer for streaming decode-to-file (mirrors StreamChunkSize).
+  ## The caller owns the pool, reserves it once, and reuses it across
+  ## entries; `stage.len` is 0 on entry and 0 on return.
+
+proc flushRarStage(stage: var PooledBuffer[byte]; wf: File;
+    crc: var uint32) {.inline.} =
+  ## Write all staged bytes to `wf`, folding them into `crc`, and reset.
+  if stage.len > 0:
+    var off = 0
+    while off < stage.len:
+      let w = writeBuffer(wf, addr stage.data[off], stage.len - off)
+      if w <= 0:
+        raise newException(RarCodecError, "rar: short write")
+      off += w
+    crc = crc32Update(crc, addr stage.data[0], stage.len)
+    stage.len = 0
+
+proc emitStagedZeros(st: UnpackState; stage: var PooledBuffer[byte];
+    wf: File; crc: var uint32; outCnt: var uint64; outLimit: uint64;
+    n: int) {.inline.} =
+  ## Zero-fill `n` bytes (out-of-window match rule): staging + window.
+  if outCnt + n.uint64 > outLimit:
+    raise newException(RarCodecError, "rar: exceeds output limit")
+  var left = n
+  while left > 0:
+    if stage.len >= stage.cap:
+      flushRarStage(stage, wf, crc)
+    let take = min(left, stage.cap - stage.len)
+    zeroMem(addr stage.data[stage.len], take)
+    windowZeros(st, take)
+    stage.len += take
+    outCnt += take.uint64
+    left -= take
+
+proc emitStagedByte(st: UnpackState; stage: var PooledBuffer[byte];
+    wf: File; crc: var uint32; outCnt: var uint64; outLimit: uint64;
+    b: byte) {.inline.} =
+  ## Single literal byte: mirrors `emitByte` exactly, through staging.
+  if outCnt >= outLimit:
+    raise newException(RarCodecError, "rar: exceeds output limit")
+  if stage.cap < rarFileStageCap:
+    raise newException(RarCodecError, "rar: stage too small")
+  if stage.len >= stage.cap:
+    flushRarStage(stage, wf, crc)
+  stage.data[stage.len] = b
+  stage.len += 1
+  st.window[st.wpos] = b
+  st.wpos += 1
+  if st.wpos >= st.dictSize:
+    st.wpos = 0
+  inc st.total
+  outCnt += 1
+
+proc emitStagedMatch(st: UnpackState; stage: var PooledBuffer[byte];
+    wf: File; crc: var uint32; outCnt: var uint64; outLimit: uint64;
+    dist, length: uint64) =
+  ## Streaming twin of `emitMatch`: identical output bytes and window
+  ## evolution. Matches are short by format (length slots top out near
+  ## 4KB; the stage is 64KB), so the whole run stages contiguously —
+  ## flushed first when short on room — and the seed reads window history
+  ## exactly like the original while the doubling extends within the
+  ## stable stage exactly like the original extends within its output
+  ## string (never from a window region concurrently being written).
+  ## The window then takes the run in one bulk append from the stage.
+  if outCnt + length > outLimit:
+    raise newException(RarCodecError, "rar: match exceeds output limit")
+  let totalLen = int(length)
+  if stage.cap < rarFileStageCap:
+    raise newException(RarCodecError, "rar: stage too small")
+  if totalLen > stage.cap - stage.len:
+    flushRarStage(stage, wf, crc)
+    if totalLen > stage.cap - stage.len:
+      raise newException(RarCodecError, "rar: match too large")
+  var zeroCount = 0
+  if dist == 0 or dist > st.dictSize.uint64:
+    zeroCount = totalLen
+  elif dist > st.total:
+    zeroCount = min(totalLen, int(dist - st.total))
+  let t0 = stage.len
+  if zeroCount > 0:
+    zeroMem(addr stage.data[t0], zeroCount)
+    stage.len += zeroCount
+    st.windowZeros(zeroCount)
+  var produced = zeroCount
+  if produced < totalLen:
+    # Seed: exactly min(dist, remaining) bytes from window history into
+    # the stage; the window takes each piece from the stable stage copy.
+    var need = min(totalLen - produced, dist.int)
+    while need > 0:
+      var srcIdx = st.wpos - dist.int
+      if srcIdx < 0:
+        srcIdx += st.dictSize
+      var chunk = min(need, st.dictSize - srcIdx)
+      chunk = min(chunk, st.dictSize - st.wpos)
+      copyMem(addr stage.data[stage.len], addr st.window[srcIdx], chunk)
+      windowAppend(st, addr stage.data[stage.len], chunk)
+      stage.len += chunk
+      produced += chunk
+      need -= chunk
+    # Doubling: the emitted run is dist-periodic by construction and
+    # `done` stays a multiple of dist, so copying the last `done` stage
+    # bytes (contiguous in the staged run) extends it exactly.
+    let seeded = produced
+    var done = dist.int
+    while produced < totalLen:
+      let n = min(done, totalLen - produced)
+      copyMem(addr stage.data[t0 + produced],
+        addr stage.data[t0 + produced - done], n)
+      produced += n
+      done += n
+    # Commit the doubling tail to the window in one bulk append (the
+    # seed pieces already went in progressively above).
+    let tail = totalLen - seeded
+    if tail > 0:
+      windowAppend(st, addr stage.data[t0 + seeded], tail)
+  stage.len = t0 + totalLen
+  outCnt += totalLen.uint64
+
+proc decodeRarMemberToFile*(st: UnpackState; data: pointer; dataLen: int;
+    outLimit: uint64; algoVer: int; wf: File;
+    stage: var PooledBuffer[byte]): tuple[bytes: uint64, crc: uint32,
+    filters: seq[RarFilter]] =
+  ## Streaming twin of `decodeMember`: identical wire semantics (same
+  ## blocks, tables, limits, filter markers), but output streams to `wf`
+  ## through the caller-owned `stage` pool (64KB backing, `stage.len` 0 on
+  ## entry and return) instead of a retained string. Returns the raw byte
+  ## count, CRC32 of the raw bytes, and the post-filter list for the
+  ## caller to apply via `applyRarFiltersToFile`. Solid-group state
+  ## (`st`) evolves exactly as in `decodeMember`.
+  if stage.cap < rarFileStageCap:
+    raise newException(RarCodecError, "rar: stage too small")
+  if stage.len != 0:
+    raise newException(RarCodecError, "rar: stage not empty")
+  let bytes = cast[ptr UncheckedArray[byte]](data)
+  var pos = 0
+  var filters: seq[RarFilter] = @[]
+  var outCnt: uint64 = 0
+  var crc: uint32 = 0xFFFFFFFF'u32
+  let distSyms = if algoVer == 1: rarDistSyms70 else: rarDistSyms50
+  while true:
+    if pos + 2 > dataLen:
+      raise newException(RarCodecError, "rar: truncated block header")
+    let flags = bytes[pos]
+    let checksum = bytes[pos + 1]
+    let nb =
+      case (flags shr 3) and 3
+      of 0: 1
+      of 1: 2
+      of 2: 3
+      else: raise newException(RarCodecError, "rar: bad block size length")
+    if pos + 2 + nb > dataLen:
+      raise newException(RarCodecError, "rar: truncated block header")
+    var acc = checksum xor flags
+    var payloadSize = 0
+    for i in 0 ..< nb:
+      let b = bytes[pos + 2 + i]
+      acc = acc xor b
+      payloadSize = payloadSize or (int(b) shl (i * 8))
+    if acc != 0x5A:
+      raise newException(RarCodecError, "rar: block checksum mismatch")
+    let isLast = (flags and 0x40) != 0
+    let hasTables = (flags and 0x80) != 0
+    let finalBits = min(int(flags and 7) + 1, 8)
+    let payloadBits =
+      if payloadSize == 0: 0
+      else: (payloadSize - 1) * 8 + finalBits
+    if pos + 2 + nb + payloadSize > dataLen:
+      raise newException(RarCodecError, "rar: truncated block payload")
+    var br = initBitReader(cast[pointer](addr bytes[pos + 2 + nb]),
+      payloadSize)
+    if hasTables:
+      let lvl = readLevelLengths(br)
+      let levelT = buildHuff(lvl)
+      let totalLens = rarMainSyms + distSyms + rarAlignSyms + rarLenSyms
+      let lens = decodeLengths(br, levelT, totalLens)
+      var o = 0
+      st.mainT = buildHuff(lens[o ..< o + rarMainSyms]); o += rarMainSyms
+      st.distT = buildHuff(lens[o ..< o + distSyms]); o += distSyms
+      let alens = lens[o ..< o + rarAlignSyms]; o += rarAlignSyms
+      st.alignT = buildHuff(alens)
+      st.lenT = buildHuff(lens[o ..< o + rarLenSyms])
+      st.alignMode = false
+      for L in alens:
+        if L != 4:
+          st.alignMode = true
+          break
+      st.tablesOk = true
+      st.algoVer = algoVer
+    elif not st.tablesOk:
+      raise newException(RarCodecError, "rar: block reuses missing tables")
+    while br.read < payloadBits and outCnt < outLimit:
+      let s = decodeSym(st.mainT, br)
+      if s < 256:
+        if outCnt >= outLimit:
+          raise newException(RarCodecError, "rar: exceeds output limit")
+        emitStagedByte(st, stage, wf, crc, outCnt, outLimit, byte(s))
+      elif s == 256:
+        if filters.len >= rarMaxFilters:
+          raise newException(RarCodecError, "rar: too many filters")
+        let f = readFilter(br, outCnt)
+        if f.len > rarMaxFilterLen.uint64:
+          raise newException(RarCodecError, "rar: filter too large")
+        filters.add(f)
+      elif s == 257:
+        if st.lastLen != 0:
+          emitStagedMatch(st, stage, wf, crc, outCnt, outLimit, st.reps[0],
+            st.lastLen)
+      elif s <= 261:
+        let repIdx = s - 258
+        let d = st.reps[repIdx]
+        let lslot = decodeSym(st.lenT, br)
+        let lextra = br.readBits(lengthExtraBits(lslot))
+        let length = lengthFromSlot(lslot, lextra)
+        if d == 0:
+          # Uninitialized rep: zero-fill per format rule.
+          if outCnt + length > outLimit:
+            raise newException(RarCodecError, "rar: exceeds output limit")
+          emitStagedZeros(st, stage, wf, crc, outCnt, outLimit, int(length))
+        else:
+          for i in countdown(repIdx, 1):
+            st.reps[i] = st.reps[i - 1]
+          st.reps[0] = d
+          st.lastLen = length
+          emitStagedMatch(st, stage, wf, crc, outCnt, outLimit, d, length)
+      else:
+        let lslot = s - 262
+        let lextra = br.readBits(lengthExtraBits(lslot))
+        var length = lengthFromSlot(lslot, lextra)
+        let dslot = decodeSym(st.distT, br)
+        if (algoVer == 0 and dslot >= rarDistSyms50) or
+            dslot >= rarDistSyms70:
+          raise newException(RarCodecError, "rar: bad distance slot")
+        let nbits = distBitCount(dslot)
+        if algoVer == 0 and nbits > 31:
+          raise newException(RarCodecError, "rar: bad distance slot")
+        var dextra: uint64
+        if nbits >= 4 and st.alignMode:
+          let high = br.readBitsWide(nbits - 4)
+          let low = uint64(decodeSym(st.alignT, br))
+          dextra = (high shl 4) or low
+        else:
+          dextra = br.readBitsWide(nbits)
+        let dist = distFromSlot(dslot, nbits, dextra)
+        length += lengthBonus(dist)
+        for i in countdown(3, 1):
+          st.reps[i] = st.reps[i - 1]
+        st.reps[0] = dist
+        st.lastLen = length
+        emitStagedMatch(st, stage, wf, crc, outCnt, outLimit, dist, length)
+    pos += 2 + nb + payloadSize
+    if isLast or outCnt >= outLimit:
+      break
+  flushRarStage(stage, wf, crc)
+  result = (outCnt, crc xor 0xFFFFFFFF'u32, filters)
+
+proc applyRarFiltersToFile*(wf: File; filters: seq[RarFilter];
+    scratch: var PooledBuffer[byte]): uint32 =
+  ## Apply post-filters to member bytes in `wf` in place (same order and
+  ## semantics as `applyFilters`), then return CRC32 of the final content.
+  ## Each region (validated ≤ `rarMaxFilterLen`, in-bounds) stages through
+  ## a transient region string, so peak is one region, never the file.
+  ## The final CRC streams through the caller-owned `scratch` backing
+  ## (64KB; `len` untouched, stays 0). File cursor ends at 0.
+  if scratch.cap < rarFileStageCap:
+    raise newException(RarCodecError, "rar: stage too small")
+  let fsize = getFileSize(wf)
+  for f in filters:
+    if f.len > rarMaxFilterLen.uint64:
+      raise newException(RarCodecError, "rar: filter range invalid")
+    let e = f.start + f.len
+    if e < f.start or e > fsize.uint64:
+      raise newException(RarCodecError, "rar: filter range invalid")
+    var region = newString(int(f.len))
+    if region.len > 0:
+      setFilePos(wf, f.start.int64)
+      var roff = 0
+      while roff < region.len:
+        let n = readBuffer(wf, addr region[roff], region.len - roff)
+        if n <= 0:
+          raise newException(RarCodecError, "rar: short read")
+        roff += n
+    case f.kind
+    of fkDelta: applyDelta(region, 0, region.len, f.channels)
+    of fkE8: applyE8(region, 0, region.len, f.start, false)
+    of fkE8E9: applyE8(region, 0, region.len, f.start, true)
+    of fkArm: applyArm(region, 0, region.len, f.start)
+    if region.len > 0:
+      setFilePos(wf, f.start.int64)
+      var woff = 0
+      while woff < region.len:
+        let n = writeBuffer(wf, addr region[woff], region.len - woff)
+        if n <= 0:
+          raise newException(RarCodecError, "rar: short write")
+        woff += n
+  setFilePos(wf, 0)
+  var crc: uint32 = 0xFFFFFFFF'u32
+  while true:
+    let n = readBuffer(wf, addr scratch.data[0], scratch.cap)
+    if n <= 0:
+      break
+    crc = crc32Update(crc, addr scratch.data[0], n)
+  setFilePos(wf, 0)
+  crc xor 0xFFFFFFFF'u32

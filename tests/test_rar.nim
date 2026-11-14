@@ -1,6 +1,7 @@
 import std/[unittest, tables, strutils, options, random]
 import std/unicode
-from std/os import joinPath, getTempDir, removeFile
+import buffalo
+from std/os import joinPath, getTempDir, removeFile, removeDir, symlinkExists
 import archive/types
 import archive/io
 import archive/files
@@ -922,3 +923,315 @@ suite "rar5 archive comment":
     except RarError:
       failed = true
     check failed
+
+suite "rar5 streaming to-dir":
+  test "store to-dir via extractFile dispatch":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: 5,
+        isRegular: true), data: "hello"),
+      FsEntry(path: "sub", meta: FileMeta(name: "sub", isDir: true),
+        data: ""),
+      FsEntry(path: "sub/b.txt", meta: FileMeta(name: "b.txt", size: 5,
+        isRegular: true), data: "world"),
+      FsEntry(path: "empty.txt", meta: FileMeta(name: "empty.txt", size: 0,
+        isRegular: true), data: ""),
+      FsEntry(path: "link.txt", meta: FileMeta(name: "link.txt",
+        isSymlink: true), data: "", linkTarget: "a.txt"),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(), ctx, dst, files)
+    let src = joinPath(getTempDir(), "rar_stream_store.rar")
+    writeFile(src, take(dst))
+    let outd = joinPath(getTempDir(), "rar_stream_store_out")
+    removeDir(outd)
+    try:
+      extractFile(src, outd)
+      check(readFile(joinPath(outd, "a.txt")) == "hello")
+      check(readFile(joinPath(outd, "sub/b.txt")) == "world")
+      check(readFile(joinPath(outd, "empty.txt")) == "")
+      check(symlinkExists(joinPath(outd, "link.txt")))
+    finally:
+      try: removeFile(src) except OSError: discard
+      try: removeDir(outd) except OSError: discard
+
+  test "compressed m1 to-dir via extractFile dispatch":
+    var ctx: ArchiveContext
+    var big = newString(512 * 1024)
+    const phrase = "the quick brown fox jumps over the lazy dog. "
+    for i in 0 ..< big.len:
+      big[i] = phrase[i mod phrase.len]
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "small.txt", meta: FileMeta(name: "small.txt", size: 5,
+        isRegular: true), data: "hello"),
+      FsEntry(path: "big.txt", meta: FileMeta(name: "big.txt",
+        size: big.len, isRegular: true), data: big),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 1), ctx, dst, files)
+    let src = joinPath(getTempDir(), "rar_stream_m1.rar")
+    writeFile(src, take(dst))
+    let outd = joinPath(getTempDir(), "rar_stream_m1_out")
+    removeDir(outd)
+    try:
+      extractFile(src, outd)
+      check(readFile(joinPath(outd, "small.txt")) == "hello")
+      check(readFile(joinPath(outd, "big.txt")) == big)
+    finally:
+      try: removeFile(src) except OSError: discard
+      try: removeDir(outd) except OSError: discard
+
+  test "solid group streams in walk order without retention":
+    var ctx: ArchiveContext
+    var entries: seq[FsEntry] = @[]
+    for i in 0 ..< 4:
+      var data = newString(64 * 1024)
+      for j in 0 ..< data.len:
+        data[j] = chr(((i * 37 + j div 16) and 0xFF))
+      entries.add(FsEntry(path: "f" & $i & ".bin",
+        meta: FileMeta(name: "f" & $i & ".bin", size: data.len,
+          isRegular: true), data: data))
+    let files = filesFromEntries(ctx, FromFSOptions(), entries, ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 1, solid: true), ctx, dst, files)
+    let src = joinPath(getTempDir(), "rar_stream_solid.rar")
+    writeFile(src, take(dst))
+    let outd = joinPath(getTempDir(), "rar_stream_solid_out")
+    removeDir(outd)
+    try:
+      extractFile(src, outd)
+      for i in 0 ..< 4:
+        var want = newString(64 * 1024)
+        for j in 0 ..< want.len:
+          want[j] = chr(((i * 37 + j div 16) and 0xFF))
+        check(readFile(joinPath(outd, "f" & $i & ".bin")) == want)
+    finally:
+      try: removeFile(src) except OSError: discard
+      try: removeDir(outd) except OSError: discard
+
+  test "filters round trip through file patching":
+    var ctx: ArchiveContext
+    # x86-like bytes trigger the E8/E9 forward filter on write.
+    var exe = newString(64 * 1024)
+    var rnd = initRand(1234)
+    for i in 0 ..< exe.len:
+      if i mod 7 == 0:
+        exe[i] = chr(0xE8)
+        if i + 4 < exe.len:
+          for k in 1 .. 4:
+            exe[i + k] = chr(rnd.rand(255))
+      else:
+        exe[i] = chr(rnd.rand(255))
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "prog.bin", meta: FileMeta(name: "prog.bin",
+        size: exe.len, isRegular: true), data: exe),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 1, useFilters: true), ctx, dst, files)
+    let src = joinPath(getTempDir(), "rar_stream_filt.rar")
+    writeFile(src, take(dst))
+    let outd = joinPath(getTempDir(), "rar_stream_filt_out")
+    removeDir(outd)
+    try:
+      extractFile(src, outd)
+      check(readFile(joinPath(outd, "prog.bin")) == exe)
+    finally:
+      try: removeFile(src) except OSError: discard
+      try: removeDir(outd) except OSError: discard
+
+  test "streaming decode applies explicit delta filter":
+    # Deterministic filter-path unit test: the encoded stream carries a
+    # DELTA marker, so decode must return it and the file patcher must
+    # restore the original bytes (same bytes the in-memory path yields).
+    var data = newString(8192)
+    for i in 0 ..< data.len:
+      data[i] = chr(((i * 7 + (i div 2)) and 0xFF))
+    let (ds, av) = resolveWriterDict(Rar())
+    let specs = @[RarFilterSpec(start: 0, len: data.len, kind: 0,
+      channels: 2)]
+    # The encoder takes forward-transformed bytes plus the specs (same
+    # contract `archiveRar` uses via `transformWithFilters`).
+    let transformed = fwdDelta(data, 2)
+    let packed = encodeRarMemberFiltered(transformed.toOpenArrayByte(0,
+      transformed.len - 1), 1, ds, specs, av)
+    let mem = block:
+      let s = UnpackState()
+      resetUnpack(s, ds, av)
+      decodeMember(s, unsafeAddr packed[0], packed.len, data.len.uint64,
+        av)
+    check(mem == data)
+    let st = UnpackState()
+    resetUnpack(st, ds, av)
+    let tmp = joinPath(getTempDir(), "rar_stream_delta.bin")
+    var wf = open(tmp, fmReadWrite)
+    var stage = initPool(byte, rarFileStageCap, MaxScratchCap)
+    stage.reserve(rarFileStageCap)
+    let dec = decodeRarMemberToFile(st, unsafeAddr packed[0], packed.len,
+      data.len.uint64, av, wf, stage)
+    check(dec.filters.len == 1)
+    let finalCrc = applyRarFiltersToFile(wf, dec.filters, stage)
+    close(wf)
+    check(readFile(tmp) == data)
+    check(finalCrc == crc32Checksum(data))
+    try: removeFile(tmp) except OSError: discard
+
+  test "streaming matches handler on mixed solid+filter archive":
+    var ctx: ArchiveContext
+    var exe = newString(32 * 1024)
+    for i in 0 ..< exe.len:
+      exe[i] = if i mod 5 == 0: chr(0xE8) else: chr(i and 0xFF)
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "t.txt", meta: FileMeta(name: "t.txt", size: 30000,
+        isRegular: true), data: "lorem ipsum ".repeat(2500)),
+      FsEntry(path: "p.bin", meta: FileMeta(name: "p.bin", size: exe.len,
+        isRegular: true), data: exe),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 1, solid: true, useFilters: true), ctx, dst, files)
+    let blob = take(dst)
+    var bodies = initOrderedTable[string, string]()
+    extractRar(Rar(meth: 1, solid: true, useFilters: true), ctx,
+      openInputString(blob)) do (c: ArchiveContext; info: FileInfo):
+      if info.isRegular():
+        bodies[info.nameInArchive] = readAll(info.open())
+    let src = joinPath(getTempDir(), "rar_stream_equiv.rar")
+    writeFile(src, blob)
+    let outd = joinPath(getTempDir(), "rar_stream_equiv_out")
+    removeDir(outd)
+    try:
+      extractFile(src, outd)
+      for k, v in bodies:
+        check(readFile(joinPath(outd, k)) == v)
+    finally:
+      try: removeFile(src) except OSError: discard
+      try: removeDir(outd) except OSError: discard
+
+  test "per-file encryption streams with password":
+    var ctx: ArchiveContext
+    var secret = newString(2 * 1024 * 1024)
+    for i in 0 ..< secret.len:
+      secret[i] = chr((i * 13 + 7) and 0xFF)
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "s.bin", meta: FileMeta(name: "s.bin", size: secret.len,
+        isRegular: true), data: secret),
+      FsEntry(path: "store.bin", meta: FileMeta(name: "store.bin",
+        size: secret.len, isRegular: true), data: secret),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(password: "hunter2", kdfLg2: 4), ctx, dst, files)
+    # STORE file: second entry forced to STORE via meth 0 archive below.
+    let dst2 = newOutput()
+    archiveRar(Rar(meth: 0, password: "hunter2", kdfLg2: 4), ctx, dst2, files)
+    for (tag, blob) in [("m1", take(dst)), ("st", take(dst2))]:
+      let src = joinPath(getTempDir(), "rar_stream_enc_" & tag & ".rar")
+      writeFile(src, blob)
+      let outd = joinPath(getTempDir(), "rar_stream_enc_" & tag & "_out")
+      removeDir(outd)
+      try:
+        extractRarToDirStreaming(Rar(password: "hunter2"), src, outd, ctx)
+        check(readFile(joinPath(outd, "s.bin")) == secret)
+        check(readFile(joinPath(outd, "store.bin")) == secret)
+      finally:
+        try: removeFile(src) except OSError: discard
+        try: removeDir(outd) except OSError: discard
+
+  test "per-file encryption streams compressed entries with password":
+    var ctx: ArchiveContext
+    var text = newString(512 * 1024)
+    const phrase = "the quick brown fox jumps over the lazy dog. "
+    for i in 0 ..< text.len:
+      text[i] = phrase[i mod phrase.len]
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "c.txt", meta: FileMeta(name: "c.txt", size: text.len,
+        isRegular: true), data: text),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 1, password: "hunter2", kdfLg2: 4), ctx, dst, files)
+    let blob = take(dst)
+    check(blob.len < text.len) # actually compressed, not stored
+    let src = joinPath(getTempDir(), "rar_stream_enc_c.rar")
+    writeFile(src, blob)
+    let outd = joinPath(getTempDir(), "rar_stream_enc_c_out")
+    removeDir(outd)
+    try:
+      extractRarToDirStreaming(Rar(password: "hunter2"), src, outd, ctx)
+      check(readFile(joinPath(outd, "c.txt")) == text)
+      # Wrong password fails the same way as the one-shot opener.
+      removeDir(outd)
+      expect(RarError):
+        extractRarToDirStreaming(Rar(password: "wrong"), src, outd, ctx)
+    finally:
+      try: removeFile(src) except OSError: discard
+      try: removeDir(outd) except OSError: discard
+
+  test "wrong password fails streaming":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: 5,
+        isRegular: true), data: "hello"),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 1, password: "hunter2", kdfLg2: 4), ctx, dst, files)
+    let src = joinPath(getTempDir(), "rar_stream_wrong.rar")
+    writeFile(src, take(dst))
+    let outd = joinPath(getTempDir(), "rar_stream_wrong_out")
+    removeDir(outd)
+    try:
+      expect(RarError):
+        extractRarToDirStreaming(Rar(password: "wrong"), src, outd, ctx)
+      expect(RarError):
+        extractRarToDirStreaming(Rar(), src, outd, ctx)
+    finally:
+      try: removeFile(src) except OSError: discard
+      try: removeDir(outd) except OSError: discard
+
+  test "header-encrypted archive streams in place":
+    var ctx: ArchiveContext
+    var big = newString(256 * 1024)
+    for i in 0 ..< big.len:
+      big[i] = chr((i div 3) and 0xFF)
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "h.txt", meta: FileMeta(name: "h.txt", size: big.len,
+        isRegular: true), data: big),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 1, password: "pw", kdfLg2: 4, encHeaders: true),
+      ctx, dst, files)
+    let src = joinPath(getTempDir(), "rar_stream_hdr.rar")
+    writeFile(src, take(dst))
+    let outd = joinPath(getTempDir(), "rar_stream_hdr_out")
+    removeDir(outd)
+    try:
+      extractRarToDirStreaming(Rar(password: "pw"), src, outd, ctx)
+      check(readFile(joinPath(outd, "h.txt")) == big)
+      expect(RarError):
+        extractFile(src, outd) # dispatch has no password
+    finally:
+      try: removeFile(src) except OSError: discard
+      try: removeDir(outd) except OSError: discard
+
+  test "corrupt and truncated archives fail streaming":
+    var ctx: ArchiveContext
+    let files = filesFromEntries(ctx, FromFSOptions(), [
+      FsEntry(path: "a.txt", meta: FileMeta(name: "a.txt", size: 20000,
+        isRegular: true), data: "x".repeat(20000)),
+    ], ".", "")
+    let dst = newOutput()
+    archiveRar(Rar(meth: 1), ctx, dst, files)
+    let blob = take(dst)
+    let src = joinPath(getTempDir(), "rar_stream_bad.rar")
+    let outd = joinPath(getTempDir(), "rar_stream_bad_out")
+    try:
+      var bad = blob
+      bad[bad.len - 10] = chr(ord(bad[bad.len - 10]) xor 0xFF)
+      writeFile(src, bad)
+      removeDir(outd)
+      expect(ArchiveError):
+        extractFile(src, outd)
+      writeFile(src, blob[0 ..< blob.len - 10])
+      removeDir(outd)
+      expect(ArchiveError):
+        extractFile(src, outd)
+    finally:
+      try: removeFile(src) except OSError: discard
+      try: removeDir(outd) except OSError: discard

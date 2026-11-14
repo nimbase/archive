@@ -17,7 +17,10 @@
 ## Thread safety: no globals, all state on the stack or per-call.
 
 import std/[strutils, times, tables]
-from std/os import splitFile
+import buffalo
+import nimcypher/aes as ncAes
+from std/os import splitFile, createDir, parentDir, joinPath, createSymlink,
+  removeFile, DirSep, isAbsolute
 import ../io
 import ../types
 import ../crc32
@@ -2062,6 +2065,511 @@ proc extractRar*(r: Rar; ctx: ArchiveContext; inp: Input;
     if nextPos <= blockPos:
       raise newException(RarError, "rar: walk did not advance")
     discard typeStart
+
+proc rarSafeDestPath(outPath, name: string): string =
+  ## Zip-slip guard mirroring archive.safeDestPath (same rules): formats
+  ## cannot import the top-level module, so the fast path carries its own.
+  let rel = name.replace('\\', '/')
+  if rel.isAbsolute:
+    raise newException(ArchiveError,
+      "entry escapes destination (absolute path): " & name)
+  for part in rel.split('/'):
+    if part == "..":
+      raise newException(ArchiveError,
+        "entry escapes destination (..): " & name)
+  joinPath(outPath, rel.replace('/', DirSep))
+
+proc streamRarStoredToFile(bulk: File; dataOff, dataLen: int; wf: File;
+    chunk: var PooledBuffer[byte]; expectLen: int; expectCrc: uint32;
+    hasCrc: bool; entryName: string; ctx: ArchiveContext) =
+  ## Chunked STORE copy `bulk[dataOff ..< +dataLen]` -> `wf` through the
+  ## caller-owned 64KB chunk. Verifies size/CRC naming the entry.
+  if dataLen != expectLen:
+    raise newException(RarError, "rar: size mismatch: " & entryName)
+  chunk.reserve(StreamChunkSize)
+  setFilePos(bulk, dataOff.int64)
+  var crc: uint32 = 0xFFFFFFFF'u32
+  var total = 0
+  var remaining = dataLen
+  while remaining > 0:
+    ctx.checkCancelled()
+    let take = min(remaining, chunk.cap)
+    let n = readBuffer(bulk, addr chunk.data[0], take)
+    if n <= 0:
+      raise newException(RarError, "rar: truncated file data: " & entryName)
+    crc = crc32Update(crc, addr chunk.data[0], n)
+    var woff = 0
+    while woff < n:
+      let w = writeBuffer(wf, addr chunk.data[woff], n - woff)
+      if w <= 0:
+        raise newException(RarError, "rar: short write: " & entryName)
+      woff += w
+    total += n
+    remaining -= n
+  if total != expectLen:
+    raise newException(RarError, "rar: size mismatch: " & entryName)
+  if hasCrc and total > 0:
+    if (crc xor 0xFFFFFFFF'u32) != expectCrc:
+      raise newException(RarError, "rar: data crc mismatch: " & entryName)
+
+proc streamRarStoredDecryptedToFile(key: array[32, byte];
+    iv: array[16, byte]; bulk: File; dataOff, dataLen: int; size: int64;
+    wf: File; chunk: var PooledBuffer[byte]; hashKey: array[32, byte];
+    useHashMac: bool; expectCrc: uint32; hasCrc: bool; entryName: string;
+    ctx: ArchiveContext) =
+  ## Stream a STORE-encrypted data range (`bulk` at `dataOff`, `dataLen`
+  ## ciphertext bytes) to `wf` with bounded memory: one 64KB caller-owned
+  ## chunk plus one CBC streaming context (single key schedule for the
+  ## whole file). Only the first `size` plaintext bytes are kept (zero
+  ## padding truncated); size/CRC verified naming the entry. Entry-level
+  ## failures raise RarError exactly like the one-shot opener; only a
+  ## misaligned ciphertext raises RarCryptError (same as `rarAesDecrypt`).
+  if dataLen mod 16 != 0:
+    raise newException(RarCryptError, "rar: ciphertext not block-aligned")
+  chunk.reserve(StreamChunkSize)
+  if chunk.cap <= 0:
+    raise newException(RarCryptError, "rar: chunk too small")
+  setFilePos(bulk, dataOff.int64)
+  var st = ncAes.cbcStreamInit(key, iv, false)
+  try:
+    var crc: uint32 = 0xFFFFFFFF'u32
+    var written: int64 = 0
+    var remaining = dataLen
+    while remaining > 0:
+      ctx.checkCancelled()
+      let take = min(remaining, chunk.cap)
+      let n = readBuffer(bulk, addr chunk.data[0], take)
+      if n <= 0:
+        raise newException(RarError, "rar: truncated file data")
+      remaining -= n
+      let pt = ncAes.cbcStreamUpdate(st, chunk.data.toOpenArray(0, n - 1))
+      var use = pt.len
+      let avail = size - written
+      if use.int64 > avail:
+        use = avail.int
+      if use > 0:
+        var woff = 0
+        while woff < use:
+          let w = writeBuffer(wf, unsafeAddr pt[woff], use - woff)
+          if w <= 0:
+            raise newException(RarError, "rar: short write: " & entryName)
+          woff += w
+        crc = crc32Update(crc, unsafeAddr pt[0], use)
+        written += use.int64
+    ncAes.cbcStreamFinish(st)
+    if written != size:
+      raise newException(RarError, "rar: truncated file data")
+    if hasCrc and size > 0:
+      let raw = crc xor 0xFFFFFFFF'u32
+      let expect =
+        if useHashMac: rarHashMacCrc(hashKey, raw)
+        else: raw
+      if expect != expectCrc:
+        raise newException(RarError, "rar: data crc mismatch")
+  except CatchableError:
+    try: ncAes.cbcStreamFinish(st)
+    except CatchableError: discard
+    raise
+
+proc verifyStreamedRar(unpacked: uint64; known, hasCrc: bool;
+    storedCrc: uint32; bytes: uint64; crc: uint32; useHashMac: bool;
+    hashKey: array[32, byte]) =
+  ## Mirror of verifyRarDecoded/verifyRarDecodedCrypt over streamed
+  ## (byte count, CRC) values. Raises RarCodecError like the originals.
+  if known and bytes != unpacked:
+    raise newException(RarCodecError, "rar: size mismatch")
+  if hasCrc and bytes > 0:
+    let expect =
+      if useHashMac: rarHashMacCrc(hashKey, crc)
+      else: crc
+    if expect != storedCrc:
+      raise newException(RarCodecError, "rar: data crc mismatch")
+
+proc extractRarToDirStreaming*(r: Rar; path, outPath: string;
+    ctx: ArchiveContext) =
+  ## Bounded-memory RAR extraction to a directory tree: entries stream
+  ## incrementally, never holding a full compressed entry or extracted
+  ## file in RAM. Header parsing walks the mmap (tiny); bulk bytes stream
+  ## via a separate file handle in 64KB chunks (stored, encrypted or
+  ## packed) through caller-owned buffalo pools; LZ output flushes to
+  ## disk in 64KB stages with incremental CRC. Solid groups decode
+  ## forward in walk order with one shared UnpackState and no per-file
+  ## retention. Filtered members decode raw then patch ≤4MB regions in
+  ## place. Header-encrypted archives walk encrypted headers in place
+  ## (no clear-archive copy). Peak is fixed buffers + window + one
+  ## member's packed bytes, never unpacked size. Caps, progress,
+  ## cancellation, and error semantics match `extractRar`.
+  createDir(outPath)
+  let inp = openInputFile(path)
+  try:
+    if remaining(inp) < 8:
+      raise newException(RarError, "rar: truncated signature")
+    let sig = readSpan(inp, 8)
+    if not spanEqual(sig, rar5Magic):
+      raise newException(RarError, "rar: bad signature")
+    var bulk: File
+    if not open(bulk, path, fmRead):
+      raise newException(RarError, "rar open: cannot reopen for streaming")
+    try:
+      var chunkPool = initPool(byte, StreamChunkSize, MaxScratchCap)
+      var stagePool = initPool(byte, rarFileStageCap, MaxScratchCap)
+      var packPool = initPool(byte, StreamChunkSize, 0)
+      chunkPool.reserve(StreamChunkSize)
+      stagePool.reserve(rarFileStageCap)
+      packPool.reserve(StreamChunkSize)
+      # Solid-group decode state (no decoded retention: walk order is
+      # decode order, each member streams to its own file).
+      var st: UnpackState = nil
+      var hasGroup = false
+      var groupId = 0
+      var curGroup = 0
+      var groupDict: uint64 = 0
+      var groupAlgo70 = false
+      # Header-encryption state (HEAD_CRYPT derives one archive key).
+      var archKey: array[32, byte]
+      var hdrEnc = false
+      var headerCount = 0
+      var index = 0
+      while true:
+        ctx.checkCancelled()
+        if remaining(inp) == 0:
+          break # tolerant EOF like extractRar
+        let blockPos = inputPos(inp)
+        # Fetch one plaintext header block; the walk cursor ends at the
+        # data-area start either way (headers never cross a boundary).
+        var hbytes = ""
+        var dataStart = 0
+        if not hdrEnc:
+          if remaining(inp) < 4:
+            raise newException(RarError, "rar: truncated header crc")
+          let storedCrc = readU32le(inp)
+          let hsizePos = inputPos(inp)
+          let hsize = readVint(inp)
+          if hsize > rarMaxHeaderSize.uint64:
+            raise newException(RarError, "rar: header too large")
+          let bodyStart = inputPos(inp)
+          let hsizeBytes = bodyStart - hsizePos
+          if uint64(remaining(inp)) < hsize:
+            raise newException(RarError, "rar: truncated header")
+          let headerEnd = bodyStart + int(hsize)
+          let crcSpan = spanAt(inp, hsizePos, hsizeBytes + int(hsize))
+          let calc =
+            if crcSpan.len == 0: 0xFFFFFFFF'u32
+            else: crc32Update(0xFFFFFFFF'u32, crcSpan.p, crcSpan.len) xor
+              0xFFFFFFFF'u32
+          if calc != storedCrc:
+            raise newException(RarError, "rar: header crc mismatch")
+          hbytes = spanToString(spanAt(inp, hsizePos - 4,
+            4 + hsizeBytes + int(hsize)))
+          seek(inp, headerEnd)
+          dataStart = headerEnd
+        else:
+          hbytes = readHdrEncPlaintext(inp, archKey)
+          dataStart = inputPos(inp)
+        inc headerCount
+        if headerCount > rarMaxHeaderCount:
+          raise newException(RarError, "rar: too many headers")
+        let hin = openInputString(hbytes)
+        discard readU32le(hin) # stored crc (verified on fetch)
+        discard readVint(hin) # hsize
+        let htype = readVint(hin)
+        let hflags = readVint(hin)
+        var extraSize: uint64 = 0
+        var dataSize: uint64 = 0
+        if (hflags and 0x0001) != 0:
+          extraSize = readVint(hin)
+        if (hflags and 0x0002) != 0:
+          dataSize = readVint(hin)
+        let headerLen = hbytes.len
+        case htype
+        of 1: # main
+          let archFlags = readVint(hin)
+          if (archFlags and 0x0002) != 0:
+            discard readVint(hin) # volume number
+          if (hflags and 0x0002) != 0:
+            if dataSize > uint64(remaining(inp)):
+              raise newException(RarError, "rar: truncated main data")
+            seek(inp, dataStart + int(dataSize))
+        of 2, 3: # file / service
+          let isService = htype == 3
+          let fileFlags = readVint(hin)
+          let unpacked = readVint(hin)
+          let attrs = readVint(hin)
+          var mtime = fromUnix(0)
+          if (fileFlags and 0x0002) != 0:
+            let t = readU32le(hin)
+            mtime = fromUnix(t.int64)
+          var dcrc: uint32 = 0
+          var hasCrc = false
+          if (fileFlags and 0x0004) != 0:
+            dcrc = readU32le(hin)
+            hasCrc = true
+          let compInfo = readVint(hin)
+          let hostOs = readVint(hin)
+          let nameLen = readVint(hin)
+          if nameLen > rarMaxNameLen.uint64:
+            raise newException(RarError, "rar: name too long")
+          var nm = ""
+          if nameLen > 0:
+            if uint64(remaining(hin)) < nameLen:
+              raise newException(RarError, "rar: truncated name")
+            let ns = readSpan(hin, int(nameLen))
+            nm = newString(int(nameLen))
+            copyMem(addr nm[0], ns.p, int(nameLen))
+          var entry = RarEntry(name: nm, size: cast[int64](unpacked),
+            modTime: mtime, compInfo: compInfo, dataOff: -1,
+            dataLen: 0, dataCrc: dcrc, hasCrc: hasCrc)
+          entry.mode =
+            if hostOs == 1: int(attrs)
+            elif (fileFlags and 0x0001) != 0: 0o40755
+            else: 0o100644
+          if (fileFlags and 0x0001) != 0:
+            entry.isDir = true
+          let extraStart = headerLen - int(extraSize)
+          if extraSize > 0:
+            if extraStart < inputPos(hin) or headerLen < extraStart:
+              raise newException(RarError, "rar: bad extra area")
+            seek(hin, extraStart)
+            parseExtra(hin, headerLen, entry)
+          if (hflags and 0x0008) != 0 or (hflags and 0x0010) != 0:
+            raise newException(RarError,
+              "rar: split volume part; use extractRarVolumes with all volumes")
+          if isService:
+            if dataSize > uint64(remaining(inp)):
+              raise newException(RarError, "rar: truncated service data")
+            seek(inp, dataStart + int(dataSize))
+            continue
+          if entry.isDir:
+            if dataSize != 0:
+              if dataSize > uint64(remaining(inp)):
+                raise newException(RarError, "rar: truncated dir data")
+              seek(inp, dataStart + int(dataSize))
+            let dest = rarSafeDestPath(outPath, nm)
+            ctx.reportProgress(nm, index, -1, 0)
+            inc index
+            createDir(dest)
+            continue
+          if entry.isSymlink:
+            if dataSize != 0:
+              if dataSize > uint64(remaining(inp)):
+                raise newException(RarError, "rar: truncated link data")
+              seek(inp, dataStart + int(dataSize))
+            let dest = rarSafeDestPath(outPath, nm)
+            ctx.reportProgress(nm, index, -1, entry.size)
+            inc index
+            createDir(parentDir(dest))
+            createSymlink(entry.linkTarget, dest)
+            continue
+          # Regular file.
+          if uint64(remaining(inp)) < dataSize:
+            raise newException(RarError, "rar: truncated file data")
+          let dataLen = int(dataSize)
+          let known = (fileFlags and 0x0008) == 0
+          let unpackedU = unpacked
+          let dest = rarSafeDestPath(outPath, nm)
+          ctx.reportProgress(nm, index, -1, entry.size)
+          inc index
+          createDir(parentDir(dest))
+          var f: File
+          if not open(f, dest, fmReadWrite):
+            # Read-write: the streaming decoder writes, and filtered
+            # members patch regions back in place (same handle).
+            raise newException(RarError,
+              "rar: cannot open for writing: " & nm)
+          var ok = false
+          try:
+            if compMethod(compInfo) == 0:
+              # STORE (mirrors the opener: caps, crypt, size, CRC).
+              if ctx.maxRarUnpackedBytes != 0 and
+                  entry.size > ctx.maxRarUnpackedBytes:
+                raise newException(RarError,
+                  "rar: unpacked size exceeds cap")
+              if entry.encrypted:
+                if r.password == "":
+                  raise newException(RarError, "rar: password required")
+                if entry.cryptVer != 0:
+                  raise newException(RarCodecError,
+                    "rar: unknown encryption version")
+                if entry.cryptLg2 > rarKdfMaxLg2:
+                  raise newException(RarCodecError,
+                    "rar: KDF count exceeds decoder maximum")
+                let keys = deriveRarKeys(r.password, entry.cryptSalt,
+                  entry.cryptLg2)
+                var stored: array[12, byte]
+                for i in 0 ..< 12:
+                  stored[i] = entry.cryptCheck[i]
+                if entry.hasCryptCheck and
+                    not rarVerifyCheck(stored, keys.checkRaw):
+                  raise newException(RarError, "rar: incorrect password")
+                streamRarStoredDecryptedToFile(keys.key, entry.cryptIv,
+                  bulk, dataStart, dataLen, entry.size, f, chunkPool,
+                  keys.hashKey, entry.useHashMac, entry.dataCrc,
+                  entry.hasCrc, nm, ctx)
+              else:
+                streamRarStoredToFile(bulk, dataStart, dataLen, f,
+                  chunkPool, int(entry.size), entry.dataCrc,
+                  entry.hasCrc, nm, ctx)
+            else:
+              # Compressed: empty members cost nothing (mirrors the
+              # decoder's early return: no validation, no state change).
+              if dataLen == 0:
+                if known and unpackedU != 0:
+                  raise newException(RarCodecError,
+                    "rar: truncated file data")
+              else:
+                let fm = checkRarMethod(compInfo, unpackedU, ctx)
+                if fm.meth notin 1 .. 5:
+                  raise newException(RarCodecError,
+                    "rar: unknown compression method " & $fm.meth)
+                let ver = compVersion(compInfo)
+                let compat = (compInfo shr 20) and 1
+                let algo70 = ver == 1 and compat == 0
+                let ds = rarDictSize(compInfo)
+                var grp = groupId
+                if not hasGroup or not compSolid(compInfo) or
+                    ds != groupDict or algo70 != groupAlgo70:
+                  inc groupId
+                  grp = groupId
+                  hasGroup = true
+                groupDict = ds
+                groupAlgo70 = algo70
+                if st == nil or curGroup != grp:
+                  st = UnpackState()
+                  resetUnpack(st, int(fm.dictSize),
+                    if fm.algo70: 1 else: 0)
+                  curGroup = grp
+                elif int(fm.dictSize) != st.dictSize or
+                    fm.algo70 != (st.algoVer == 1):
+                  # Dictionary change forces Solid=false: fresh window.
+                  resetUnpack(st, int(fm.dictSize),
+                    if fm.algo70: 1 else: 0)
+                let limit =
+                  if known: unpackedU
+                  elif ctx.maxRarUnpackedBytes > 0:
+                    uint64(ctx.maxRarUnpackedBytes)
+                  else: 1'u64 shl 62
+                let algoVer = if fm.algo70: 1 else: 0
+                var bytes: uint64 = 0
+                var crc: uint32 = 0
+                var hashKey: array[32, byte]
+                var useMac = false
+                if entry.encrypted:
+                  if r.password == "":
+                    raise newException(RarError, "rar: password required")
+                  if entry.cryptVer != 0:
+                    raise newException(RarCodecError,
+                      "rar: unknown encryption version")
+                  if entry.cryptLg2 > rarKdfMaxLg2:
+                    raise newException(RarCodecError,
+                      "rar: KDF count exceeds decoder maximum")
+                  if ctx.maxRarUnpackedBytes > 0 and
+                      dataLen > int(ctx.maxRarUnpackedBytes) + 16:
+                    raise newException(RarCodecError,
+                      "rar: unpacked size exceeds cap")
+                  let keys = deriveRarKeys(r.password, entry.cryptSalt,
+                    entry.cryptLg2)
+                  var stored: array[12, byte]
+                  for i in 0 ..< 12:
+                    stored[i] = entry.cryptCheck[i]
+                  if entry.hasCryptCheck and
+                      not rarVerifyCheck(stored, keys.checkRaw):
+                    raise newException(RarError, "rar: incorrect password")
+                  if entry.useHashMac:
+                    hashKey = keys.hashKey
+                    useMac = true
+                  packPool.ensureLen(dataLen)
+                  setFilePos(bulk, dataStart.int64)
+                  var poff = 0
+                  while poff < dataLen:
+                    ctx.checkCancelled()
+                    let n = readBuffer(bulk, addr packPool.data[poff],
+                      dataLen - poff)
+                    if n <= 0:
+                      raise newException(RarError,
+                        "rar: truncated file data")
+                    poff += n
+                  let pt = decryptRarBytes(
+                    packPool.data.toOpenArray(0, dataLen - 1), keys.key,
+                    entry.cryptIv)
+                  packPool.clear()
+                  if packPool.cap > MaxScratchCap:
+                    packPool = initPool(byte, StreamChunkSize, 0)
+                  if pt.len > 0:
+                    let dec = decodeRarMemberToFile(st, unsafeAddr pt[0],
+                      pt.len, limit, algoVer, f, stagePool)
+                    bytes = dec.bytes
+                    crc = dec.crc
+                    if dec.filters.len > 0:
+                      crc = applyRarFiltersToFile(f, dec.filters, stagePool)
+                  # Empty plaintext verifies like an empty decode (known
+                  # nonzero size still raises size mismatch below).
+                  verifyStreamedRar(unpackedU, known, entry.hasCrc,
+                    entry.dataCrc, bytes, crc, useMac, hashKey)
+                else:
+                  let sp = spanAt(inp, dataStart, dataLen)
+                  let dec = decodeRarMemberToFile(st, sp.p, sp.len, limit,
+                    algoVer, f, stagePool)
+                  bytes = dec.bytes
+                  crc = dec.crc
+                  if dec.filters.len > 0:
+                    crc = applyRarFiltersToFile(f, dec.filters, stagePool)
+                  verifyStreamedRar(unpackedU, known, entry.hasCrc,
+                    entry.dataCrc, bytes, crc, false, hashKey)
+            ok = true
+          finally:
+            close(f)
+            if not ok:
+              try: removeFile(dest)
+              except CatchableError: discard
+          seek(inp, dataStart + dataLen)
+        of 4:
+          # HEAD_CRYPT: derive the archive key; subsequent headers are
+          # already being decrypted in place by the fetch step above.
+          if r.password == "":
+            raise newException(RarError, "rar: password required")
+          let tsLen = headerLen - inputPos(hin)
+          if tsLen <= 0 or tsLen > 64:
+            raise newException(RarError, "rar: bad crypt header")
+          let tsSp = readSpan(hin, tsLen)
+          var tsStr = newString(tsLen)
+          copyMem(addr tsStr[0], tsSp.p, tsLen)
+          let hc = parseHeadCrypt(tsStr, 0)
+          if hc.ver != 0:
+            raise newException(RarCodecError,
+              "rar: unknown encryption version")
+          if hc.lg2 > rarKdfMaxLg2:
+            raise newException(RarCodecError,
+              "rar: KDF count exceeds decoder maximum")
+          let akeys = deriveRarKeys(r.password, hc.salt, hc.lg2)
+          var stored12: array[12, byte]
+          for i in 0 ..< 12:
+            stored12[i] = hc.check[i]
+          if hc.hasCheck and not rarVerifyCheck(stored12, akeys.checkRaw):
+            raise newException(RarError, "rar: incorrect password")
+          archKey = akeys.key
+          hdrEnc = true
+          # HEAD_CRYPT carries no data; the cursor is already past it.
+        of 5:
+          # endarc: consume optional data, stop.
+          if dataSize > 0:
+            if dataSize > uint64(remaining(inp)):
+              raise newException(RarError, "rar: truncated endarc data")
+            seek(inp, dataStart + int(dataSize))
+          break
+        else:
+          # unknown: skip via lengths.
+          if (hflags and 0x0002) != 0:
+            if dataSize > uint64(remaining(inp)):
+              raise newException(RarError, "rar: truncated unknown data")
+            seek(inp, dataStart + int(dataSize))
+        let nextPos = inputPos(inp)
+        if nextPos <= blockPos:
+          raise newException(RarError, "rar: walk did not advance")
+      # end while
+    finally:
+      close(bulk)
+  finally:
+    close(inp)
 
 proc readRarComment*(ctx: ArchiveContext; inp: Input;
     password = ""): string =

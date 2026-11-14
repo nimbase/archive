@@ -19,6 +19,7 @@ import ./archive/files
 import ./archive/crypt
 import ./archive/vfs
 import ./archive/zipfile
+import ./archive/formats/rar
 
 export registry
 export types
@@ -379,8 +380,10 @@ proc extractFile*(path, outPath: string; ctx: ArchiveContext) =
   ## devices) are skipped. Entry names are validated with safeDestPath,
   ## so a malicious archive cannot write outside `outPath`.
   ## Plain zip uses a bounded streaming fast path (no full-entry
-  ## buffering); all other formats use the generic handler (tar is
-  ## already zero-copy bounded via borrowed spans).
+  ## buffering); plain rar uses its own bounded streaming fast path
+  ## (solid groups decode forward in walk order, no per-file retention);
+  ## all other formats use the generic handler (tar is already zero-copy
+  ## bounded via borrowed spans).
   createDir(outPath)
   let res =
     try: identifyPath(path)
@@ -402,6 +405,9 @@ proc extractFile*(path, outPath: string; ctx: ArchiveContext) =
       return
   if res.archival == some(afZip) and res.compression.isNone:
     extractZipToDirStreaming(path, outPath, ctx)
+    return
+  if res.archival == some(afRar) and res.compression.isNone:
+    extractRarToDirStreaming(Rar(), path, outPath, ctx)
     return
   extractFile(path, proc(c: ArchiveContext; info: FileInfo) =
     if info.nameInArchive == "" or info.nameInArchive == ".":
