@@ -11,5 +11,5 @@ srcDir        = "src"
 
 requires "nim >= 2.2.10"
 requires "nbrotli >= 0.1.0"
-requires "nimcypher >= 0.3.0"
+requires "nimcypher >= 0.4.0"
 requires "https://github.com/nimbase/buffalo"
