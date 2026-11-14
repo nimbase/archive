@@ -8,6 +8,7 @@
 ## scalar pure Nim (brotli via nbrotli carries its own internal SIMD).
 
 import ./io
+import buffalo
 
 type FlateError* = object of CatchableError
 
@@ -558,6 +559,230 @@ proc inflateFileRange*(rf: File, compLen: int, wf: File, scratch: Output,
         let avail = min(toCopy, bufLen - bi)
         needRoom(avail)
         writeBytes(scratch, addr inBuf[bi], avail)
+        bitPos += avail * 8
+        toCopy -= avail
+        maybeFlush()
+    of 1:
+      let lit = fixedLitDec()
+      let dist = fixedDistDec()
+      while true:
+        let sym = fDecode(lit)
+        if sym < 256:
+          needRoom(1)
+          putByte(scratch, byte(sym))
+          maybeFlush()
+        elif sym == 256:
+          break
+        else:
+          let li = sym - 257
+          if li < 0 or li > 28:
+            raise newException(FlateError, "flate: bad length code")
+          let length = lenBase[li] + fGetBits(lenExtra[li])
+          let dsym = fDecode(dist)
+          if dsym < 0 or dsym > 29:
+            raise newException(FlateError, "flate: bad distance code")
+          let distance = distBase[dsym] + fGetBits(distExtra[dsym])
+          needRoom(length)
+          putMatch(scratch, distance, length)
+          maybeFlush()
+    of 2:
+      let (lit, dist) = fReadDynamicTables()
+      while true:
+        let sym = fDecode(lit)
+        if sym < 256:
+          needRoom(1)
+          putByte(scratch, byte(sym))
+          maybeFlush()
+        elif sym == 256:
+          break
+        else:
+          let li = sym - 257
+          if li < 0 or li > 28:
+            raise newException(FlateError, "flate: bad length code")
+          let length = lenBase[li] + fGetBits(lenExtra[li])
+          let dsym = fDecode(dist)
+          if dsym < 0 or dsym > 29:
+            raise newException(FlateError, "flate: bad distance code")
+          let distance = distBase[dsym] + fGetBits(distExtra[dsym])
+          needRoom(length)
+          putMatch(scratch, distance, length)
+          maybeFlush()
+    else:
+      raise newException(FlateError, "flate: reserved block type")
+
+  flushAllToFile(scratch, wf, crc, total)
+  result = (total, crc xor 0xFFFFFFFF'u32)
+
+proc inflateFileRangePooled*(rf: File, compLen: int, wf: File,
+    scratch: Output, pool: var PooledBuffer[byte]): tuple[bytes: int,
+    crc: uint32] =
+  ## Pooled twin of `inflateFileRange`: identical wire behavior, but the
+  ## 64KB compressed-input chunk lives in a caller-owned pool instead of
+  ## a `var string`. `reserve` (not `newString`) provides the backing, so
+  ## steady-state iterations across entries perform no allocation and no
+  ## zero-fill; `maxCap` (set by the caller, e.g. `MaxScratchCap`) bounds
+  ## growth and raises `RangeDefect` instead of allocating past it. The
+  ## pool holds no entry state on return (all bytes are consumed). `bufLen`
+  ## tracks valid bytes, `pool.cap` is the fixed capacity — `pool.len` is
+  ## left at 0 throughout.
+  ensureFixedCap(scratch, StreamBufCap)
+  if scratch.len != 0:
+    resetBounded(scratch)
+  pool.reserve(StreamChunkSize)
+  var bufLen = 0
+  var bitPos = 0
+  var remaining = compLen
+  var crc: uint32 = 0xFFFFFFFF'u32
+  var total = 0
+
+  template needRoom(n: int) =
+    if scratch.len + n > StreamBufCap:
+      flushKeepWindow(scratch, wf, StreamWindowSize, crc, total)
+
+  template maybeFlush() =
+    if scratch.len >= StreamChunkSize + StreamWindowSize:
+      flushKeepWindow(scratch, wf, StreamWindowSize, crc, total)
+
+  template refill() =
+    let bi = bitPos div 8
+    if bi < bufLen:
+      let unread = bufLen - bi
+      if bi > 0 and unread > 0:
+        moveMem(addr pool.data[0], addr pool.data[bi], unread)
+      bufLen = unread
+      bitPos = bitPos - bi * 8
+    else:
+      bufLen = 0
+      bitPos = 0
+    if remaining > 0:
+      let free = pool.cap - bufLen
+      let toRead = min(free, remaining)
+      if toRead > 0:
+        let n = readBuffer(rf, addr pool.data[bufLen], toRead)
+        if n <= 0:
+          raise newException(FlateError, "flate: truncated input")
+        bufLen += n
+        remaining -= n
+
+  template ensureBits(nbits: int) =
+    while (bufLen * 8 - bitPos) < nbits:
+      let beforeLen = bufLen
+      let beforeRem = remaining
+      refill()
+      if (bufLen * 8 - bitPos) < nbits:
+        if remaining == 0 and bufLen * 8 - bitPos < nbits:
+          # No more bytes to read and still short: truncated.
+          # Avoid infinite loop when refill made no progress.
+          if bufLen == beforeLen and remaining == beforeRem:
+            raise newException(FlateError, "flate: truncated input")
+        # Otherwise loop again (refill may have made partial progress).
+
+  template fGetBits(n: int): int =
+    block:
+      ensureBits(n)
+      var res = 0
+      for i in 0 ..< n:
+        let p = bitPos + i
+        if (cast[ptr UncheckedArray[byte]](unsafeAddr pool.data[0])[p div 8] and
+            byte(1 shl (p mod 8))) != 0:
+          res = res or (1 shl i)
+      bitPos += n
+      res
+
+  template fAlignToByte() =
+    bitPos = (bitPos + 7) and not 7
+
+  template fDecode(d: HuffDec): int =
+    block:
+      var code = 0
+      var first = 0
+      var index = 0
+      var sym = -1
+      for length in 1 .. d.maxLen:
+        code = (code shl 1) or fGetBits(1)
+        let count = d.counts[length]
+        if code - first < count:
+          sym = d.symbols[index + (code - first)]
+          break
+        index += count
+        first = (first + count) shl 1
+      if sym < 0:
+        raise newException(FlateError, "flate: invalid huffman code")
+      sym
+
+  template fReadDynamicTables(): tuple[lit, dist: HuffDec] =
+    block:
+      let hlit = fGetBits(5) + 257
+      let hdist = fGetBits(5) + 1
+      let hclen = fGetBits(4) + 4
+      var clLens = newSeq[int](19)
+      for i in 0 ..< hclen:
+        clLens[clOrder[i]] = fGetBits(3)
+      let cl = initHuffDec(clLens)
+      let totalLens = hlit + hdist
+      var lens = newSeq[int](totalLens)
+      var ii = 0
+      while ii < totalLens:
+        let sym = fDecode(cl)
+        case sym
+        of 0 .. 15:
+          lens[ii] = sym
+          inc ii
+        of 16:
+          if ii == 0:
+            raise newException(FlateError, "flate: repeat with no previous")
+          let rep = fGetBits(2) + 3
+          for _ in 0 ..< rep:
+            if ii >= totalLens:
+              raise newException(FlateError, "flate: too many lengths")
+            lens[ii] = lens[ii - 1]
+            inc ii
+        of 17:
+          let rep = fGetBits(3) + 3
+          for _ in 0 ..< rep:
+            if ii >= totalLens:
+              raise newException(FlateError, "flate: too many lengths")
+            lens[ii] = 0
+            inc ii
+        of 18:
+          let rep = fGetBits(7) + 11
+          for _ in 0 ..< rep:
+            if ii >= totalLens:
+              raise newException(FlateError, "flate: too many lengths")
+            lens[ii] = 0
+            inc ii
+        else:
+          raise newException(FlateError, "flate: bad code-length code")
+      let lit = initHuffDec(lens[0 ..< hlit])
+      let dist =
+        if hdist == 1 and lens[hlit] == 0:
+          initHuffDec(newSeq[int](1))
+        else:
+          initHuffDec(lens[hlit ..< totalLens])
+      (lit, dist)
+
+  var done = false
+  while not done:
+    done = fGetBits(1) == 1
+    let btype = fGetBits(2)
+    case btype
+    of 0: # stored: copy bytes from file stream through scratch window
+      fAlignToByte()
+      let length = fGetBits(16)
+      let inv = fGetBits(16)
+      if (length xor 0xFFFF) != inv:
+        raise newException(FlateError, "flate: stored length mismatch")
+      var toCopy = length
+      while toCopy > 0:
+        let bi = bitPos div 8
+        if bi >= bufLen:
+          refill()
+          if bitPos div 8 >= bufLen:
+            raise newException(FlateError, "flate: truncated stored block")
+          continue
+        let avail = min(toCopy, bufLen - bi)
+        needRoom(avail)
+        writeBytes(scratch, addr pool.data[bi], avail)
         bitPos += avail * 8
         toCopy -= avail
         maybeFlush()

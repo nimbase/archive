@@ -10,6 +10,7 @@
 import std/[options, strutils]
 from std/os import createDir, joinPath, parentDir, isAbsolute, createSymlink,
   DirSep, removeFile
+import buffalo
 import nimcypher/utils as ncUtils
 import ./archive/types
 import ./archive/io
@@ -287,8 +288,13 @@ proc extractZipToDirStreaming(path, outPath: string; ctx: ArchiveContext) =
       raise newException(ArchiveError, "zip open: cannot reopen for streaming")
     try:
       # Bounded pool: one 96KB window + one 64KB input chunk, reused.
+      # The chunk pool is a caller-owned buffalo buffer (64KB backing,
+      # capped at MaxScratchCap): steady-state entries perform no input
+      # allocation and no zero-fill, and it can never grow with entry
+      # size — unlike the string buffer it replaces, no per-entry trim
+      # is needed. Thread-safe: the pool never escapes this call.
       let scratch = newOutput(StreamBufCap)
-      var inBuf = newString(0)
+      var chunkPool = initPool(byte, StreamChunkSize, MaxScratchCap)
       var entryIdx = 0
       for e in reader.files:
         ctx.checkCancelled()
@@ -336,11 +342,11 @@ proc extractZipToDirStreaming(path, outPath: string; ctx: ArchiveContext) =
                 let dataOff = cast[int](e.raw.p) - baseAddr
                 setFilePos(rf, dataOff.int64)
                 if e.meth == 0: # stored
-                  streamStoredRangeToFile(rf, f, inBuf, e.raw.len,
-                    e.expectLen, e.expectCrc, e.name)
+                  streamStoredRangeToFilePooled(rf, f, chunkPool,
+                    e.raw.len, e.expectLen, e.expectCrc, e.name)
                 elif e.meth == 8: # deflate
-                  streamDeflatedRangeToFile(rf, e.raw.len, f, scratch,
-                    inBuf, e.expectLen, e.expectCrc, e.name)
+                  streamDeflatedRangeToFilePooled(rf, e.raw.len, f,
+                    scratch, chunkPool, e.expectLen, e.expectCrc, e.name)
                 else:
                   raise newException(ArchiveError,
                     "handling file: " & e.name & ": unsupported method")
@@ -348,8 +354,10 @@ proc extractZipToDirStreaming(path, outPath: string; ctx: ArchiveContext) =
             finally:
               close(f)
               resetBounded(scratch)
-              if inBuf.len > MaxScratchCap:
-                inBuf = newString(0)
+              # chunkPool holds no entry state (both pooled streaming
+              # paths fully consume it per entry) and its backing is
+              # capped at MaxScratchCap by construction, so unlike the
+              # old string buffer it needs no size trim here.
               if not ok:
                 try: removeFile(dest)
                 except CatchableError: discard

@@ -8,6 +8,7 @@
 ## only while its parent Input/Output lives.
 
 import std/memfiles
+import buffalo
 import ./crc32
 
 const StreamChunkSize* = 65536
@@ -403,6 +404,39 @@ proc writeByte*(dst: Output; c: char | byte) =
   ensureCap(dst, 1)
   dst.buf[dst.len] = char(c)
   inc dst.len
+
+proc writeOpenArray*(dst: Output; data: openArray[byte]) =
+  ## Write a contiguous view in one reservation + one copy, no
+  ## intermediate string. The intended source is `buf.toOpenArray()`
+  ## passed as an immediate argument inside a `withBorrow` scope (which
+  ## the borrow rules explicitly allow); the callee copies out, so
+  ## nothing escapes.
+  if data.len <= 0:
+    return
+  ensureCap(dst, data.len)
+  copyMem(addr dst.buf[dst.len], unsafeAddr data[0], data.len)
+  dst.len += data.len
+
+proc copySpanToPooled*(s: Span; buf: var PooledBuffer[byte]) =
+  ## Stage span bytes in a caller-owned pool. `ensureLen` grows the
+  ## backing geometrically without zero-filling the fresh region (every
+  ## byte is overwritten by the copy); `maxCap` bounds growth and raises
+  ## `RangeDefect` instead of allocating past it. The pool holds no
+  ## entry state beyond this call's bytes.
+  buf.clear()
+  buf.ensureLen(s.len)
+  if s.len > 0:
+    copyMem(addr buf.data[0], s.p, s.len)
+
+proc readSpanIntoPooled*(inp: Input; buf: var PooledBuffer[byte];
+    n: int): int =
+  ## Borrow up to `n` bytes, stage them in a caller-owned pool, advance.
+  ## Returns bytes staged. Unlike `readBytes`, no string is allocated;
+  ## the caller reuses `buf` across iterations (steady state: no growth,
+  ## just the copy).
+  let s = readSpan(inp, n)
+  copySpanToPooled(s, buf)
+  s.len
 
 proc outputBytes*(dst: Output): Span =
   ## Borrowed view of used bytes.

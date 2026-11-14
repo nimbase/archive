@@ -11,6 +11,7 @@
 ## trailing descriptor is simply never read.
 
 import std/[times, strutils]
+import buffalo
 import ./io
 import ./flate
 import ./crc32
@@ -184,6 +185,42 @@ proc streamStoredRangeToFile*(rf, wf: File, inBuf: var string, compLen,
   if (crc xor 0xFFFFFFFF'u32) != expectCrc:
     raise newException(ZipError, "zip: checksum mismatch: " & entryName)
 
+proc streamStoredRangeToFilePooled*(rf, wf: File;
+    pool: var PooledBuffer[byte]; compLen, expectLen: int;
+    expectCrc: uint32; entryName: string) =
+  ## Pooled twin of `streamStoredRangeToFile`: identical wire behavior,
+  ## but the 64KB input chunk lives in a caller-owned pool. `reserve`
+  ## (not `newString`) provides the backing, so steady-state iterations
+  ## across entries perform no allocation and no zero-fill — `readBuffer`
+  ## overwrites the chunk before it is ever read; `maxCap` (set by the
+  ## caller, e.g. `MaxScratchCap`) bounds growth. The pool holds no entry
+  ## state on return (`pool.len` is left at 0 throughout; `pool.cap` is
+  ## the fixed capacity).
+  if compLen != expectLen:
+    raise newException(ZipError, "zip: size mismatch: " & entryName)
+  pool.reserve(StreamChunkSize)
+  var crc: uint32 = 0xFFFFFFFF'u32
+  var total = 0
+  var remaining = compLen
+  while remaining > 0:
+    let toRead = min(remaining, pool.cap)
+    let n = readBuffer(rf, addr pool.data[0], toRead)
+    if n <= 0:
+      raise newException(ZipError, "zip: truncated entry: " & entryName)
+    crc = crc32Update(crc, addr pool.data[0], n)
+    var woff = 0
+    while woff < n:
+      let w = writeBuffer(wf, addr pool.data[woff], n - woff)
+      if w <= 0:
+        raise newException(ZipError, "zip: short write: " & entryName)
+      woff += w
+    total += n
+    remaining -= n
+  if total != expectLen:
+    raise newException(ZipError, "zip: size mismatch: " & entryName)
+  if (crc xor 0xFFFFFFFF'u32) != expectCrc:
+    raise newException(ZipError, "zip: checksum mismatch: " & entryName)
+
 proc streamDeflatedRangeToFile*(rf: File, compLen: int, wf: File,
     scratch: Output, inBuf: var string, expectLen: int, expectCrc: uint32,
     entryName: string) =
@@ -193,6 +230,23 @@ proc streamDeflatedRangeToFile*(rf: File, compLen: int, wf: File,
   var res: tuple[bytes: int, crc: uint32]
   try:
     res = inflateFileRange(rf, compLen, wf, scratch, inBuf)
+  except FlateError as err:
+    raise newException(ZipError, "zip: deflate error in " & entryName &
+      ": " & err.msg)
+  if res.bytes != expectLen:
+    raise newException(ZipError, "zip: size mismatch: " & entryName)
+  if res.crc != expectCrc:
+    raise newException(ZipError, "zip: checksum mismatch: " & entryName)
+
+proc streamDeflatedRangeToFilePooled*(rf: File, compLen: int, wf: File,
+    scratch: Output, pool: var PooledBuffer[byte], expectLen: int,
+    expectCrc: uint32, entryName: string) =
+  ## Pooled twin of `streamDeflatedRangeToFile`: identical wire behavior
+  ## via `inflateFileRangePooled`, with the 64KB input chunk in a
+  ## caller-owned pool reused across entries.
+  var res: tuple[bytes: int, crc: uint32]
+  try:
+    res = inflateFileRangePooled(rf, compLen, wf, scratch, pool)
   except FlateError as err:
     raise newException(ZipError, "zip: deflate error in " & entryName &
       ": " & err.msg)
