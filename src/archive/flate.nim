@@ -1,8 +1,8 @@
 ## DEFLATE (RFC 1951) ported from Go compress/flate.
 ##
 ## Inflate supports all block types: stored, fixed Huffman and dynamic
-## Huffman. Deflate emits stored-empty plus fixed-Huffman blocks with a
-## hash-chain LZ77 matcher. All entry points work on raw pointers and
+## Huffman. Deflate emits stored-empty plus one fixed-Huffman block per
+## 32 KB of input with a hash-chain LZ77 matcher. All entry points work on raw pointers and
 ## reusable `Output` buffers: no stream objects, no per-call output
 ## allocation when the caller reuses an Output. Archive codecs stay
 ## scalar pure Nim (brotli via nbrotli carries its own internal SIMD).
@@ -1266,6 +1266,12 @@ const
   hashBits = 15
   hashSize = 1 shl hashBits
   maxChainLen = 256
+  # Uncompressed bytes per emitted fixed-Huffman block (RFC 1951 3.2.3:
+  # BFINAL=0 on every block but the last). One window's worth keeps each
+  # block self-contained for the matcher (tables reset per block, same as
+  # DeflateStream.writeDeflate) while inputs at or under this size still
+  # encode as the historical single final block.
+  deflateBlockSize = 32768
 
 proc hash3(p: pointer; pos: int): int {.inline.} =
   let b = cast[ptr UncheckedArray[byte]](p)
@@ -1351,7 +1357,11 @@ proc emitFixedBlock(bp: pointer; total: int; head, prev: var seq[int];
   w.writeBits(ecode, elen)
 
 proc deflateInto*(inp: Input; output: Output) =
-  ## Compress the remaining input bytes with fixed-Huffman blocks.
+  ## Compress the remaining input bytes with fixed-Huffman blocks, one
+  ## block per 32 KB of input (RFC 1951 3.2.3: BFINAL=0 except on the
+  ## last block). Tables reset per block, so matches never cross a block
+  ## boundary — same rule as DeflateStream.writeDeflate; inputs at or
+  ## under 32 KB still encode as a single final block.
   let flc = fixedLitEnc()
   let fdc = fixedDistEnc()
   let base = basePointer(inp)
@@ -1365,7 +1375,21 @@ proc deflateInto*(inp: Input; output: Output) =
   var prev = newSeq[int](windowSize)
   for i in 0 ..< windowSize:
     prev[i] = -1
-  emitFixedBlock(bp, total, head, prev, w, flc, fdc, true)
+  if total == 0:
+    emitFixedBlock(bp, 0, head, prev, w, flc, fdc, true)
+    seek(inp, start)
+    w.flushBits()
+    return
+  var off = 0
+  while off < total:
+    let n = min(deflateBlockSize, total - off)
+    for i in 0 ..< hashSize:
+      head[i] = -1
+    for i in 0 ..< windowSize:
+      prev[i] = -1
+    emitFixedBlock(cast[pointer](cast[int](bp) + off), n, head, prev, w,
+      flc, fdc, off + n == total)
+    off += n
   seek(inp, start + total)
   w.flushBits()
 

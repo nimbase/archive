@@ -128,3 +128,32 @@ suite "flate":
     for i in 0..<s.len: s[i] = chr(i div 40000)
     let enc = deflateFixed(s)
     check(inflateAll(enc) == s)
+
+  test "one-shot multi-block round trip":
+    # Inputs over 32 KB encode as one fixed-Huffman block per 32 KB
+    # (RFC 1951 3.2.3: BFINAL=0 except on the last block); tables reset
+    # per block, so matches never cross a boundary. Small inputs still
+    # encode as the historical single final block.
+    let small = "hello world. ".repeat(50)
+    let smallEnc = deflateFixed(small)
+    check((smallEnc[0].ord and 1) == 1) # BFINAL set: single block
+    check(((smallEnc[0].ord shr 1) and 3) == 1) # BTYPE fixed
+    check(inflateAll(smallEnc) == small)
+    # Boundary sizes around the 32 KB split.
+    for n in [32767, 32768, 32769, 100 * 1024]:
+      var s = newString(n)
+      for i in 0 ..< n:
+        s[i] = chr((i * 31 + i div 997) mod 256)
+      let enc = deflateFixed(s)
+      if n <= 32768:
+        check((enc[0].ord and 1) == 1)
+      else:
+        check((enc[0].ord and 1) == 0) # first block non-final
+        check(((enc[0].ord shr 1) and 3) == 1)
+      check(inflateAll(enc) == s)
+    # Repetitive data spanning several blocks still compresses.
+    let rep = "abcdefgh".repeat(9000) # 72 KB -> 3 blocks
+    let repEnc = deflateFixed(rep)
+    check((repEnc[0].ord and 1) == 0)
+    check(repEnc.len < rep.len div 2)
+    check(inflateAll(repEnc) == rep)
