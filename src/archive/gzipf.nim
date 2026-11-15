@@ -16,6 +16,66 @@ const
   gzMagic1 = 0x8b'u8
   gzDeflate = 8
 
+func xflByte(level: int): byte =
+  ## XFL header hint from the compression level (Go semantics).
+  if level >= 9: 2
+  elif level <= 1: 4
+  else: 0
+
+type GzipStream* = object
+  ## Streaming gzip writer (RFC 1952). `open` once, `write` any number of
+  ## chunks, then `finish`. The deflate tables allocate on first `open` and
+  ## are reused on later opens of the same object, so a thread-local stream
+  ## compresses unit after unit with no steady-state allocations. CRC32 and
+  ## ISIZE accumulate across writes; the trailer is emitted by `finish`.
+  defl: DeflateStream
+  output: Output
+  crc: uint32
+  isize: uint32
+  level: int
+
+proc openGzipStream*(s: var GzipStream; output: Output; level = 6) =
+  ## Start a new gzip member into `output`, writing the 10-byte header.
+  ## Reuses the deflate tables when the object was opened before.
+  if not deflateTablesReady(s.defl):
+    openDeflateStream(s.defl, output)
+  else:
+    resetDeflateStream(s.defl, output)
+  s.output = output
+  s.crc = 0xFFFFFFFF'u32
+  s.isize = 0
+  s.level = level
+  output.writeByte(char(gzMagic0))
+  output.writeByte(char(gzMagic1))
+  output.writeByte(char(gzDeflate))
+  output.writeByte(char(0)) # FLG
+  for _ in 0 ..< 4:
+    output.writeByte(char(0)) # MTIME
+  output.writeByte(char(xflByte(level)))
+  output.writeByte(char(3)) # OS = Unix
+
+proc writeGzip*(s: var GzipStream; p: pointer; n: int) =
+  ## Feed `[p, p+n)` into the running member. Empty writes are no-ops.
+  if n <= 0:
+    return
+  s.crc = crc32Update(s.crc, p, n)
+  s.isize += n.uint32
+  writeDeflate(s.defl, p, n)
+
+proc writeGzip*(s: var GzipStream; data: openArray[byte]) {.inline.} =
+  ## View overload: no copy, the bytes are read straight from the caller.
+  if data.len > 0:
+    s.writeGzip(unsafeAddr data[0], data.len)
+
+proc finishGzip*(s: var GzipStream) =
+  ## Close the member: final deflate block plus the CRC32/ISIZE trailer.
+  finishDeflate(s.defl)
+  let crc = s.crc xor 0xFFFFFFFF'u32
+  for i in 0 ..< 4: # CRC32 LE
+    s.output.writeByte(char((crc shr (8 * i)) and 0xFF))
+  for i in 0 ..< 4: # ISIZE LE
+    s.output.writeByte(char((s.isize shr (8 * i)) and 0xFF))
+
 proc gzipCompressInto*(inp: Input; output: Output; level = 6) =
   ## One-shot gzip compress of the remaining input. Level follows Go:
   ## <=1 fastest, >=9 best, 0 maps to default (6 here).
@@ -29,11 +89,7 @@ proc gzipCompressInto*(inp: Input; output: Output; level = 6) =
   output.writeByte(char(0)) # FLG
   for _ in 0 ..< 4:
     output.writeByte(char(0)) # MTIME
-  let xfl =
-    if level >= 9: 2
-    elif level <= 1: 4
-    else: 0
-  output.writeByte(char(xfl))
+  output.writeByte(char(xflByte(level)))
   output.writeByte(char(3)) # OS = Unix
   deflateInto(inp, output)
   for i in 0 ..< 4: # CRC32 LE

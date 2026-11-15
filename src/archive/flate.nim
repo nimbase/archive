@@ -1286,34 +1286,27 @@ proc distCode(dist: int): tuple[code, extra, extraBits: int] =
     inc di
   (di, dist - distBase[di], distExtra[di])
 
-proc deflateInto*(inp: Input; output: Output) =
-  ## Compress the remaining input bytes with fixed-Huffman blocks.
-  let flc = fixedLitEnc()
-  let fdc = fixedDistEnc()
-  let base = basePointer(inp)
-  let total = remaining(inp)
-  var w = BitWriter(dst: output)
-  w.writeBits(1, 1) # BFINAL
+proc emitFixedBlock(bp: pointer; total: int; head, prev: var seq[int];
+                      w: var BitWriter;
+                      flc, fdc: openArray[tuple[code, len: int]];
+                      isFinal: bool) =
+  ## Emit one fixed-Huffman block over `[bp, bp+total)`. The matcher tables
+  ## must be cleared to -1 by the caller when matches may not reference
+  ## earlier bytes (fresh stream or chunk boundary). Never flushes: the
+  ## bit writer stays mid-byte so consecutive blocks pack tightly; the
+  ## caller flushes once at the end of the stream.
+  w.writeBits(if isFinal: 1 else: 0, 1) # BFINAL
   w.writeBits(1, 2) # BTYPE fixed
   if total == 0:
     let (ecode, elen) = flc[256]
     w.writeBits(ecode, elen)
-    w.flushBits()
     return
-  let start = inputPos(inp)
-  let bp = cast[pointer](cast[int](base) + start)
-  var head = newSeq[int](hashSize)
-  for i in 0 ..< hashSize:
-    head[i] = -1
   # Circular predecessor ring: O(windowSize) instead of O(total).
   # Slot collisions are safe: stale entries fail the `pos - cand`
   # window check below, wrong-turn detours are bounded by maxChainLen,
   # and every emitted match is byte-verified, so output stays valid
   # (same tradeoff as zlib's own w_size prev table; ratio-only effect).
   const prevMask = windowSize - 1
-  var prev = newSeq[int](windowSize)
-  for i in 0 ..< windowSize:
-    prev[i] = -1
   var pos = 0
   while pos < total:
     var bestLen = 0
@@ -1354,10 +1347,86 @@ proc deflateInto*(inp: Input; output: Output) =
       let (lcode, llen) = flc[b.int]
       w.writeBits(lcode, llen)
       inc pos
-  seek(inp, start + total)
   let (ecode, elen) = flc[256]
   w.writeBits(ecode, elen)
+
+proc deflateInto*(inp: Input; output: Output) =
+  ## Compress the remaining input bytes with fixed-Huffman blocks.
+  let flc = fixedLitEnc()
+  let fdc = fixedDistEnc()
+  let base = basePointer(inp)
+  let total = remaining(inp)
+  var w = BitWriter(dst: output)
+  let start = inputPos(inp)
+  let bp = cast[pointer](cast[int](base) + start)
+  var head = newSeq[int](hashSize)
+  for i in 0 ..< hashSize:
+    head[i] = -1
+  var prev = newSeq[int](windowSize)
+  for i in 0 ..< windowSize:
+    prev[i] = -1
+  emitFixedBlock(bp, total, head, prev, w, flc, fdc, true)
+  seek(inp, start + total)
   w.flushBits()
+
+# ---------- streaming deflate writer ----------
+
+type DeflateStream* = object
+  ## Stateful fixed-Huffman compressor. `open` once, `write` any number of
+  ## chunks (each becomes one non-final block — matches never cross a chunk
+  ## boundary), then `finish`. Tables allocate on first `open` and are reused
+  ## across `reset`, so a thread-local stream compresses unit after unit with
+  ## no steady-state allocations.
+  bw: BitWriter
+  flc, fdc: seq[tuple[code, len: int]]
+  head, prev: seq[int]
+
+proc clearTables(s: var DeflateStream) {.inline.} =
+  for i in 0 ..< s.head.len:
+    s.head[i] = -1
+  for i in 0 ..< s.prev.len:
+    s.prev[i] = -1
+
+proc openDeflateStream*(s: var DeflateStream; output: Output) =
+  ## Start a new stream into `output`, allocating tables on first use.
+  if s.flc.len == 0:
+    s.flc = fixedLitEnc()
+    s.fdc = fixedDistEnc()
+    s.head = newSeq[int](hashSize)
+    s.prev = newSeq[int](windowSize)
+  s.clearTables()
+  s.bw = BitWriter(dst: output, acc: 0, nbits: 0)
+
+func deflateTablesReady*(s: DeflateStream): bool {.inline.} =
+  ## True once `openDeflateStream` has allocated the tables (they persist
+  ## for reuse across streams; lets wrappers pick open vs reset).
+  s.flc.len > 0
+
+proc resetDeflateStream*(s: var DeflateStream; output: Output) {.inline.} =
+  ## Start a new stream into `output`, reusing already-allocated tables.
+  ## Call `openDeflateStream` first (it allocates on first use).
+  s.clearTables()
+  s.bw = BitWriter(dst: output, acc: 0, nbits: 0)
+
+proc writeDeflate*(s: var DeflateStream; p: pointer; n: int) =
+  ## Emit one non-final block over `[p, p+n)`. Empty writes are no-ops.
+  if n <= 0:
+    return
+  s.clearTables()
+  emitFixedBlock(p, n, s.head, s.prev, s.bw, s.flc, s.fdc, false)
+
+proc writeDeflate*(s: var DeflateStream; data: openArray[byte]) {.inline.} =
+  ## View overload: no copy, the bytes are read straight from the caller.
+  if data.len > 0:
+    s.writeDeflate(unsafeAddr data[0], data.len)
+
+proc finishDeflate*(s: var DeflateStream) =
+  ## Close the stream: an empty final block, then pad to the byte boundary.
+  s.bw.writeBits(1, 1) # BFINAL
+  s.bw.writeBits(1, 2) # BTYPE fixed
+  let (ecode, elen) = s.flc[256]
+  s.bw.writeBits(ecode, elen)
+  s.bw.flushBits()
 
 proc deflateFixed*(data: string): string =
   ## Convenience: compress to a fresh string.

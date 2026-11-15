@@ -8,6 +8,7 @@ import archive/bz2f
 import archive/formats/zlib
 import archive/formats/lz4
 import archive/formats/bz2
+import archive/gzipf
 
 
 
@@ -25,6 +26,43 @@ suite "codecs":
     let plain = newOutput()
     decompressInto(cfGz, openInputString(enc), plain)
     check(take(plain) == payload)
+
+  test "gzip stream chunked writes decode":
+    let payload = "the quick brown fox jumps over the lazy dog".repeat(60)
+    for splits in [1, 13, 5000, 70000]:
+      let dst = newOutput()
+      var gs: GzipStream
+      openGzipStream(gs, dst)
+      var pos = 0
+      while pos < payload.len:
+        let n = min(splits, payload.len - pos)
+        writeGzip(gs, unsafeAddr payload[pos], n)
+        pos += n
+      finishGzip(gs)
+      let back = newOutput()
+      decompressInto(cfGz, toInput(dst), back)
+      check(take(back) == payload)
+
+  test "gzip stream empty payload":
+    let dst = newOutput()
+    var gs: GzipStream
+    openGzipStream(gs, dst)
+    finishGzip(gs)
+    let back = newOutput()
+    decompressInto(cfGz, toInput(dst), back)
+    check(take(back) == "")
+
+  test "gzip stream reuse across members":
+    var gs: GzipStream
+    for round in 0 ..< 2:
+      let payload = ("member " & $round & " ").repeat(300)
+      let dst = newOutput()
+      openGzipStream(gs, dst)
+      writeGzip(gs, payload.toOpenArrayByte(0, payload.high))
+      finishGzip(gs)
+      let back = newOutput()
+      decompressInto(cfGz, toInput(dst), back)
+      check(take(back) == payload)
 
   test "gzip empty payload":
     let dst = newOutput()

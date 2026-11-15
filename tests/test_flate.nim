@@ -54,6 +54,51 @@ suite "flate":
     inflateInto(openInputString(enc), dst)
     check(take(dst) == payload)
 
+  test "stream chunked writes decode":
+    let payload = "stream me ".repeat(3000)
+    for splits in [1, 7, 1000, 65536]:
+      let dst = newOutput()
+      var st: DeflateStream
+      openDeflateStream(st, dst)
+      var pos = 0
+      while pos < payload.len:
+        let n = min(splits, payload.len - pos)
+        writeDeflate(st, unsafeAddr payload[pos], n)
+        pos += n
+      finishDeflate(st)
+      check(inflateAll(take(dst)) == payload)
+
+  test "stream empty is 03 00":
+    let dst = newOutput()
+    var st: DeflateStream
+    openDeflateStream(st, dst)
+    finishDeflate(st)
+    check(take(dst) == "\x03\x00")
+
+  test "stream reset reuses tables":
+    var st: DeflateStream
+    for round in 0 ..< 2:
+      let payload = "round " & $round & " "
+      let full = payload.repeat(500)
+      let dst = newOutput()
+      if round == 0:
+        openDeflateStream(st, dst)
+      else:
+        resetDeflateStream(st, dst)
+      writeDeflate(st, full.toOpenArrayByte(0, full.high))
+      finishDeflate(st)
+      check(inflateAll(take(dst)) == full)
+
+  test "stream matches one-shot on decode":
+    let payload = "hello world. ".repeat(50)
+    check(inflateAll(deflateFixed(payload)) == payload)
+    let dst = newOutput()
+    var st: DeflateStream
+    openDeflateStream(st, dst)
+    writeDeflate(st, payload.toOpenArrayByte(0, payload.high))
+    finishDeflate(st)
+    check(inflateAll(take(dst)) == payload)
+
   test "borrowed input round trip":
     let payload = "borrowed-window. ".repeat(4000)
     var plain = newString(payload.len)
