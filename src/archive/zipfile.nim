@@ -288,6 +288,12 @@ proc dosTimeToTime(dosDate, dosTime: int): Time =
   let day = dosDate and 0x1F
   let mon = (dosDate shr 5) and 0x0F
   let yr = ((dosDate shr 9) and 0x7F) + 1980
+  # Generated zips (e.g. dotLottie) zero the timestamp fields; range
+  # conversion raises Defect (not CatchableError), so validate first.
+  if mon < 1 or mon > 12 or day < 1 or day > 31 or hrs > 23 or
+      mins > 59 or sec > 59:
+    return dateTime(1980, mJan, 1.MonthdayRange, 0.HourRange, 0.MinuteRange,
+      0.SecondRange, 0, local()).toTime()
   try:
     dateTime(yr, mon.Month, day.MonthdayRange, hrs.HourRange,
       mins.MinuteRange, sec.SecondRange, 0, local()).toTime()
