@@ -6,6 +6,6 @@ on:
     paths-ignore: [LICENSE, README.*, examples]
 jobs:
   test:
-    uses: nimbase/setup-nim-action/.github/workflows/test_clue.yml@main
+    uses: nimbase/setup-nim-action/.github/workflows/test.yml@main
     with:
       nim-version: stable
