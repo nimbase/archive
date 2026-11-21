@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <code>clue install archive</code>
+  <code>nimble install archive</code> / <code>clue install archive</code>
 </p>
 
 <p align="center">
@@ -38,7 +38,7 @@
 
 ## Examples
 Runnable versions live in [`examples/`](examples/) (`nim.cfg` points at
-`../src`, so no install needed — just `clue build`). Snippets below:
+`../src`, so no install needed — just `nimble build`). Snippets below:
 High-level API first (`import archive` covers types and dispatch too);
 zero-copy `Input`/`Output` plumbing is still there when you need it:
 
